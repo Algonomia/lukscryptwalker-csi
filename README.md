@@ -31,6 +31,9 @@ parameters:
   csi.storage.k8s.io/node-stage-secret-name: "luks-secret"
   csi.storage.k8s.io/node-stage-secret-namespace: "kube-system"
   
+  # Key name within the secret that contains the passphrase (optional, default: "passphrase")
+  passphraseKey: "passphrase"
+  
   # Filesystem type (optional, default: ext4)
   fsType: "ext4"
 ```
@@ -47,19 +50,19 @@ parameters:
 
 1. **Add the Helm repository:**
    ```bash
-   # If you have a Helm repository, add it here
-   # helm repo add lukscryptwalker-csi https://your-repo-url
+   helm repo add lukscryptwalker-csi https://algonomia.github.io/lukscryptwalker-csi/
+   helm repo update
    ```
 
 2. **Install with Helm:**
    ```bash
-   # Install from local chart
-   helm install lukscryptwalker-csi ./charts/lukscryptwalker-csi \
+   # Install with default configuration
+   helm install my-lukscryptwalker lukscryptwalker-csi/lukscryptwalker-csi \
      --namespace kube-system \
      --create-namespace
 
    # Or with custom values
-   helm install lukscryptwalker-csi ./charts/lukscryptwalker-csi \
+   helm install my-lukscryptwalker lukscryptwalker-csi/lukscryptwalker-csi \
      --namespace kube-system \
      --create-namespace \
      --values my-values.yaml
@@ -78,6 +81,11 @@ parameters:
    
    storage:
      localPath: "/mnt/encrypted-volumes"
+   
+   # Configure passphrase key name
+   storageClass:
+     secret:
+       passphraseKey: "my-custom-key"
    ```
 
 ### Option 2: Direct Kubernetes Manifests
@@ -106,14 +114,16 @@ parameters:
    apiVersion: storage.k8s.io/v1
    kind: StorageClass
    metadata:
-     name: lukscrypt-local
+     name: lukscryptwalker-local
    provisioner: lukscryptwalker.csi.k8s.io
    parameters:
      local-path: "/opt/local-path-provisioner"
      csi.storage.k8s.io/node-stage-secret-name: "luks-secret"
      csi.storage.k8s.io/node-stage-secret-namespace: "kube-system"
+     passphraseKey: "passphrase"
    reclaimPolicy: Delete
    volumeBindingMode: WaitForFirstConsumer
+   allowVolumeExpansion: true
    ```
 
 2. **Create a PVC:**
@@ -128,7 +138,7 @@ parameters:
      resources:
        requests:
          storage: 1Gi
-     storageClassName: lukscrypt-local
+     storageClassName: lukscryptwalker-local
    ```
 
 3. **Use in a Pod:**
@@ -164,6 +174,30 @@ parameters:
    - Node service resizes the LUKS device
    - Node service resizes the filesystem (ext4/xfs)
    - Changes are reflected in the pod automatically
+
+5. **Using custom passphrase key names:**
+   ```bash
+   # Create secret with custom key name
+   kubectl create secret generic my-luks-secret \
+     --from-literal=encryption-key=my-secure-passphrase \
+     -n kube-system
+   ```
+
+   ```yaml
+   # StorageClass with custom passphrase key
+   apiVersion: storage.k8s.io/v1
+   kind: StorageClass
+   metadata:
+     name: custom-lukscryptwalker
+   provisioner: lukscryptwalker.csi.k8s.io
+   parameters:
+     csi.storage.k8s.io/node-stage-secret-name: "my-luks-secret"
+     csi.storage.k8s.io/node-stage-secret-namespace: "kube-system"
+     passphraseKey: "encryption-key"  # Custom key name
+   reclaimPolicy: Delete
+   volumeBindingMode: WaitForFirstConsumer
+   allowVolumeExpansion: true
+   ```
 
 ## Security Considerations
 
