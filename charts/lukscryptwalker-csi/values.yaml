@@ -1,0 +1,147 @@
+image:
+  repository: lukscryptwalker-csi
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+# Image pull secrets
+imagePullSecrets: []
+
+# CSI Driver configuration
+csiDriver:
+  name: lukscrypt.csi.k8s.io
+  attachRequired: false
+  podInfoOnMount: false
+
+# Controller configuration
+controller:
+  replicas: 1
+  
+  image:
+    repository: lukscryptwalker-csi
+    tag: "latest"
+    pullPolicy: IfNotPresent
+  
+  # Sidecar images
+  sidecars:
+    provisioner:
+      image:
+        repository: registry.k8s.io/sig-storage/csi-provisioner
+        tag: v3.6.2
+        pullPolicy: IfNotPresent
+    resizer:
+      image:
+        repository: registry.k8s.io/sig-storage/csi-resizer  
+        tag: v1.9.2
+        pullPolicy: IfNotPresent
+
+  resources:
+    limits:
+      cpu: 200m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# Node configuration  
+node:
+  image:
+    repository: lukscryptwalker-csi
+    tag: "latest" 
+    pullPolicy: IfNotPresent
+    
+  # Sidecar images
+  sidecars:
+    nodeDriverRegistrar:
+      image:
+        repository: registry.k8s.io/sig-storage/csi-node-driver-registrar
+        tag: v2.9.2
+        pullPolicy: IfNotPresent
+
+  resources:
+    limits:
+      cpu: 200m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+  nodeSelector: {}
+  tolerations:
+    - operator: Exists
+  affinity: {}
+
+# Storage configuration
+storage:
+  # Default local path for volumes
+  localPath: "/opt/local-path-provisioner"
+  
+  # Default size for backing files
+  defaultSize: "1Gi"
+
+# StorageClass configuration
+storageClass:
+  create: true
+  name: lukscrypt-local
+  isDefault: false
+  reclaimPolicy: Delete
+  allowVolumeExpansion: true
+  volumeBindingMode: WaitForFirstConsumer
+  
+  # LUKS secret configuration
+  secret:
+    name: luks-secret
+    namespace: kube-system
+    # Auto-create secret with random passphrase
+    create: true
+    # If create is false, provide your own passphrase (base64 encoded)
+    passphrase: ""
+
+# RBAC configuration
+rbac:
+  create: true
+
+# ServiceAccount configuration  
+serviceAccount:
+  controller:
+    create: true
+    name: lukscryptwalker-csi-controller
+    annotations: {}
+  node:
+    create: true
+    name: lukscryptwalker-csi-node
+    annotations: {}
+
+# Security context
+securityContext:
+  # Controller runs as non-privileged
+  controller:
+    runAsNonRoot: true
+    runAsUser: 1001
+    runAsGroup: 1001
+    fsGroup: 1001
+  # Node must run privileged for LUKS operations
+  node:
+    privileged: true
+    allowPrivilegeEscalation: true
+    capabilities:
+      add: ["SYS_ADMIN"]
+
+# Logging
+logging:
+  level: 4
+
+# Node selector for deployment
+nodeSelector: {}
+
+# Tolerations
+tolerations: []
+
+# Pod annotations
+podAnnotations: {}
+
+# Pod security context
+podSecurityContext: {}

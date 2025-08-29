@@ -1,0 +1,113 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "lukscryptwalker-csi.fullname" . }}-node
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "lukscryptwalker-csi.node.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "lukscryptwalker-csi.node.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "lukscryptwalker-csi.node.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- include "lukscryptwalker-csi.imagePullSecrets" . | nindent 6 }}
+      serviceAccountName: {{ include "lukscryptwalker-csi.node.serviceAccountName" . }}
+      hostNetwork: true
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: node-driver-registrar
+        image: {{ .Values.node.sidecars.nodeDriverRegistrar.image.repository }}:{{ .Values.node.sidecars.nodeDriverRegistrar.image.tag }}
+        imagePullPolicy: {{ .Values.node.sidecars.nodeDriverRegistrar.image.pullPolicy }}
+        args:
+        - "--v={{ .Values.logging.level }}"
+        - "--csi-address=$(ADDRESS)"
+        - "--kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)"
+        env:
+        - name: ADDRESS
+          value: /csi/csi.sock
+        - name: DRIVER_REG_SOCK_PATH
+          value: /var/lib/kubelet/plugins/{{ .Values.csiDriver.name }}/csi.sock
+        - name: KUBE_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        volumeMounts:
+        - name: plugin-dir
+          mountPath: /csi/
+        - name: registration-dir
+          mountPath: /registration/
+      - name: lukscryptwalker-csi
+        image: {{ .Values.node.image.repository }}:{{ .Values.node.image.tag | default .Chart.AppVersion }}
+        imagePullPolicy: {{ .Values.node.image.pullPolicy }}
+        {{- with .Values.securityContext.node }}
+        securityContext:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        args:
+        - "--endpoint=$(CSI_ENDPOINT)"
+        - "--nodeid=$(KUBE_NODE_NAME)"
+        env:
+        - name: CSI_ENDPOINT
+          value: unix:///csi/csi.sock
+        - name: KUBE_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        volumeMounts:
+        - name: plugin-dir
+          mountPath: /csi
+        - name: pods-mount-dir
+          mountPath: /var/lib/kubelet
+          mountPropagation: "Bidirectional"
+        - name: device-dir
+          mountPath: /dev
+        - name: local-path-dir
+          mountPath: {{ .Values.storage.localPath }}
+          mountPropagation: "Bidirectional"
+        {{- with .Values.node.resources }}
+        resources:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      volumes:
+      - name: plugin-dir
+        hostPath:
+          path: /var/lib/kubelet/plugins/{{ .Values.csiDriver.name }}
+          type: DirectoryOrCreate
+      - name: registration-dir
+        hostPath:
+          path: /var/lib/kubelet/plugins_registry/
+          type: Directory
+      - name: pods-mount-dir
+        hostPath:
+          path: /var/lib/kubelet
+          type: Directory
+      - name: device-dir
+        hostPath:
+          path: /dev
+      - name: local-path-dir
+        hostPath:
+          path: {{ .Values.storage.localPath }}
+          type: DirectoryOrCreate
+      {{- with .Values.node.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

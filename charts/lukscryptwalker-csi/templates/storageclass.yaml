@@ -1,0 +1,44 @@
+{{- if .Values.storageClass.create -}}
+---
+{{- if .Values.storageClass.secret.create }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Values.storageClass.secret.name }}
+  namespace: {{ .Values.storageClass.secret.namespace }}
+  labels:
+    {{- include "lukscryptwalker-csi.labels" . | nindent 4 }}
+type: Opaque
+data:
+  {{- if .Values.storageClass.secret.passphrase }}
+  passphrase: {{ .Values.storageClass.secret.passphrase }}
+  {{- else }}
+  # Auto-generated passphrase (base64 encoded)
+  passphrase: {{ randAlphaNum 32 | b64enc | quote }}
+  {{- end }}
+
+---
+{{- end }}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.storageClass.name }}
+  labels:
+    {{- include "lukscryptwalker-csi.labels" . | nindent 4 }}
+  {{- if .Values.storageClass.isDefault }}
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+  {{- end }}
+provisioner: {{ .Values.csiDriver.name }}
+parameters:
+  # Local path where volumes will be stored
+  local-path: {{ .Values.storage.localPath | quote }}
+  
+  # LUKS encryption parameters
+  csi.storage.k8s.io/node-stage-secret-name: {{ .Values.storageClass.secret.name | quote }}
+  csi.storage.k8s.io/node-stage-secret-namespace: {{ .Values.storageClass.secret.namespace | quote }}
+
+reclaimPolicy: {{ .Values.storageClass.reclaimPolicy }}
+allowVolumeExpansion: {{ .Values.storageClass.allowVolumeExpansion }}
+volumeBindingMode: {{ .Values.storageClass.volumeBindingMode }}
+{{- end }}

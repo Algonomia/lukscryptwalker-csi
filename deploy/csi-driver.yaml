@@ -1,0 +1,233 @@
+---
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: lukscrypt.csi.k8s.io
+spec:
+  attachRequired: false
+  podInfoOnMount: false
+  volumeLifecycleModes:
+  - Persistent
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lukscryptwalker-csi-controller
+  namespace: kube-system
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: lukscryptwalker-csi-controller
+rules:
+- apiGroups: [""]
+  resources: ["persistentvolumes"]
+  verbs: ["get", "list", "watch", "create", "delete", "patch"]
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["get", "list", "watch", "update"]
+- apiGroups: ["storage.k8s.io"]
+  resources: ["storageclasses"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["list", "watch", "create", "update", "patch"]
+- apiGroups: ["storage.k8s.io"]
+  resources: ["csinodes"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: lukscryptwalker-csi-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: lukscryptwalker-csi-controller
+subjects:
+- kind: ServiceAccount
+  name: lukscryptwalker-csi-controller
+  namespace: kube-system
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lukscryptwalker-csi-node
+  namespace: kube-system
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: lukscryptwalker-csi-node
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: lukscryptwalker-csi-node
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: lukscryptwalker-csi-node
+subjects:
+- kind: ServiceAccount
+  name: lukscryptwalker-csi-node
+  namespace: kube-system
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: lukscryptwalker-csi-controller
+  namespace: kube-system
+spec:
+  serviceName: lukscryptwalker-csi-controller
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lukscryptwalker-csi-controller
+  template:
+    metadata:
+      labels:
+        app: lukscryptwalker-csi-controller
+    spec:
+      serviceAccountName: lukscryptwalker-csi-controller
+      containers:
+      - name: csi-provisioner
+        image: registry.k8s.io/sig-storage/csi-provisioner:v3.6.2
+        args:
+        - "--csi-address=$(ADDRESS)"
+        - "--v=5"
+        - "--feature-gates=Topology=true"
+        - "--strict-topology=false"
+        env:
+        - name: ADDRESS
+          value: /var/lib/csi/sockets/pluginproxy/csi.sock
+        volumeMounts:
+        - name: socket-dir
+          mountPath: /var/lib/csi/sockets/pluginproxy/
+      - name: lukscryptwalker-csi
+        image: lukscryptwalker-csi:latest
+        imagePullPolicy: Always
+        args:
+        - "--endpoint=$(CSI_ENDPOINT)"
+        - "--nodeid=$(KUBE_NODE_NAME)"
+        env:
+        - name: CSI_ENDPOINT
+          value: unix:///var/lib/csi/sockets/pluginproxy/csi.sock
+        - name: KUBE_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        volumeMounts:
+        - name: socket-dir
+          mountPath: /var/lib/csi/sockets/pluginproxy/
+      volumes:
+      - name: socket-dir
+        emptyDir: {}
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: lukscryptwalker-csi-node
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: lukscryptwalker-csi-node
+  template:
+    metadata:
+      labels:
+        app: lukscryptwalker-csi-node
+    spec:
+      serviceAccountName: lukscryptwalker-csi-node
+      hostNetwork: true
+      containers:
+      - name: node-driver-registrar
+        image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.9.2
+        args:
+        - "--v=5"
+        - "--csi-address=$(ADDRESS)"
+        - "--kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)"
+        env:
+        - name: ADDRESS
+          value: /csi/csi.sock
+        - name: DRIVER_REG_SOCK_PATH
+          value: /var/lib/kubelet/plugins/lukscrypt.csi.k8s.io/csi.sock
+        - name: KUBE_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        volumeMounts:
+        - name: plugin-dir
+          mountPath: /csi/
+        - name: registration-dir
+          mountPath: /registration/
+      - name: lukscryptwalker-csi
+        image: lukscryptwalker-csi:latest
+        imagePullPolicy: Always
+        securityContext:
+          privileged: true
+          capabilities:
+            add: ["SYS_ADMIN"]
+          allowPrivilegeEscalation: true
+        args:
+        - "--endpoint=$(CSI_ENDPOINT)"
+        - "--nodeid=$(KUBE_NODE_NAME)"
+        env:
+        - name: CSI_ENDPOINT
+          value: unix:///csi/csi.sock
+        - name: KUBE_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        volumeMounts:
+        - name: plugin-dir
+          mountPath: /csi
+        - name: pods-mount-dir
+          mountPath: /var/lib/kubelet
+          mountPropagation: "Bidirectional"
+        - name: device-dir
+          mountPath: /dev
+        - name: local-path-dir
+          mountPath: /opt/local-path-provisioner
+          mountPropagation: "Bidirectional"
+      volumes:
+      - name: plugin-dir
+        hostPath:
+          path: /var/lib/kubelet/plugins/lukscrypt.csi.k8s.io
+          type: DirectoryOrCreate
+      - name: registration-dir
+        hostPath:
+          path: /var/lib/kubelet/plugins_registry/
+          type: Directory
+      - name: pods-mount-dir
+        hostPath:
+          path: /var/lib/kubelet
+          type: Directory
+      - name: device-dir
+        hostPath:
+          path: /dev
+      - name: local-path-dir
+        hostPath:
+          path: /opt/local-path-provisioner
+          type: DirectoryOrCreate
