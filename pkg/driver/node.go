@@ -16,11 +16,12 @@ import (
 )
 
 const (
-	LocalPathKey       = "local-path"
-	DefaultLocalPath   = "/opt/local-path-provisioner"
-	SecretNamespaceKey = "csi.storage.k8s.io/node-stage-secret-namespace"
-	SecretNameKey      = "csi.storage.k8s.io/node-stage-secret-name"
-	PassphraseKey      = "passphrase"
+	LocalPathKey         = "local-path"
+	DefaultLocalPath     = "/opt/local-path-provisioner"
+	SecretNamespaceKey   = "csi.storage.k8s.io/node-stage-secret-namespace"
+	SecretNameKey        = "csi.storage.k8s.io/node-stage-secret-name"
+	PassphraseKeyParam   = "passphraseKey"
+	DefaultPassphraseKey = "passphrase"
 )
 
 type NodeServer struct {
@@ -73,8 +74,14 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		}
 	}
 
+	// Get the passphrase key name from volume context
+	passphraseKey := req.GetVolumeContext()[PassphraseKeyParam]
+	if passphraseKey == "" {
+		passphraseKey = DefaultPassphraseKey
+	}
+
 	// Get passphrase from secrets
-	passphrase, err := ns.getPassphrase(req.GetSecrets())
+	passphrase, err := ns.getPassphrase(req.GetSecrets(), passphraseKey)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Failed to get passphrase: %v", err)
 	}
@@ -271,11 +278,11 @@ func (ns *NodeServer) createBackingFile(filePath, size string) error {
 	return nil
 }
 
-func (ns *NodeServer) getPassphrase(secrets map[string]string) (string, error) {
-	if passphrase, ok := secrets[PassphraseKey]; ok {
+func (ns *NodeServer) getPassphrase(secrets map[string]string, passphraseKey string) (string, error) {
+	if passphrase, ok := secrets[passphraseKey]; ok {
 		return passphrase, nil
 	}
-	return "", fmt.Errorf("passphrase not found in secrets")
+	return "", fmt.Errorf("passphrase not found in secrets with key '%s'", passphraseKey)
 }
 
 func (ns *NodeServer) formatDevice(devicePath string, capability *csi.VolumeCapability) error {

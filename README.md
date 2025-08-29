@@ -1,4 +1,4 @@
-# LUKS CSI Driver
+# LUKSCryptWalker - LUKS CSI Driver
 
 A Kubernetes CSI driver that provides LUKS encryption on top of local storage, similar to rancher.io/local-path but with built-in encryption capabilities.
 
@@ -107,7 +107,7 @@ parameters:
    kind: StorageClass
    metadata:
      name: lukscrypt-local
-   provisioner: lukscrypt.csi.k8s.io
+   provisioner: lukscryptwalker.csi.k8s.io
    parameters:
      local-path: "/opt/local-path-provisioner"
      csi.storage.k8s.io/node-stage-secret-name: "luks-secret"

@@ -37,6 +37,9 @@ parameters:
   # LUKS encryption parameters
   csi.storage.k8s.io/node-stage-secret-name: {{ .Values.storageClass.secret.name | quote }}
   csi.storage.k8s.io/node-stage-secret-namespace: {{ .Values.storageClass.secret.namespace | quote }}
+  
+  # Key name within the secret that contains the passphrase
+  passphraseKey: {{ .Values.storageClass.secret.passphraseKey | quote }}
 
 reclaimPolicy: {{ .Values.storageClass.reclaimPolicy }}
 allowVolumeExpansion: {{ .Values.storageClass.allowVolumeExpansion }}

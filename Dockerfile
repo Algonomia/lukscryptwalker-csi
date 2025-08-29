@@ -44,7 +44,7 @@ RUN chmod +x /usr/local/bin/lukscryptwalker-csi
 RUN mkdir -p /opt/local-path-provisioner && \
     chown -R lukscrypt:lukscrypt /opt/local-path-provisioner
 
-# Switch to non-root user for build
-USER lukscrypt
+# Note: User will be set by Kubernetes securityContext
+# Controller runs as non-root, Node runs as root for privileged operations
 
 ENTRYPOINT ["/usr/local/bin/lukscryptwalker-csi"]

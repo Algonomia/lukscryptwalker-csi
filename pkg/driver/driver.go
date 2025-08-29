@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	DriverName    = "lukscrypt.csi.k8s.io"
+	DriverName    = "lukscryptwalker.csi.k8s.io"
 	DriverVersion = "1.0.0"
 )
 

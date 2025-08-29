@@ -1,6 +1,6 @@
-# LUKS CSI Driver Helm Chart
+# LUKSCryptWalker - LUKS CSI Driver Helm Chart
 
-This Helm chart deploys the LUKS CSI Driver on a Kubernetes cluster using the Helm package manager.
+This Helm chart deploys the LUKSCryptWalker, a LUKS CSI Driver on a Kubernetes cluster using the Helm package manager.
 
 ## Prerequisites
 
@@ -39,7 +39,7 @@ The following table lists the configurable parameters and their default values:
 | `image.repository` | Container image repository | `lukscryptwalker-csi` |
 | `image.tag` | Container image tag | `latest` |
 | `image.pullPolicy` | Image pull policy | `IfNotPresent` |
-| `csiDriver.name` | CSI driver name | `lukscrypt.csi.k8s.io` |
+| `csiDriver.name` | CSI driver name | `lukscryptwalker.csi.k8s.io` |
 | `controller.replicas` | Controller replicas | `1` |
 | `storage.localPath` | Local storage path | `/opt/local-path-provisioner` |
 | `storageClass.create` | Create StorageClass | `true` |

@@ -1,5 +1,5 @@
 image:
-  repository: lukscryptwalker-csi
+  repository: briceguillaume/lukscryptwalker-csi
   tag: "latest"
   pullPolicy: IfNotPresent
 
@@ -8,7 +8,7 @@ imagePullSecrets: []
 
 # CSI Driver configuration
 csiDriver:
-  name: lukscrypt.csi.k8s.io
+  name: lukscryptwalker.csi.k8s.io
   attachRequired: false
   podInfoOnMount: false
 
@@ -17,7 +17,7 @@ controller:
   replicas: 1
   
   image:
-    repository: lukscryptwalker-csi
+    repository: briceguillaume/lukscryptwalker-csi
     tag: "latest"
     pullPolicy: IfNotPresent
   
@@ -49,7 +49,7 @@ controller:
 # Node configuration  
 node:
   image:
-    repository: lukscryptwalker-csi
+    repository: briceguillaume/lukscryptwalker-csi
     tag: "latest" 
     pullPolicy: IfNotPresent
     
@@ -99,6 +99,8 @@ storageClass:
     create: true
     # If create is false, provide your own passphrase (base64 encoded)
     passphrase: ""
+    # Key name within the secret that contains the passphrase
+    passphraseKey: "passphrase"
 
 # RBAC configuration
 rbac:
@@ -126,6 +128,8 @@ securityContext:
   # Node must run privileged for LUKS operations
   node:
     privileged: true
+    runAsUser: 0
+    runAsGroup: 0
     allowPrivilegeEscalation: true
     capabilities:
       add: ["SYS_ADMIN"]

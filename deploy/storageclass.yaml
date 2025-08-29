@@ -2,7 +2,7 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: lukscryptwalker-local
-provisioner: lukscrypt.csi.k8s.io
+provisioner: lukscryptwalker.csi.k8s.io
 parameters:
   # Local path where volumes will be stored
   local-path: "/opt/local-path-provisioner"
@@ -11,6 +11,9 @@ parameters:
   # Reference to secret containing the passphrase
   csi.storage.k8s.io/node-stage-secret-name: "luks-secret"
   csi.storage.k8s.io/node-stage-secret-namespace: "kube-system"
+  
+  # Key name within the secret that contains the passphrase (default: "passphrase")
+  passphraseKey: "passphrase"
   
   # Optional: specify filesystem type (default: ext4)
   # fsType: "ext4"
