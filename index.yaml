@@ -4,8 +4,32 @@ entries:
   - annotations:
       category: Storage
     apiVersion: v2
+    appVersion: 1.0.1
+    created: "2025-08-30T23:40:43.314744025+02:00"
+    description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
+      driver with LUKS encryption
+    digest: 0e5cf7de5dd22f1cc1923dc3751c13bde1b6cdfd83dad32967946b7e21ae1b20
+    home: https://github.com/Algonomia/lukscryptwalker-csi
+    keywords:
+    - storage
+    - csi
+    - luks
+    - encryption
+    maintainers:
+    - email: brice.guillaume@algonomia.com
+      name: Brice GUILLAUME - Algonomia
+    name: lukscryptwalker-csi
+    sources:
+    - https://github.com/Algonomia/lukscryptwalker-csi
+    type: application
+    urls:
+    - https://algonomia.github.io/lukscryptwalker-csi/lukscryptwalker-csi-1.0.1.tgz
+    version: 1.0.1
+  - annotations:
+      category: Storage
+    apiVersion: v2
     appVersion: 1.0.0
-    created: "2025-08-29T17:20:41.685281989+02:00"
+    created: "2025-08-30T23:40:43.314341592+02:00"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 5fd0d9a45a7d7b6afe0d4570cf3a228c66a09b30ae2a1311670ea14c9f5144ef
@@ -25,4 +49,4 @@ entries:
     urls:
     - https://algonomia.github.io/lukscryptwalker-csi/lukscryptwalker-csi-1.0.0.tgz
     version: 1.0.0
-generated: "2025-08-29T17:20:41.684358979+02:00"
+generated: "2025-08-30T23:40:43.313594964+02:00"
