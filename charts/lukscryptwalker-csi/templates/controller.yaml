@@ -69,6 +69,8 @@ spec:
         volumeMounts:
         - name: socket-dir
           mountPath: /var/lib/csi/sockets/pluginproxy/
+        - name: local-path
+          mountPath: {{ .Values.storage.localPath }}
         {{- with .Values.securityContext.controller }}
         securityContext:
           {{- toYaml . | nindent 10 }}
@@ -80,6 +82,10 @@ spec:
       volumes:
       - name: socket-dir
         emptyDir: {}
+      - name: local-path
+        hostPath:
+          path: {{ .Values.storage.localPath }}
+          type: DirectoryOrCreate
       {{- with .Values.controller.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
