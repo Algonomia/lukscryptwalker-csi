@@ -406,8 +406,16 @@ func (ns *NodeServer) setDirectoryPermissions(path string, fsGroup *int64) error
 		return fmt.Errorf("failed to create directory: %v", err)
 	}
 	
-	// If fsGroup is specified, change group ownership
+	// If fsGroup is specified, set both permissions and group ownership explicitly
 	if fsGroup != nil {
+		// Explicitly set the permissions to ensure they're correct
+		if err := os.Chmod(path, mode); err != nil {
+			klog.Warningf("Failed to set permissions %o: %v", mode, err)
+		} else {
+			klog.Infof("Successfully set permissions %o for %s", mode, path)
+		}
+		
+		// Change group ownership
 		if err := os.Chown(path, -1, int(*fsGroup)); err != nil {
 			klog.Warningf("Failed to change group ownership to %d: %v", *fsGroup, err)
 			// Don't fail the mount, just log the warning
