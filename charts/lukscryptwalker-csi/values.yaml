@@ -1,6 +1,6 @@
 image:
   repository: briceguillaume/lukscryptwalker-csi
-  tag: "v1.0.1"
+  tag: "v1.0.2"
   pullPolicy: IfNotPresent
 
 # Image pull secrets
@@ -10,7 +10,7 @@ imagePullSecrets: []
 csiDriver:
   name: lukscryptwalker.csi.k8s.io
   attachRequired: false
-  podInfoOnMount: false
+  podInfoOnMount: true  # Enable to get pod fsGroup information
 
 # Controller configuration
 controller:
@@ -18,7 +18,7 @@ controller:
   
   image:
     repository: briceguillaume/lukscryptwalker-csi
-    tag: "v1.0.1"
+    tag: "v1.0.2"
     pullPolicy: IfNotPresent
   
   # Sidecar images
@@ -50,7 +50,7 @@ controller:
 node:
   image:
     repository: briceguillaume/lukscryptwalker-csi
-    tag: "v1.0.1"
+    tag: "v1.0.2"
     pullPolicy: IfNotPresent
     
   # Sidecar images
@@ -135,8 +135,7 @@ securityContext:
 
 # Pod security context (for pod-level settings like fsGroup)
 podSecurityContext:
-  controller:
-    fsGroup: 1001
+  controller: {}  # No fsGroup needed - directories are created with 0777 permissions
   node: {}
 
 # Logging
@@ -151,6 +150,3 @@ tolerations: []
 
 # Pod annotations
 podAnnotations: {}
-
-# Pod security context
-podSecurityContext: {}

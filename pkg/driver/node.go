@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -60,8 +61,11 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		localPath = filepath.Join(DefaultLocalPath, volumeID)
 	}
 
-	// Ensure the local path directory exists
-	if err := os.MkdirAll(localPath, 0755); err != nil {
+	// Extract fsGroup from pod volume context
+	fsGroup := ns.extractFsGroup(req.GetVolumeContext())
+
+	// Ensure the local path directory exists with appropriate permissions
+	if err := ns.setDirectoryPermissions(localPath, fsGroup); err != nil {
 		return nil, status.Errorf(codes.Internal, "Failed to create local path directory %s: %v", localPath, err)
 	}
 
@@ -156,8 +160,11 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return nil, status.Error(codes.InvalidArgument, "Target path missing in request")
 	}
 
-	// Bind mount from staging to target
-	if err := ns.bindMount(stagingTargetPath, targetPath, req.GetReadonly()); err != nil {
+	// Extract fsGroup from pod volume context
+	fsGroup := ns.extractFsGroup(req.GetVolumeContext())
+
+	// Bind mount from staging to target with appropriate permissions
+	if err := ns.bindMount(stagingTargetPath, targetPath, req.GetReadonly(), fsGroup); err != nil {
 		return nil, status.Errorf(codes.Internal, "Failed to bind mount: %v", err)
 	}
 
@@ -331,7 +338,7 @@ func (ns *NodeServer) mountDevice(devicePath, targetPath string, capability *csi
 	}
 
 	// Create target directory
-	if err := os.MkdirAll(targetPath, 0755); err != nil {
+	if err := os.MkdirAll(targetPath, 0777); err != nil {
 		return fmt.Errorf("failed to create target directory: %v", err)
 	}
 
@@ -357,10 +364,44 @@ func (ns *NodeServer) mountDevice(devicePath, targetPath string, capability *csi
 	return nil
 }
 
-func (ns *NodeServer) bindMount(sourcePath, targetPath string, readonly bool) error {
-	// Create target directory
-	if err := os.MkdirAll(targetPath, 0755); err != nil {
-		return fmt.Errorf("failed to create target directory: %v", err)
+// extractFsGroup extracts the fsGroup from pod volume context
+func (ns *NodeServer) extractFsGroup(volumeContext map[string]string) *int64 {
+	if fsGroupStr, exists := volumeContext["csi.storage.k8s.io/pod.spec.securityContext.fsGroup"]; exists {
+		if fsGroup, err := strconv.ParseInt(fsGroupStr, 10, 64); err == nil {
+			klog.V(4).Infof("Found fsGroup %d from pod volume context", fsGroup)
+			return &fsGroup
+		}
+	}
+	return nil
+}
+
+// setDirectoryPermissions sets directory permissions based on fsGroup
+func (ns *NodeServer) setDirectoryPermissions(path string, fsGroup *int64) error {
+	// Create directory with appropriate permissions
+	var mode os.FileMode = 0755 // Default permissions
+	if fsGroup != nil {
+		mode = 0775 // Group writable when fsGroup is set
+	}
+	
+	if err := os.MkdirAll(path, mode); err != nil {
+		return fmt.Errorf("failed to create directory: %v", err)
+	}
+	
+	// If fsGroup is specified, change group ownership
+	if fsGroup != nil {
+		if err := os.Chown(path, -1, int(*fsGroup)); err != nil {
+			klog.Warningf("Failed to change group ownership to %d: %v", *fsGroup, err)
+			// Don't fail the mount, just log the warning
+		}
+	}
+	
+	return nil
+}
+
+func (ns *NodeServer) bindMount(sourcePath, targetPath string, readonly bool, fsGroup *int64) error {
+	// Create target directory with appropriate permissions
+	if err := ns.setDirectoryPermissions(targetPath, fsGroup); err != nil {
+		return err
 	}
 
 	args := []string{"--bind", sourcePath, targetPath}
