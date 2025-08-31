@@ -111,6 +111,11 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		return nil, status.Errorf(codes.Internal, "Failed to mount device: %v", err)
 	}
 
+	// Set permissions on the mounted filesystem root directory
+	if err := ns.setDirectoryPermissions(stagingTargetPath, fsGroup); err != nil {
+		return nil, status.Errorf(codes.Internal, "Failed to set permissions on mounted filesystem: %v", err)
+	}
+
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
