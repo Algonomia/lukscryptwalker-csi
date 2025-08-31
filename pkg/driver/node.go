@@ -415,12 +415,12 @@ func (ns *NodeServer) setDirectoryPermissions(path string, fsGroup *int64) error
 			klog.Infof("Successfully set permissions %o for %s", mode, path)
 		}
 		
-		// Change group ownership
-		if err := os.Chown(path, -1, int(*fsGroup)); err != nil {
-			klog.Warningf("Failed to change group ownership to %d: %v", *fsGroup, err)
+		// Change both user and group ownership to fsGroup
+		if err := os.Chown(path, int(*fsGroup), int(*fsGroup)); err != nil {
+			klog.Warningf("Failed to change ownership to %d:%d: %v", *fsGroup, *fsGroup, err)
 			// Don't fail the mount, just log the warning
 		} else {
-			klog.Infof("Successfully set group ownership to %d for %s", *fsGroup, path)
+			klog.Infof("Successfully set ownership to %d:%d for %s", *fsGroup, *fsGroup, path)
 		}
 	}
 	
