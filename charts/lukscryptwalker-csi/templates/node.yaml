@@ -21,7 +21,7 @@ spec:
       {{- include "lukscryptwalker-csi.imagePullSecrets" . | nindent 6 }}
       serviceAccountName: {{ include "lukscryptwalker-csi.node.serviceAccountName" . }}
       hostNetwork: true
-      {{- with .Values.podSecurityContext }}
+      {{- with .Values.podSecurityContext.node }}
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}

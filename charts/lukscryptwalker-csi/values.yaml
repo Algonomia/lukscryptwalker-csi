@@ -124,7 +124,6 @@ securityContext:
     runAsNonRoot: true
     runAsUser: 1001
     runAsGroup: 1001
-    fsGroup: 1001
   # Node must run privileged for LUKS operations
   node:
     privileged: true
@@ -133,6 +132,12 @@ securityContext:
     allowPrivilegeEscalation: true
     capabilities:
       add: ["SYS_ADMIN"]
+
+# Pod security context (for pod-level settings like fsGroup)
+podSecurityContext:
+  controller:
+    fsGroup: 1001
+  node: {}
 
 # Logging
 logging:
