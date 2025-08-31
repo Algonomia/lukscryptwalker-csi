@@ -85,7 +85,7 @@ storage:
 # StorageClass configuration
 storageClass:
   create: true
-  name: lukscrypt-local
+  name: lukscryptwalker-local
   isDefault: false
   reclaimPolicy: Delete
   allowVolumeExpansion: true
