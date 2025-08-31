@@ -1,6 +1,6 @@
 image:
   repository: briceguillaume/lukscryptwalker-csi
-  tag: "v1.0.2"
+  tag: "v1.0.3"
   pullPolicy: IfNotPresent
 
 # Image pull secrets
@@ -18,7 +18,7 @@ controller:
   
   image:
     repository: briceguillaume/lukscryptwalker-csi
-    tag: "v1.0.2"
+    tag: "v1.0.3"
     pullPolicy: IfNotPresent
   
   # Sidecar images
@@ -50,7 +50,7 @@ controller:
 node:
   image:
     repository: briceguillaume/lukscryptwalker-csi
-    tag: "v1.0.2"
+    tag: "v1.0.3"
     pullPolicy: IfNotPresent
     
   # Sidecar images
@@ -82,25 +82,67 @@ storage:
   # Default size for backing files
   defaultSize: "1Gi"
 
-# StorageClass configuration
-storageClass:
+# LUKS secret configuration (shared by all StorageClasses by default)
+secret:
+  name: luks-secret
+  namespace: kube-system
+  # Auto-create secret with random passphrase
   create: true
-  name: lukscryptwalker-local
-  isDefault: false
-  reclaimPolicy: Delete
-  allowVolumeExpansion: true
-  volumeBindingMode: WaitForFirstConsumer
+  # If create is false, provide your own passphrase (base64 encoded)
+  passphrase: ""
+  # Key name within the secret that contains the passphrase
+  passphraseKey: "passphrase"
+
+# StorageClasses configuration - all StorageClasses are defined here
+storageClasses:
+  # Default StorageClass with automatic fsGroup detection
+  - name: lukscryptwalker-local
+    isDefault: false
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: WaitForFirstConsumer
+    # fsGroup: null  # Auto-detect from pod (default behavior)
+    secret:
+      name: luks-secret
+      namespace: kube-system
+      passphraseKey: "passphrase"
   
-  # LUKS secret configuration
-  secret:
-    name: luks-secret
-    namespace: kube-system
-    # Auto-create secret with random passphrase
-    create: true
-    # If create is false, provide your own passphrase (base64 encoded)
-    passphrase: ""
-    # Key name within the secret that contains the passphrase
-    passphraseKey: "passphrase"
+  # Example configurations for different database types
+  # Uncomment and customize as needed
+  
+  # - name: lukscryptwalker-postgres
+  #   isDefault: false
+  #   reclaimPolicy: Delete
+  #   allowVolumeExpansion: true
+  #   volumeBindingMode: WaitForFirstConsumer
+  #   fsGroup: 26  # PostgreSQL group
+  #   secret:
+  #     name: luks-secret
+  #     namespace: kube-system
+  #     passphraseKey: "passphrase"
+  
+  # - name: lukscryptwalker-mysql
+  #   isDefault: false
+  #   reclaimPolicy: Delete
+  #   allowVolumeExpansion: true
+  #   volumeBindingMode: WaitForFirstConsumer
+  #   fsGroup: 999  # MySQL group
+  #   secret:
+  #     name: luks-secret
+  #     namespace: kube-system
+  #     passphraseKey: "passphrase"
+  
+  # - name: lukscryptwalker-custom
+  #   isDefault: false
+  #   reclaimPolicy: Delete
+  #   allowVolumeExpansion: true
+  #   volumeBindingMode: WaitForFirstConsumer
+  #   fsGroup: 1001  # Custom application group
+  #   localPath: "/mnt/custom-volumes"  # Optional: different path
+  #   secret:
+  #     name: custom-luks-secret
+  #     namespace: kube-system
+  #     passphraseKey: "encryption-key"
 
 # RBAC configuration
 rbac:

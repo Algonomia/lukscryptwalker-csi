@@ -36,6 +36,10 @@ parameters:
   
   # Filesystem type (optional, default: ext4)
   fsType: "ext4"
+  
+  # Manual fsGroup override (optional)
+  # If set, this fsGroup will be used for this StorageClass instead of auto-detecting from pods
+  fsGroup: "26"  # Example: Use PostgreSQL group ID
 ```
 
 ## Prerequisites
@@ -73,19 +77,28 @@ parameters:
    # my-values.yaml
    image:
      repository: my-registry/lukscryptwalker-csi
-     tag: "v1.0.0"
-   
-   storageClass:
-     name: my-encrypted-storage
-     isDefault: true
+     tag: "v1.0.3"
    
    storage:
      localPath: "/mnt/encrypted-volumes"
    
-   # Configure passphrase key name
-   storageClass:
-     secret:
-       passphraseKey: "my-custom-key"
+   # Create multiple StorageClasses for different use cases
+   storageClasses:
+     - name: my-encrypted-storage
+       isDefault: true
+       fsGroup: 26  # PostgreSQL
+       secret:
+         name: luks-secret
+         namespace: kube-system
+         passphraseKey: "passphrase"
+     
+     - name: mysql-encrypted
+       fsGroup: 999  # MySQL
+       localPath: "/mnt/mysql-volumes"
+       secret:
+         name: luks-secret
+         namespace: kube-system
+         passphraseKey: "passphrase"
    ```
 
 ### Option 2: Direct Kubernetes Manifests
@@ -198,6 +211,58 @@ parameters:
    volumeBindingMode: WaitForFirstConsumer
    allowVolumeExpansion: true
    ```
+
+## File System Permissions
+
+The driver supports flexible file system permission management:
+
+### Automatic fsGroup Detection (Recommended)
+By default, the driver automatically detects the `fsGroup` from requesting pods and sets appropriate permissions:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: postgres-pod
+spec:
+  securityContext:
+    fsGroup: 26  # PostgreSQL group
+  containers:
+  - name: postgres
+    image: postgres:15
+    volumeMounts:
+    - name: data
+      mountPath: /var/lib/postgresql/data
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: postgres-pvc
+```
+
+The driver will automatically:
+- Create directories with `0775` permissions
+- Set group ownership to `26` (PostgreSQL group)
+- Allow both the container user and group to write
+
+### Manual fsGroup Override
+For scenarios where specific StorageClasses should always use a particular group, configure it directly in the StorageClass:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: postgres-encrypted
+provisioner: lukscryptwalker.csi.k8s.io
+parameters:
+  fsGroup: "26"  # Manual override for PostgreSQL
+  csi.storage.k8s.io/node-stage-secret-name: "luks-secret"
+  csi.storage.k8s.io/node-stage-secret-namespace: "kube-system"
+```
+
+### Permission Modes
+- **No fsGroup**: `0755` permissions (owner only) - uses auto-detection from pod
+- **With fsGroup**: `0775` permissions + group ownership - uses specified fsGroup from StorageClass
+- **StorageClass fsGroup takes precedence** over automatic pod detection
 
 ## Security Considerations
 

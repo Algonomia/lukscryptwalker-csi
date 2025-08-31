@@ -364,14 +364,25 @@ func (ns *NodeServer) mountDevice(devicePath, targetPath string, capability *csi
 	return nil
 }
 
-// extractFsGroup extracts the fsGroup from pod volume context
+// extractFsGroup extracts the fsGroup from manual override or pod volume context
 func (ns *NodeServer) extractFsGroup(volumeContext map[string]string) *int64 {
-	if fsGroupStr, exists := volumeContext["csi.storage.k8s.io/pod.spec.securityContext.fsGroup"]; exists {
+	// First check for manual fsGroup override in StorageClass parameters
+	if fsGroupStr, exists := volumeContext["fsGroup"]; exists {
 		if fsGroup, err := strconv.ParseInt(fsGroupStr, 10, 64); err == nil {
-			klog.V(4).Infof("Found fsGroup %d from pod volume context", fsGroup)
+			klog.V(4).Infof("Using manual fsGroup %d from StorageClass parameters", fsGroup)
 			return &fsGroup
 		}
 	}
+	
+	// Fall back to auto-detection from pod security context
+	if fsGroupStr, exists := volumeContext["csi.storage.k8s.io/pod.spec.securityContext.fsGroup"]; exists {
+		if fsGroup, err := strconv.ParseInt(fsGroupStr, 10, 64); err == nil {
+			klog.V(4).Infof("Auto-detected fsGroup %d from pod volume context", fsGroup)
+			return &fsGroup
+		}
+	}
+	
+	klog.V(4).Infof("No fsGroup found - using default permissions")
 	return nil
 }
 

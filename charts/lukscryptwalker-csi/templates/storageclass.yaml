@@ -1,47 +1,52 @@
-{{- if .Values.storageClass.create -}}
+{{- if .Values.secret.create }}
 ---
-{{- if .Values.storageClass.secret.create }}
 apiVersion: v1
 kind: Secret
 metadata:
-  name: {{ .Values.storageClass.secret.name }}
-  namespace: {{ .Values.storageClass.secret.namespace }}
+  name: {{ .Values.secret.name }}
+  namespace: {{ .Values.secret.namespace }}
   labels:
     {{- include "lukscryptwalker-csi.labels" . | nindent 4 }}
 type: Opaque
 data:
-  {{- if .Values.storageClass.secret.passphrase }}
-  passphrase: {{ .Values.storageClass.secret.passphrase }}
+  {{- if .Values.secret.passphrase }}
+  {{ .Values.secret.passphraseKey }}: {{ .Values.secret.passphrase }}
   {{- else }}
   # Auto-generated passphrase (base64 encoded)
-  passphrase: {{ randAlphaNum 32 | b64enc | quote }}
+  {{ .Values.secret.passphraseKey }}: {{ randAlphaNum 32 | b64enc | quote }}
   {{- end }}
-
----
 {{- end }}
+
+{{- range .Values.storageClasses }}
+---
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
-  name: {{ .Values.storageClass.name }}
+  name: {{ .name }}
   labels:
-    {{- include "lukscryptwalker-csi.labels" . | nindent 4 }}
-  {{- if .Values.storageClass.isDefault }}
+    {{- include "lukscryptwalker-csi.labels" $ | nindent 4 }}
+  {{- if .isDefault }}
   annotations:
     storageclass.kubernetes.io/is-default-class: "true"
   {{- end }}
-provisioner: {{ .Values.csiDriver.name }}
+provisioner: {{ $.Values.csiDriver.name }}
 parameters:
   # Local path where volumes will be stored
-  local-path: {{ .Values.storage.localPath | quote }}
+  local-path: {{ .localPath | default $.Values.storage.localPath | quote }}
   
   # LUKS encryption parameters
-  csi.storage.k8s.io/node-stage-secret-name: {{ .Values.storageClass.secret.name | quote }}
-  csi.storage.k8s.io/node-stage-secret-namespace: {{ .Values.storageClass.secret.namespace | quote }}
+  csi.storage.k8s.io/node-stage-secret-name: {{ .secret.name | quote }}
+  csi.storage.k8s.io/node-stage-secret-namespace: {{ .secret.namespace | quote }}
   
   # Key name within the secret that contains the passphrase
-  passphraseKey: {{ .Values.storageClass.secret.passphraseKey | quote }}
+  passphraseKey: {{ .secret.passphraseKey | quote }}
+  
+  {{- if .fsGroup }}
+  # Manual fsGroup override for this StorageClass
+  fsGroup: {{ .fsGroup | quote }}
+  {{- end }}
 
-reclaimPolicy: {{ .Values.storageClass.reclaimPolicy }}
-allowVolumeExpansion: {{ .Values.storageClass.allowVolumeExpansion }}
-volumeBindingMode: {{ .Values.storageClass.volumeBindingMode }}
+reclaimPolicy: {{ .reclaimPolicy | default "Delete" }}
+allowVolumeExpansion: {{ .allowVolumeExpansion | default true }}
+volumeBindingMode: {{ .volumeBindingMode | default "WaitForFirstConsumer" }}
 {{- end }}
