@@ -38,7 +38,7 @@ func NewNodeServer(d *Driver) *NodeServer {
 }
 
 func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
-	klog.V(4).Infof("NodeStageVolume called with request: %+v", req)
+	klog.Infof("NodeStageVolume called for volume %s", req.GetVolumeId())
 
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
@@ -143,7 +143,7 @@ func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 }
 
 func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
-	klog.V(4).Infof("NodePublishVolume called with request: %+v", req)
+	klog.Infof("NodePublishVolume called for volume %s", req.GetVolumeId())
 
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
@@ -369,7 +369,7 @@ func (ns *NodeServer) extractFsGroup(volumeContext map[string]string) *int64 {
 	// First check for manual fsGroup override in StorageClass parameters
 	if fsGroupStr, exists := volumeContext["fsGroup"]; exists {
 		if fsGroup, err := strconv.ParseInt(fsGroupStr, 10, 64); err == nil {
-			klog.V(4).Infof("Using manual fsGroup %d from StorageClass parameters", fsGroup)
+			klog.Infof("Using manual fsGroup %d from StorageClass parameters", fsGroup)
 			return &fsGroup
 		}
 	}
@@ -377,12 +377,12 @@ func (ns *NodeServer) extractFsGroup(volumeContext map[string]string) *int64 {
 	// Fall back to auto-detection from pod security context
 	if fsGroupStr, exists := volumeContext["csi.storage.k8s.io/pod.spec.securityContext.fsGroup"]; exists {
 		if fsGroup, err := strconv.ParseInt(fsGroupStr, 10, 64); err == nil {
-			klog.V(4).Infof("Auto-detected fsGroup %d from pod volume context", fsGroup)
+			klog.Infof("Auto-detected fsGroup %d from pod volume context", fsGroup)
 			return &fsGroup
 		}
 	}
 	
-	klog.V(4).Infof("No fsGroup found - using default permissions")
+	klog.Infof("No fsGroup found - using default permissions")
 	return nil
 }
 
@@ -392,6 +392,9 @@ func (ns *NodeServer) setDirectoryPermissions(path string, fsGroup *int64) error
 	var mode os.FileMode = 0755 // Default permissions
 	if fsGroup != nil {
 		mode = 0775 // Group writable when fsGroup is set
+		klog.Infof("Creating directory %s with mode 0775 and group ownership %d", path, *fsGroup)
+	} else {
+		klog.Infof("Creating directory %s with mode 0755 (no fsGroup)", path)
 	}
 	
 	if err := os.MkdirAll(path, mode); err != nil {
@@ -403,6 +406,8 @@ func (ns *NodeServer) setDirectoryPermissions(path string, fsGroup *int64) error
 		if err := os.Chown(path, -1, int(*fsGroup)); err != nil {
 			klog.Warningf("Failed to change group ownership to %d: %v", *fsGroup, err)
 			// Don't fail the mount, just log the warning
+		} else {
+			klog.Infof("Successfully set group ownership to %d for %s", *fsGroup, path)
 		}
 	}
 	
