@@ -70,7 +70,7 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	}
 
 	// Create a backing file for LUKS if it doesn't exist
-	backingFile := filepath.Join(localPath, "luks.img")
+	backingFile := filepath.Join(localPath, fmt.Sprintf("luks-%s.img", volumeID))
 	if _, err := os.Stat(backingFile); os.IsNotExist(err) {
 		// Create a sparse file (1GB by default, can be made configurable)
 		if err := ns.createBackingFile(backingFile, "1G"); err != nil {
