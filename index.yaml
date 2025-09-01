@@ -23,6 +23,6 @@ entries:
     - https://github.com/Algonomia/lukscryptwalker-csi
     type: application
     urls:
-    - https://github.com/Algonomia/lukscryptwalker-csi/releases/download/lukscryptwalker-csi-1.1.6.tgz
+    - https://algonomia.github.io/lukscryptwalker-csi/lukscryptwalker-csi-1.1.6.tgz
     version: 1.1.6
 generated: "2025-09-01T11:33:42.204990912+02:00"
