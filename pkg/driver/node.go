@@ -70,10 +70,14 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	}
 
 	// Create a backing file for LUKS if it doesn't exist
-	backingFile := filepath.Join(localPath, fmt.Sprintf("luks-%s.img", volumeID))
+	backingFile := GenerateBackingFilePath(localPath, volumeID)
 	if _, err := os.Stat(backingFile); os.IsNotExist(err) {
-		// Create a sparse file (1GB by default, can be made configurable)
-		if err := ns.createBackingFile(backingFile, "1G"); err != nil {
+		// Get capacity from volume context (passed from controller)
+		capacityStr := req.GetVolumeContext()["capacity"]
+		if capacityStr == "" {
+			capacityStr = "1073741824" // Default 1GB in bytes
+		}
+		if err := CreateBackingFile(backingFile, capacityStr); err != nil {
 			return nil, status.Errorf(codes.Internal, "Failed to create backing file: %v", err)
 		}
 	}
@@ -142,6 +146,18 @@ func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 	mapperName := ns.luksManager.GenerateMapperName(volumeID)
 	if err := ns.luksManager.CloseLUKS(mapperName); err != nil {
 		return nil, status.Errorf(codes.Internal, "Failed to close LUKS device: %v", err)
+	}
+
+	// For volume deletion, clean up backing files and directories
+	// This happens when the volume is being permanently deleted
+	localPath := filepath.Join(DefaultLocalPath, volumeID)
+	
+	// Remove the entire volume directory and its contents (including backing file)
+	if err := os.RemoveAll(localPath); err != nil && !os.IsNotExist(err) {
+		klog.Warningf("Failed to clean up volume directory %s: %v", localPath, err)
+		// Don't fail the unstage operation due to cleanup issues
+	} else if !os.IsNotExist(err) {
+		klog.Infof("Successfully cleaned up volume directory: %s", localPath)
 	}
 
 	return &csi.NodeUnstageVolumeResponse{}, nil
@@ -248,12 +264,21 @@ func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 
 	klog.Infof("Expanding volume %s at path %s to %d bytes", volumeID, volumePath, requestedBytes)
 
+	// Determine local path and backing file
+	localPath := filepath.Join(DefaultLocalPath, volumeID)
+	backingFile := GenerateBackingFilePath(localPath, volumeID)
+
 	// Generate mapper name for this volume
 	mapperName := ns.luksManager.GenerateMapperName(volumeID)
 
 	// Check if LUKS device is opened
 	if !ns.luksManager.IsLUKSOpened(mapperName) {
 		return nil, status.Errorf(codes.FailedPrecondition, "LUKS device %s is not opened", mapperName)
+	}
+
+	// Expand the backing file to the requested size
+	if err := ExpandBackingFile(backingFile, requestedBytes); err != nil {
+		return nil, status.Errorf(codes.Internal, "Failed to expand backing file: %v", err)
 	}
 
 	// Resize the LUKS device to fill the expanded backing file
@@ -278,17 +303,6 @@ func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 
 // Helper methods
 
-func (ns *NodeServer) createBackingFile(filePath, size string) error {
-	cmd := exec.Command("fallocate", "-l", size, filePath)
-	if err := cmd.Run(); err != nil {
-		// Fallback to dd if fallocate is not available
-		cmd = exec.Command("dd", "if=/dev/zero", "of="+filePath, "bs=1G", "count=1", "seek=0")
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("failed to create backing file with dd: %v", err)
-		}
-	}
-	return nil
-}
 
 func (ns *NodeServer) getPassphrase(secrets map[string]string, passphraseKey string) (string, error) {
 	if passphrase, ok := secrets[passphraseKey]; ok {

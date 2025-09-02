@@ -48,8 +48,8 @@ spec:
         - name: registration-dir
           mountPath: /registration/
       - name: lukscryptwalker-csi
-        image: {{ .Values.node.image.repository }}:{{ .Values.node.image.tag | default .Chart.AppVersion }}
-        imagePullPolicy: {{ .Values.node.image.pullPolicy }}
+        image: {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
         {{- with .Values.securityContext.node }}
         securityContext:
           {{- toYaml . | nindent 10 }}

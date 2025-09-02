@@ -1,6 +1,6 @@
 image:
   repository: briceguillaume/lukscryptwalker-csi
-  tag: "v1.0.9"
+  tag: "v1.0.10"
   pullPolicy: IfNotPresent
 
 # Image pull secrets
@@ -15,11 +15,6 @@ csiDriver:
 # Controller configuration
 controller:
   replicas: 1
-  
-  image:
-    repository: briceguillaume/lukscryptwalker-csi
-    tag: "v1.0.9"
-    pullPolicy: IfNotPresent
   
   # Sidecar images
   sidecars:
@@ -48,11 +43,6 @@ controller:
 
 # Node configuration  
 node:
-  image:
-    repository: briceguillaume/lukscryptwalker-csi
-    tag: "v1.0.9"
-    pullPolicy: IfNotPresent
-    
   # Sidecar images
   sidecars:
     nodeDriverRegistrar:
