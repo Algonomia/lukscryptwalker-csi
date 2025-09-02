@@ -66,11 +66,13 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+        - name: CSI_LOCAL_PATH
+          value: {{ .Values.storage.defaultPath | quote }}
         volumeMounts:
         - name: socket-dir
           mountPath: /var/lib/csi/sockets/pluginproxy/
         - name: local-path
-          mountPath: {{ .Values.storage.localPath }}
+          mountPath: {{ .Values.storage.defaultPath }}
         {{- with .Values.securityContext.controller }}
         securityContext:
           {{- toYaml . | nindent 10 }}
@@ -84,7 +86,7 @@ spec:
         emptyDir: {}
       - name: local-path
         hostPath:
-          path: {{ .Values.storage.localPath }}
+          path: {{ .Values.storage.defaultPath }}
           type: DirectoryOrCreate
       {{- with .Values.controller.nodeSelector }}
       nodeSelector:

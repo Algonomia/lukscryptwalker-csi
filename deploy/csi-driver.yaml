@@ -1,3 +1,12 @@
+# LuksCryptwalker CSI Driver Deployment
+# 
+# To customize the storage path, change the CSI_LOCAL_PATH environment variable
+# in both the controller and node containers below (currently set to "/opt/local-path-provisioner")
+#
+# For example, to use "/mnt/encrypted-volumes":
+# - Change value: "/opt/local-path-provisioner" to value: "/mnt/encrypted-volumes" 
+# - Update the local-path-dir volume mountPath and hostPath accordingly
+
 ---
 apiVersion: storage.k8s.io/v1
 kind: CSIDriver
@@ -157,6 +166,8 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+        - name: CSI_LOCAL_PATH
+          value: "/opt/local-path-provisioner"
         volumeMounts:
         - name: socket-dir
           mountPath: /var/lib/csi/sockets/pluginproxy/
@@ -220,6 +231,8 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+        - name: CSI_LOCAL_PATH
+          value: "/opt/local-path-provisioner"
         volumeMounts:
         - name: plugin-dir
           mountPath: /csi

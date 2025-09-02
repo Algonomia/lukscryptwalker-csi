@@ -3,7 +3,6 @@ package driver
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
@@ -51,23 +50,14 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		}
 	}
 
-	// Get local path from parameters (store in volume context for nodes)
-	localPath := req.GetParameters()[LocalPathKey]
-	if localPath == "" {
-		localPath = filepath.Join(DefaultLocalPath, name)
-	}
-
 	// Store volume metadata - nodes will handle directory creation
 	volumeContext := map[string]string{
-		LocalPathKey: localPath,
-		"capacity":   fmt.Sprintf("%d", capacityBytes),
+		"capacity": fmt.Sprintf("%d", capacityBytes),
 	}
 
 	// Add any additional parameters to volume context
 	for k, v := range req.GetParameters() {
-		if k != LocalPathKey {
-			volumeContext[k] = v
-		}
+		volumeContext[k] = v
 	}
 
 	volume := &csi.Volume{

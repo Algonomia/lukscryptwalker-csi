@@ -2,6 +2,7 @@ package driver
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 
@@ -42,4 +43,15 @@ func CreateBackingFile(filePath, size string) error {
 // GenerateBackingFilePath creates a consistent backing file path for a given volume ID and local path
 func GenerateBackingFilePath(localPath, volumeID string) string {
 	return filepath.Join(localPath, fmt.Sprintf("luks-%s.img", volumeID))
+}
+
+// GetLocalPath determines the local path for a volume using environment variable
+func GetLocalPath(volumeID string) string {
+	// Use environment variable
+	if envPath := os.Getenv("CSI_LOCAL_PATH"); envPath != "" {
+		return filepath.Join(envPath, volumeID)
+	}
+	
+	// Fallback to default
+	return filepath.Join(DefaultLocalPath, volumeID)
 }

@@ -1,6 +1,6 @@
 image:
   repository: briceguillaume/lukscryptwalker-csi
-  tag: "v1.0.10"
+  tag: "v1.0.11"
   pullPolicy: IfNotPresent
 
 # Image pull secrets
@@ -66,8 +66,8 @@ node:
 
 # Storage configuration
 storage:
-  # Default local path for volumes
-  localPath: "/opt/local-path-provisioner"
+  # Default local path for volumes (overrides hardcoded fallback)
+  defaultPath: "/opt/local-path-provisioner"
   
   # Default size for backing files
   defaultSize: "1Gi"
@@ -128,7 +128,6 @@ storageClasses:
   #   allowVolumeExpansion: true
   #   volumeBindingMode: WaitForFirstConsumer
   #   fsGroup: 1001  # Custom application group
-  #   localPath: "/mnt/custom-volumes"  # Optional: different path
   #   secret:
   #     name: custom-luks-secret
   #     namespace: kube-system

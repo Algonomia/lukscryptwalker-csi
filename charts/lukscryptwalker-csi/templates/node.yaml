@@ -64,6 +64,8 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+        - name: CSI_LOCAL_PATH
+          value: {{ .Values.storage.defaultPath | quote }}
         volumeMounts:
         - name: plugin-dir
           mountPath: /csi
@@ -73,7 +75,7 @@ spec:
         - name: device-dir
           mountPath: /dev
         - name: local-path-dir
-          mountPath: {{ .Values.storage.localPath }}
+          mountPath: {{ .Values.storage.defaultPath }}
           mountPropagation: "Bidirectional"
         {{- with .Values.node.resources }}
         resources:
@@ -97,7 +99,7 @@ spec:
           path: /dev
       - name: local-path-dir
         hostPath:
-          path: {{ .Values.storage.localPath }}
+          path: {{ .Values.storage.defaultPath }}
           type: DirectoryOrCreate
       {{- with .Values.node.nodeSelector }}
       nodeSelector:

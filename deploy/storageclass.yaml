@@ -4,9 +4,6 @@ metadata:
   name: lukscryptwalker-local
 provisioner: lukscryptwalker.csi.k8s.io
 parameters:
-  # Local path where volumes will be stored
-  local-path: "/opt/local-path-provisioner"
-  
   # LUKS encryption parameters
   # Reference to secret containing the passphrase
   csi.storage.k8s.io/node-stage-secret-name: "luks-secret"

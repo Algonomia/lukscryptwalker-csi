@@ -31,9 +31,6 @@ metadata:
   {{- end }}
 provisioner: {{ $.Values.csiDriver.name }}
 parameters:
-  # Local path where volumes will be stored
-  local-path: {{ .localPath | default $.Values.storage.localPath | quote }}
-  
   # LUKS encryption parameters
   csi.storage.k8s.io/node-stage-secret-name: {{ .secret.name | quote }}
   csi.storage.k8s.io/node-stage-secret-namespace: {{ .secret.namespace | quote }}

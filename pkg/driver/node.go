@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -17,7 +16,6 @@ import (
 )
 
 const (
-	LocalPathKey         = "local-path"
 	DefaultLocalPath     = "/opt/local-path-provisioner"
 	SecretNamespaceKey   = "csi.storage.k8s.io/node-stage-secret-namespace"
 	SecretNameKey        = "csi.storage.k8s.io/node-stage-secret-name"
@@ -55,11 +53,14 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		return nil, status.Error(codes.InvalidArgument, "Volume capability missing in request")
 	}
 
-	// Get the local path from volume context
-	localPath := req.GetVolumeContext()[LocalPathKey]
-	if localPath == "" {
-		localPath = filepath.Join(DefaultLocalPath, volumeID)
+	// Check if volume is already staged (idempotency)
+	if ns.isVolumeStaged(volumeID, stagingTargetPath) {
+		klog.Infof("Volume %s is already staged at %s, returning success", volumeID, stagingTargetPath)
+		return &csi.NodeStageVolumeResponse{}, nil
 	}
+
+	// Get the local path using environment variable
+	localPath := GetLocalPath(volumeID)
 
 	// Extract fsGroup from pod volume context
 	fsGroup := ns.extractFsGroup(req.GetVolumeContext())
@@ -149,8 +150,7 @@ func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 	}
 
 	// For volume deletion, clean up backing files and directories
-	// This happens when the volume is being permanently deleted
-	localPath := filepath.Join(DefaultLocalPath, volumeID)
+	localPath := GetLocalPath(volumeID)
 	
 	// Remove the entire volume directory and its contents (including backing file)
 	if err := os.RemoveAll(localPath); err != nil && !os.IsNotExist(err) {
@@ -264,8 +264,8 @@ func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 
 	klog.Infof("Expanding volume %s at path %s to %d bytes", volumeID, volumePath, requestedBytes)
 
-	// Determine local path and backing file
-	localPath := filepath.Join(DefaultLocalPath, volumeID)
+	// Get the local path 
+	localPath := GetLocalPath(volumeID)
 	backingFile := GenerateBackingFilePath(localPath, volumeID)
 
 	// Generate mapper name for this volume
@@ -303,6 +303,53 @@ func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 
 // Helper methods
 
+// isVolumeStaged checks if a volume is already staged at the given path
+func (ns *NodeServer) isVolumeStaged(volumeID, stagingTargetPath string) bool {
+	// Generate mapper name for this volume
+	mapperName := ns.luksManager.GenerateMapperName(volumeID)
+	
+	// Check if LUKS device is opened
+	if !ns.luksManager.IsLUKSOpened(mapperName) {
+		klog.V(4).Infof("LUKS device %s is not opened", mapperName)
+		return false
+	}
+	
+	// Check if staging target path is mounted
+	if !ns.isMountPoint(stagingTargetPath) {
+		klog.V(4).Infof("Staging target path %s is not mounted", stagingTargetPath)
+		return false
+	}
+	
+	// Get the mapped device path
+	mappedDevice := ns.luksManager.GetMappedDevicePath(mapperName)
+	
+	// Verify that the mount point is using our mapped device
+	if !ns.isMountedFrom(stagingTargetPath, mappedDevice) {
+		klog.V(4).Infof("Staging target path %s is not mounted from our device %s", stagingTargetPath, mappedDevice)
+		return false
+	}
+	
+	klog.V(4).Infof("Volume %s is already staged at %s", volumeID, stagingTargetPath)
+	return true
+}
+
+// isMountPoint checks if the given path is a mount point
+func (ns *NodeServer) isMountPoint(path string) bool {
+	cmd := exec.Command("mountpoint", "-q", path)
+	return cmd.Run() == nil
+}
+
+// isMountedFrom checks if the given path is mounted from the specified device
+func (ns *NodeServer) isMountedFrom(path, device string) bool {
+	cmd := exec.Command("findmnt", "-n", "-o", "SOURCE", path)
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	
+	mountedFrom := strings.TrimSpace(string(output))
+	return mountedFrom == device
+}
 
 func (ns *NodeServer) getPassphrase(secrets map[string]string, passphraseKey string) (string, error) {
 	if passphrase, ok := secrets[passphraseKey]; ok {
