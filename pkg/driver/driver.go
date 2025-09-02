@@ -10,12 +10,12 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc"
-	"k8s.io/klog/v2"
+	"k8s.io/klog"
 )
 
 const (
 	DriverName    = "lukscryptwalker.csi.k8s.io"
-	DriverVersion = "1.0.7"
+	DriverVersion = "1.0.8"
 )
 
 type Driver struct {

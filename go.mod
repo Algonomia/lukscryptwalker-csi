@@ -5,11 +5,10 @@ go 1.18
 require (
 	github.com/container-storage-interface/spec v1.8.0
 	google.golang.org/grpc v1.53.0
-	k8s.io/klog/v2 v2.100.1
+	k8s.io/klog v1.0.0
 )
 
 require (
-	github.com/go-logr/logr v1.2.4 // indirect
 	github.com/golang/protobuf v1.5.3 // indirect
 	golang.org/x/net v0.17.0 // indirect
 	golang.org/x/sys v0.13.0 // indirect

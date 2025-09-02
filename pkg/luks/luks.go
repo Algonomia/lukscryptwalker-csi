@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"k8s.io/klog/v2"
+	"k8s.io/klog"
 )
 
 const (
@@ -23,11 +23,11 @@ func NewLUKSManager() *LUKSManager {
 
 // FormatAndOpenLUKS creates a LUKS encrypted volume and opens it
 func (lm *LUKSManager) FormatAndOpenLUKS(devicePath, mapperName, passphrase string) error {
-	klog.V(4).Infof("Formatting LUKS device: %s", devicePath)
+	klog.Infof("Formatting LUKS device: %s", devicePath)
 	
 	// Check if already LUKS formatted
 	if lm.IsLUKSDevice(devicePath) {
-		klog.V(4).Infof("Device %s is already LUKS formatted", devicePath)
+		klog.Infof("Device %s is already LUKS formatted", devicePath)
 		return lm.OpenLUKS(devicePath, mapperName, passphrase)
 	}
 
@@ -46,11 +46,11 @@ func (lm *LUKSManager) FormatAndOpenLUKS(devicePath, mapperName, passphrase stri
 
 // OpenLUKS opens an existing LUKS device
 func (lm *LUKSManager) OpenLUKS(devicePath, mapperName, passphrase string) error {
-	klog.V(4).Infof("Opening LUKS device: %s as %s", devicePath, mapperName)
+	klog.Infof("Opening LUKS device: %s as %s", devicePath, mapperName)
 	
 	// Check if already opened
 	if lm.IsLUKSOpened(mapperName) {
-		klog.V(4).Infof("LUKS device %s is already opened as %s", devicePath, mapperName)
+		klog.Infof("LUKS device %s is already opened as %s", devicePath, mapperName)
 		return nil
 	}
 
@@ -68,11 +68,11 @@ func (lm *LUKSManager) OpenLUKS(devicePath, mapperName, passphrase string) error
 // CloseLUKS closes a LUKS device
 func (lm *LUKSManager) CloseLUKS(mapperName string) error {
 	if !lm.IsLUKSOpened(mapperName) {
-		klog.V(4).Infof("LUKS device %s is not opened", mapperName)
+		klog.Infof("LUKS device %s is not opened", mapperName)
 		return nil
 	}
 
-	klog.V(4).Infof("Closing LUKS device: %s", mapperName)
+	klog.Infof("Closing LUKS device: %s", mapperName)
 	
 	cmd := exec.Command(CryptsetupCmd, "luksClose", mapperName)
 	cmd.Stderr = os.Stderr
@@ -113,7 +113,7 @@ func (lm *LUKSManager) ResizeLUKS(mapperName string) error {
 		return fmt.Errorf("LUKS device %s is not opened", mapperName)
 	}
 
-	klog.V(4).Infof("Resizing LUKS device: %s", mapperName)
+	klog.Infof("Resizing LUKS device: %s", mapperName)
 
 	cmd := exec.Command(CryptsetupCmd, "resize", mapperName)
 	cmd.Stderr = os.Stderr

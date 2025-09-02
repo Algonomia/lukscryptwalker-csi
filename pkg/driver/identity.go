@@ -6,7 +6,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"k8s.io/klog/v2"
+	"k8s.io/klog"
 )
 
 type IdentityServer struct {
@@ -20,7 +20,7 @@ func NewIdentityServer(d *Driver) *IdentityServer {
 }
 
 func (ids *IdentityServer) GetPluginInfo(ctx context.Context, req *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {
-	klog.V(5).Infof("GetPluginInfo called")
+	klog.Infof("GetPluginInfo called")
 
 	if ids.driver.name == "" {
 		return nil, status.Error(codes.Unavailable, "Driver name not configured")
@@ -37,12 +37,12 @@ func (ids *IdentityServer) GetPluginInfo(ctx context.Context, req *csi.GetPlugin
 }
 
 func (ids *IdentityServer) Probe(ctx context.Context, req *csi.ProbeRequest) (*csi.ProbeResponse, error) {
-	klog.V(5).Infof("Probe called")
+	klog.Infof("Probe called")
 	return &csi.ProbeResponse{}, nil
 }
 
 func (ids *IdentityServer) GetPluginCapabilities(ctx context.Context, req *csi.GetPluginCapabilitiesRequest) (*csi.GetPluginCapabilitiesResponse, error) {
-	klog.V(5).Infof("GetPluginCapabilities called")
+	klog.Infof("GetPluginCapabilities called")
 
 	return &csi.GetPluginCapabilitiesResponse{
 		Capabilities: []*csi.PluginCapability{

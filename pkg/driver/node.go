@@ -13,7 +13,7 @@ import (
 	"github.com/lukscryptwalker-csi/pkg/luks"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"k8s.io/klog/v2"
+	"k8s.io/klog"
 )
 
 const (
@@ -120,7 +120,7 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 }
 
 func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
-	klog.V(4).Infof("NodeUnstageVolume called with request: %+v", req)
+	klog.Infof("NodeUnstageVolume called with request: %+v", req)
 
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
@@ -177,7 +177,7 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 }
 
 func (ns *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
-	klog.V(4).Infof("NodeUnpublishVolume called with request: %+v", req)
+	klog.Infof("NodeUnpublishVolume called with request: %+v", req)
 
 	targetPath := req.GetTargetPath()
 	if len(targetPath) == 0 {
@@ -224,7 +224,7 @@ func (ns *NodeServer) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVo
 }
 
 func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
-	klog.V(4).Infof("NodeExpandVolume called with request: %+v", req)
+	klog.Infof("NodeExpandVolume called with request: %+v", req)
 
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
@@ -246,7 +246,7 @@ func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 		requestedBytes = capacityRange.GetLimitBytes()
 	}
 
-	klog.V(4).Infof("Expanding volume %s at path %s to %d bytes", volumeID, volumePath, requestedBytes)
+	klog.Infof("Expanding volume %s at path %s to %d bytes", volumeID, volumePath, requestedBytes)
 
 	// Generate mapper name for this volume
 	mapperName := ns.luksManager.GenerateMapperName(volumeID)
@@ -269,7 +269,7 @@ func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 		return nil, status.Errorf(codes.Internal, "Failed to resize filesystem: %v", err)
 	}
 
-	klog.V(4).Infof("Successfully expanded volume %s to %d bytes", volumeID, requestedBytes)
+	klog.Infof("Successfully expanded volume %s to %d bytes", volumeID, requestedBytes)
 
 	return &csi.NodeExpandVolumeResponse{
 		CapacityBytes: requestedBytes,
@@ -311,11 +311,11 @@ func (ns *NodeServer) formatDevice(devicePath string, capability *csi.VolumeCapa
 	// Check if device is already formatted
 	cmd := exec.Command("blkid", devicePath)
 	if cmd.Run() == nil {
-		klog.V(4).Infof("Device %s is already formatted", devicePath)
+		klog.Infof("Device %s is already formatted", devicePath)
 		return nil
 	}
 
-	klog.V(4).Infof("Formatting device %s with filesystem %s", devicePath, fsType)
+	klog.Infof("Formatting device %s with filesystem %s", devicePath, fsType)
 	
 	var cmd2 *exec.Cmd
 	switch fsType {
@@ -458,7 +458,7 @@ func (ns *NodeServer) unmountPath(targetPath string) error {
 }
 
 func (ns *NodeServer) resizeFilesystem(devicePath, volumePath string) error {
-	klog.V(4).Infof("Resizing filesystem on device %s", devicePath)
+	klog.Infof("Resizing filesystem on device %s", devicePath)
 
 	// Detect filesystem type
 	cmd := exec.Command("blkid", "-s", "TYPE", "-o", "value", devicePath)
@@ -472,7 +472,7 @@ func (ns *NodeServer) resizeFilesystem(devicePath, volumePath string) error {
 		return fmt.Errorf("no filesystem found on device %s", devicePath)
 	}
 
-	klog.V(4).Infof("Detected filesystem type: %s on device %s", fsType, devicePath)
+	klog.Infof("Detected filesystem type: %s on device %s", fsType, devicePath)
 
 	var resizeCmd *exec.Cmd
 	switch fsType {
@@ -490,6 +490,6 @@ func (ns *NodeServer) resizeFilesystem(devicePath, volumePath string) error {
 		return fmt.Errorf("failed to resize %s filesystem on %s: %v", fsType, devicePath, err)
 	}
 
-	klog.V(4).Infof("Successfully resized %s filesystem on device %s", fsType, devicePath)
+	klog.Infof("Successfully resized %s filesystem on device %s", fsType, devicePath)
 	return nil
 }

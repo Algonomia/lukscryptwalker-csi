@@ -11,7 +11,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"k8s.io/klog/v2"
+	"k8s.io/klog"
 )
 
 type ControllerServer struct {
@@ -25,7 +25,7 @@ func NewControllerServer(d *Driver) *ControllerServer {
 }
 
 func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
-	klog.V(4).Infof("CreateVolume called with request: %+v", req)
+	klog.Infof("CreateVolume called with request: %+v", req)
 
 	name := req.GetName()
 	if len(name) == 0 {
@@ -83,12 +83,12 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		VolumeContext: volumeContext,
 	}
 
-	klog.V(4).Infof("Created volume: %+v", volume)
+	klog.Infof("Created volume: %+v", volume)
 	return &csi.CreateVolumeResponse{Volume: volume}, nil
 }
 
 func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
-	klog.V(4).Infof("DeleteVolume called with request: %+v", req)
+	klog.Infof("DeleteVolume called with request: %+v", req)
 
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
@@ -103,7 +103,7 @@ func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 		return nil, status.Errorf(codes.Internal, "Failed to delete volume directory %s: %v", localPath, err)
 	}
 
-	klog.V(4).Infof("Deleted volume: %s", volumeID)
+	klog.Infof("Deleted volume: %s", volumeID)
 	return &csi.DeleteVolumeResponse{}, nil
 }
 
@@ -182,7 +182,7 @@ func (cs *ControllerServer) ListSnapshots(ctx context.Context, req *csi.ListSnap
 }
 
 func (cs *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
-	klog.V(4).Infof("ControllerExpandVolume called with request: %+v", req)
+	klog.Infof("ControllerExpandVolume called with request: %+v", req)
 
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
@@ -202,7 +202,7 @@ func (cs *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi
 		return nil, status.Error(codes.InvalidArgument, "Required bytes missing in capacity range")
 	}
 
-	klog.V(4).Infof("Expanding volume %s to %d bytes", volumeID, requestedBytes)
+	klog.Infof("Expanding volume %s to %d bytes", volumeID, requestedBytes)
 
 	// Get the local path for this volume
 	localPath := filepath.Join(DefaultLocalPath, volumeID)
@@ -222,7 +222,7 @@ func (cs *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi
 
 	// Check if expansion is needed
 	if requestedBytes <= currentBytes {
-		klog.V(4).Infof("Volume %s already has size %d bytes, requested %d bytes", volumeID, currentBytes, requestedBytes)
+		klog.Infof("Volume %s already has size %d bytes, requested %d bytes", volumeID, currentBytes, requestedBytes)
 		return &csi.ControllerExpandVolumeResponse{
 			CapacityBytes:         currentBytes,
 			NodeExpansionRequired: false,
@@ -234,7 +234,7 @@ func (cs *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi
 		return nil, status.Errorf(codes.Internal, "Failed to expand backing file: %v", err)
 	}
 
-	klog.V(4).Infof("Successfully expanded volume %s from %d to %d bytes", volumeID, currentBytes, requestedBytes)
+	klog.Infof("Successfully expanded volume %s from %d to %d bytes", volumeID, currentBytes, requestedBytes)
 
 	return &csi.ControllerExpandVolumeResponse{
 		CapacityBytes:         requestedBytes,
@@ -263,7 +263,7 @@ func (cs *ControllerServer) validateVolumeCapabilities(caps []*csi.VolumeCapabil
 		// Validate filesystem type
 		mount := cap.GetMount()
 		fsType := mount.GetFsType()
-		if fsType != "" && fsType != "ext4" && fsType != "ext3" && fsType != "xfs" {
+		if fsType != "" && fsType != "ext2" && fsType != "ext3" && fsType != "ext4" && fsType != "xfs" {
 			return fmt.Errorf("unsupported filesystem type: %s", fsType)
 		}
 	}
@@ -274,7 +274,7 @@ func (cs *ControllerServer) validateVolumeCapabilities(caps []*csi.VolumeCapabil
 // Helper methods
 
 func (cs *ControllerServer) expandBackingFile(filePath string, newSizeBytes int64) error {
-	klog.V(4).Infof("Expanding backing file %s to %d bytes", filePath, newSizeBytes)
+	klog.Infof("Expanding backing file %s to %d bytes", filePath, newSizeBytes)
 
 	// Use truncate to expand the file
 	cmd := exec.Command("truncate", "-s", strconv.FormatInt(newSizeBytes, 10), filePath)
