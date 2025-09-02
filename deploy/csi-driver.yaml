@@ -28,6 +28,9 @@ rules:
 - apiGroups: [""]
   resources: ["persistentvolumeclaims"]
   verbs: ["get", "list", "watch", "update", "patch"]
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims/status"]
+  verbs: ["patch"]
 - apiGroups: ["storage.k8s.io"]
   resources: ["storageclasses"]
   verbs: ["get", "list", "watch"]
@@ -46,6 +49,9 @@ rules:
 - apiGroups: [""]
   resources: ["pods"]
   verbs: ["get", "list", "watch"]
+- apiGroups: ["storage.k8s.io"]
+  resources: ["volumeattachments"]
+  verbs: ["get", "list", "watch", "patch"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -121,6 +127,17 @@ spec:
         - "--v=5"
         - "--feature-gates=Topology=true"
         - "--strict-topology=false"
+        env:
+        - name: ADDRESS
+          value: /var/lib/csi/sockets/pluginproxy/csi.sock
+        volumeMounts:
+        - name: socket-dir
+          mountPath: /var/lib/csi/sockets/pluginproxy/
+      - name: csi-resizer
+        image: registry.k8s.io/sig-storage/csi-resizer:v1.9.2
+        args:
+        - "--csi-address=$(ADDRESS)"
+        - "--v=5"
         env:
         - name: ADDRESS
           value: /var/lib/csi/sockets/pluginproxy/csi.sock
