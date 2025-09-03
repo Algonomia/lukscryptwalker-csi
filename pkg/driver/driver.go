@@ -15,7 +15,7 @@ import (
 
 const (
 	DriverName    = "lukscryptwalker.csi.k8s.io"
-	DriverVersion = "1.0.11"
+	DriverVersion = "1.0.13"
 )
 
 type Driver struct {

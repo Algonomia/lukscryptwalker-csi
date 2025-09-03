@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.18-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
 WORKDIR /app
 
@@ -27,6 +27,7 @@ RUN apk add --no-cache \
     cryptsetup \
     util-linux \
     e2fsprogs \
+    e2fsprogs-extra \
     xfsprogs \
     ca-certificates
 

@@ -108,7 +108,7 @@ func (lm *LUKSManager) GenerateMapperName(volumeID string) string {
 }
 
 // ResizeLUKS resizes a LUKS device to fill the underlying block device
-func (lm *LUKSManager) ResizeLUKS(mapperName string) error {
+func (lm *LUKSManager) ResizeLUKS(mapperName, passphrase string) error {
 	if !lm.IsLUKSOpened(mapperName) {
 		return fmt.Errorf("LUKS device %s is not opened", mapperName)
 	}
@@ -116,6 +116,7 @@ func (lm *LUKSManager) ResizeLUKS(mapperName string) error {
 	klog.Infof("Resizing LUKS device: %s", mapperName)
 
 	cmd := exec.Command(CryptsetupCmd, "resize", mapperName)
+	cmd.Stdin = strings.NewReader(passphrase)
 	cmd.Stderr = os.Stderr
 	
 	if err := cmd.Run(); err != nil {
