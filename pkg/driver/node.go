@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/lukscryptwalker-csi/pkg/luks"
@@ -353,9 +355,9 @@ func (ns *NodeServer) mountAndConfigureVolume(params *StagingParameters) error {
 		return fmt.Errorf("failed to mount device: %v", err)
 	}
 
-	// Set permissions on mounted filesystem
-	if err := ns.setDirectoryPermissions(params.stagingTargetPath, params.fsGroup); err != nil {
-		return fmt.Errorf("failed to set permissions on mounted filesystem: %v", err)
+	// Apply fsGroup to the mounted filesystem content
+	if err := ns.applyFsGroupToMountedFilesystem(params.stagingTargetPath, params.fsGroup); err != nil {
+		return fmt.Errorf("failed to apply fsGroup to mounted filesystem: %v", err)
 	}
 
 	return nil
@@ -779,6 +781,11 @@ func (ns *NodeServer) bindMount(sourcePath, targetPath string, readonly bool, fs
 		}
 	}
 
+	// Ensure bind mount is ready and accessible before returning
+	if err := ns.verifyMountReadiness(targetPath, fsGroup); err != nil {
+		return fmt.Errorf("failed to verify mount readiness: %v", err)
+	}
+
 	return nil
 }
 
@@ -1057,5 +1064,129 @@ func (ns *NodeServer) restoreLUKSDeviceAndMount(volumeID, backingFile, stagingTa
 		klog.Warningf("Failed to set directory permissions: %v", err)
 	}
 
+	return nil
+}
+
+// verifyMountReadiness ensures the mount is fully ready and accessible
+func (ns *NodeServer) verifyMountReadiness(targetPath string, fsGroup *int64) error {
+	klog.Infof("Verifying mount readiness for %s", targetPath)
+
+	// Wait for mount to be stable with retries
+	maxRetries := 5
+	for i := 0; i < maxRetries; i++ {
+		// Check if path is actually mounted
+		if !ns.isMountPoint(targetPath) {
+			if i == maxRetries-1 {
+				return fmt.Errorf("mount point %s is not stable after %d retries", targetPath, maxRetries)
+			}
+			klog.Infof("Mount point %s not ready, retry %d/%d", targetPath, i+1, maxRetries)
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		// Test file system accessibility
+		if err := ns.testFilesystemAccess(targetPath, fsGroup); err != nil {
+			if i == maxRetries-1 {
+				return fmt.Errorf("filesystem access test failed after %d retries: %v", maxRetries, err)
+			}
+			klog.Infof("Filesystem access test failed, retry %d/%d: %v", i+1, maxRetries, err)
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		klog.Infof("Mount readiness verified for %s", targetPath)
+		return nil
+	}
+
+	return fmt.Errorf("mount readiness verification failed for %s", targetPath)
+}
+
+// testFilesystemAccess tests if the filesystem is accessible and writable
+func (ns *NodeServer) testFilesystemAccess(targetPath string, fsGroup *int64) error {
+	// Test read access
+	entries, err := os.ReadDir(targetPath)
+	if err != nil {
+		return fmt.Errorf("failed to read directory: %v", err)
+	}
+
+	klog.Infof("Successfully read directory %s with %d entries", targetPath, len(entries))
+
+	// Test write access if fsGroup is specified
+	if fsGroup != nil {
+		testFile := targetPath + "/.csi-mount-test"
+		if err := os.WriteFile(testFile, []byte("test"), 0644); err != nil {
+			return fmt.Errorf("failed to write test file: %v", err)
+		}
+
+		// Clean up test file
+		if err := os.Remove(testFile); err != nil {
+			klog.Warningf("Failed to remove test file %s: %v", testFile, err)
+		} else {
+			klog.Infof("Successfully verified write access for %s", targetPath)
+		}
+	}
+
+	return nil
+}
+
+// applyFsGroupToMountedFilesystem applies fsGroup permissions to the content of the mounted filesystem
+func (ns *NodeServer) applyFsGroupToMountedFilesystem(mountPath string, fsGroup *int64) error {
+	if fsGroup == nil {
+		klog.Infof("No fsGroup specified, skipping filesystem permission setup for %s", mountPath)
+		return nil
+	}
+
+	klog.Infof("Applying fsGroup %d to mounted filesystem at %s", *fsGroup, mountPath)
+
+	// First, set ownership and permissions on the mount point itself
+	if err := os.Chown(mountPath, 0, int(*fsGroup)); err != nil {
+		return fmt.Errorf("failed to set group ownership on mount point: %v", err)
+	}
+
+	if err := os.Chmod(mountPath, 0775); err != nil {
+		return fmt.Errorf("failed to set permissions on mount point: %v", err)
+	}
+
+	// Apply permissions recursively to all content in the mounted filesystem
+	err := filepath.Walk(mountPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			klog.Warningf("Error walking path %s: %v", path, err)
+			return nil // Continue walking even if we encounter errors
+		}
+
+		// Skip the mount point itself as we already handled it
+		if path == mountPath {
+			return nil
+		}
+
+		// Set group ownership for all files and directories
+		if err := os.Chown(path, 0, int(*fsGroup)); err != nil {
+			klog.Warningf("Failed to set group ownership for %s: %v", path, err)
+			return nil // Continue even if chown fails for individual files
+		}
+
+		// Set appropriate permissions based on file type
+		var newMode os.FileMode
+		if info.IsDir() {
+			// Directories: add group write and execute permissions
+			newMode = info.Mode() | 0070 // Add rwx for group
+		} else {
+			// Regular files: add group read/write permissions
+			newMode = info.Mode() | 0060 // Add rw- for group
+		}
+
+		if err := os.Chmod(path, newMode); err != nil {
+			klog.Warningf("Failed to set permissions for %s: %v", path, err)
+			return nil // Continue even if chmod fails for individual files
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to walk filesystem for permission changes: %v", err)
+	}
+
+	klog.Infof("Successfully applied fsGroup %d to filesystem content at %s", *fsGroup, mountPath)
 	return nil
 }
