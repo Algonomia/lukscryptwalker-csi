@@ -1,6 +1,6 @@
 image:
   repository: briceguillaume/lukscryptwalker-csi
-  tag: "v1.0.14"
+  tag: "v1.0.15"
   pullPolicy: IfNotPresent
 
 # Image pull secrets

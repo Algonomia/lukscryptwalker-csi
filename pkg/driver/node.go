@@ -158,6 +158,12 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return nil, status.Errorf(codes.Internal, "Failed to bind mount: %v", err)
 	}
 
+	// Apply fsGroup to the bind mount target to ensure permissions are correct
+	// This is critical because bind mounts may not immediately reflect staging permissions
+	if err := ns.applyFsGroupToMountedFilesystem(targetPath, fsGroup); err != nil {
+		return nil, status.Errorf(codes.Internal, "Failed to apply fsGroup to bind mount target: %v", err)
+	}
+
 	klog.Infof("Successfully published volume %s", volumeID)
 	return &csi.NodePublishVolumeResponse{}, nil
 }
