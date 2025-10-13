@@ -857,20 +857,22 @@ func (ns *NodeServer) extractFsGroup(volumeContext map[string]string) *int64 {
 
 // applyFsGroupPermissions applies fsGroup ownership to the bind mount target
 func (ns *NodeServer) applyFsGroupPermissions(targetPath string, fsGroup int64) error {
-	klog.Infof("Applying fsGroup %d permissions to bind mount target %s", fsGroup, targetPath)
+    klog.Infof("Applying fsGroup %d permissions recursively to %s", fsGroup, targetPath)
 
-	// Change ownership of the mount point to the fsGroup
-	if err := os.Chown(targetPath, int(fsGroup), int(fsGroup)); err != nil {
-		return fmt.Errorf("failed to change ownership of %s to group %d: %v", targetPath, fsGroup, err)
-	}
+    // Recursive chown
+    cmd := exec.Command("chown", "-R", fmt.Sprintf("%d:%d", fsGroup, fsGroup), targetPath)
+    if output, err := cmd.CombinedOutput(); err != nil {
+        return fmt.Errorf("failed to recursively apply fsGroup: %v, output: %s", err, string(output))
+    }
 
-	// Set group writable permissions (0775)
-	if err := os.Chmod(targetPath, 0775); err != nil {
-		return fmt.Errorf("failed to set permissions on %s: %v", targetPath, err)
-	}
+    // Ensure group writable
+    cmd = exec.Command("chmod", "-R", "775", targetPath)
+    if output, err := cmd.CombinedOutput(); err != nil {
+        return fmt.Errorf("failed to recursively chmod: %v, output: %s", err, string(output))
+    }
 
-	klog.Infof("Successfully applied fsGroup %d permissions to %s", fsGroup, targetPath)
-	return nil
+    klog.Infof("Successfully applied fsGroup %d permissions recursively to %s", fsGroup, targetPath)
+    return nil
 }
 
 
