@@ -153,15 +153,15 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return nil, status.Errorf(codes.Internal, "Failed to ensure volume staged: %v", err)
 	}
 
-	// Bind mount from staging to target
-	if err := ns.bindMount(stagingTargetPath, targetPath, req.GetReadonly(), fsGroup); err != nil {
-		return nil, status.Errorf(codes.Internal, "Failed to bind mount: %v", err)
+	// Apply fsGroup to staging mount content BEFORE bind mounting
+	// This ensures bind mount shows files with correct ownership from the source filesystem
+	if err := ns.applyFsGroupToMountedFilesystem(stagingTargetPath, fsGroup); err != nil {
+		return nil, status.Errorf(codes.Internal, "Failed to apply fsGroup to staging content: %v", err)
 	}
 
-	// Apply fsGroup to the bind mount target to ensure permissions are correct
-	// This is critical because bind mounts may not immediately reflect staging permissions
-	if err := ns.applyFsGroupToMountedFilesystem(targetPath, fsGroup); err != nil {
-		return nil, status.Errorf(codes.Internal, "Failed to apply fsGroup to bind mount target: %v", err)
+	// Bind mount from staging to target - will inherit the correct file ownership
+	if err := ns.bindMount(stagingTargetPath, targetPath, req.GetReadonly(), fsGroup); err != nil {
+		return nil, status.Errorf(codes.Internal, "Failed to bind mount: %v", err)
 	}
 
 	klog.Infof("Successfully published volume %s", volumeID)
@@ -313,7 +313,7 @@ func (ns *NodeServer) prepareVolumeStaging(req *csi.NodeStageVolumeRequest) (*St
 	fsGroup := ns.extractFsGroup(req.GetVolumeContext())
 
 	// Ensure local path directory exists
-	if err := ns.setDirectoryPermissions(localPath, fsGroup); err != nil {
+	if err := os.MkdirAll(localPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create local path directory %s: %v", localPath, err)
 	}
 
@@ -349,7 +349,7 @@ func (ns *NodeServer) setupLUKSDevice(params *StagingParameters) error {
 	return ns.luksManager.FormatAndOpenLUKS(params.backingFile, params.mapperName, params.passphrase)
 }
 
-// mountAndConfigureVolume mounts the device and sets up permissions
+// mountAndConfigureVolume mounts the device
 func (ns *NodeServer) mountAndConfigureVolume(params *StagingParameters) error {
 	// Format the device if needed
 	if err := ns.formatDevice(params.mappedDevice, params.volumeCapability); err != nil {
@@ -359,11 +359,6 @@ func (ns *NodeServer) mountAndConfigureVolume(params *StagingParameters) error {
 	// Mount the device
 	if err := ns.mountDevice(params.mappedDevice, params.stagingTargetPath, params.volumeCapability); err != nil {
 		return fmt.Errorf("failed to mount device: %v", err)
-	}
-
-	// Apply fsGroup to the mounted filesystem content
-	if err := ns.applyFsGroupToMountedFilesystem(params.stagingTargetPath, params.fsGroup); err != nil {
-		return fmt.Errorf("failed to apply fsGroup to mounted filesystem: %v", err)
 	}
 
 	return nil
@@ -767,9 +762,9 @@ func (ns *NodeServer) mountDevice(devicePath, targetPath string, capability *csi
 
 // bindMount creates a bind mount from source to target
 func (ns *NodeServer) bindMount(sourcePath, targetPath string, readonly bool, fsGroup *int64) error {
-	// Create target directory with appropriate permissions
-	if err := ns.setDirectoryPermissions(targetPath, fsGroup); err != nil {
-		return err
+	// Create target directory (fsGroup permissions applied to source before bind mount)
+	if err := os.MkdirAll(targetPath, 0755); err != nil {
+		return fmt.Errorf("failed to create target directory: %v", err)
 	}
 
 	// Create bind mount
@@ -858,37 +853,6 @@ func (ns *NodeServer) extractFsGroup(volumeContext map[string]string) *int64 {
 	return nil
 }
 
-// setDirectoryPermissions sets directory permissions based on fsGroup
-func (ns *NodeServer) setDirectoryPermissions(path string, fsGroup *int64) error {
-	var mode os.FileMode = 0755 // Default permissions
-	if fsGroup != nil {
-		mode = 0775 // Group writable when fsGroup is set
-		klog.Infof("Creating directory %s with mode 0775 and group ownership %d", path, *fsGroup)
-	} else {
-		klog.Infof("Creating directory %s with mode 0755 (no fsGroup)", path)
-	}
-	
-	if err := os.MkdirAll(path, mode); err != nil {
-		return fmt.Errorf("failed to create directory: %v", err)
-	}
-	
-	// Set ownership if fsGroup is specified
-	if fsGroup != nil {
-		if err := os.Chmod(path, mode); err != nil {
-			klog.Warningf("Failed to set permissions %o: %v", mode, err)
-		} else {
-			klog.Infof("Successfully set permissions %o for %s", mode, path)
-		}
-		
-		if err := os.Chown(path, int(*fsGroup), int(*fsGroup)); err != nil {
-			klog.Warningf("Failed to change ownership to %d:%d: %v", *fsGroup, *fsGroup, err)
-		} else {
-			klog.Infof("Successfully set ownership to %d:%d for %s", *fsGroup, *fsGroup, path)
-		}
-	}
-	
-	return nil
-}
 
 // =============================================================================
 // Passphrase and Secret Management
@@ -1062,12 +1026,6 @@ func (ns *NodeServer) restoreLUKSDeviceAndMount(volumeID, backingFile, stagingTa
 	if err := ns.mountDevice(mappedDevice, stagingTargetPath, volumeCapability); err != nil {
 		ns.luksManager.CloseLUKS(mapperName) // Cleanup on failure
 		return fmt.Errorf("failed to mount device: %v", err)
-	}
-
-	// Set permissions
-	fsGroup := ns.extractFsGroup(volumeContext)
-	if err := ns.setDirectoryPermissions(stagingTargetPath, fsGroup); err != nil {
-		klog.Warningf("Failed to set directory permissions: %v", err)
 	}
 
 	return nil
