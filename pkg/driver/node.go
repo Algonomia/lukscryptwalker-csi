@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -153,21 +152,10 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return nil, status.Errorf(codes.Internal, "Failed to ensure volume staged: %v", err)
 	}
 
-	// Apply fsGroup to staging mount content BEFORE bind mounting
-	// This ensures bind mount shows files with correct ownership from the source filesystem
-	if err := ns.applyFsGroupToMountedFilesystem(stagingTargetPath, fsGroup); err != nil {
-		return nil, status.Errorf(codes.Internal, "Failed to apply fsGroup to staging content: %v", err)
-	}
-
-	// Bind mount from staging to target - will inherit the correct file ownership
+	// Create bind mount with fsGroup applied via mount options
+	// This uses built-in mount uid/gid options for clean ownership handling
 	if err := ns.bindMount(stagingTargetPath, targetPath, req.GetReadonly(), fsGroup); err != nil {
 		return nil, status.Errorf(codes.Internal, "Failed to bind mount: %v", err)
-	}
-
-	// Apply fsGroup to bind mount target to ensure the mount point itself has correct ownership
-	// This addresses race conditions with Kubernetes' own fsGroup handling
-	if err := ns.applyFsGroupToMountedFilesystem(targetPath, fsGroup); err != nil {
-		return nil, status.Errorf(codes.Internal, "Failed to apply fsGroup to bind mount target: %v", err)
 	}
 
 	klog.Infof("Successfully published volume %s", volumeID)
@@ -766,15 +754,33 @@ func (ns *NodeServer) mountDevice(devicePath, targetPath string, capability *csi
 	return nil
 }
 
-// bindMount creates a bind mount from source to target
+// bindMount creates a bind mount from source to target with optional fsGroup ownership
 func (ns *NodeServer) bindMount(sourcePath, targetPath string, readonly bool, fsGroup *int64) error {
-	// Create target directory (fsGroup permissions applied to source before bind mount)
+	// Create target directory
 	if err := os.MkdirAll(targetPath, 0755); err != nil {
 		return fmt.Errorf("failed to create target directory: %v", err)
 	}
 
-	// Create bind mount
-	args := []string{"--bind", sourcePath, targetPath}
+	// Prepare bind mount options
+	var mountOptions []string
+
+	// Add fsGroup as uid/gid mount options if specified
+	if fsGroup != nil {
+		mountOptions = append(mountOptions, fmt.Sprintf("uid=%d", *fsGroup))
+		mountOptions = append(mountOptions, fmt.Sprintf("gid=%d", *fsGroup))
+		// Set umask to allow group write access (0002 = rwxrwxr-x)
+		mountOptions = append(mountOptions, "umask=0002")
+		klog.Infof("Using bind mount options for fsGroup %d: %v", *fsGroup, mountOptions)
+	}
+
+	// Create bind mount with options
+	args := []string{"--bind"}
+	if len(mountOptions) > 0 {
+		args = append(args, "-o", strings.Join(mountOptions, ","))
+	}
+	args = append(args, sourcePath, targetPath)
+
+	klog.Infof("Executing bind mount: mount %v", args)
 	cmd := exec.Command("mount", args...)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to bind mount %s to %s: %v", sourcePath, targetPath, err)
@@ -1096,68 +1102,5 @@ func (ns *NodeServer) testFilesystemAccess(targetPath string, fsGroup *int64) er
 		}
 	}
 
-	return nil
-}
-
-// applyFsGroupToMountedFilesystem applies fsGroup permissions to the content of the mounted filesystem
-func (ns *NodeServer) applyFsGroupToMountedFilesystem(mountPath string, fsGroup *int64) error {
-	if fsGroup == nil {
-		klog.Infof("No fsGroup specified, skipping filesystem permission setup for %s", mountPath)
-		return nil
-	}
-
-	klog.Infof("Applying fsGroup %d to mounted filesystem at %s", *fsGroup, mountPath)
-
-	// First, set ownership and permissions on the mount point itself
-	// Set both user and group to fsGroup so the pod's user can write
-	if err := os.Chown(mountPath, int(*fsGroup), int(*fsGroup)); err != nil {
-		return fmt.Errorf("failed to set ownership on mount point: %v", err)
-	}
-
-	if err := os.Chmod(mountPath, 0775); err != nil {
-		return fmt.Errorf("failed to set permissions on mount point: %v", err)
-	}
-
-	// Apply permissions recursively to all content in the mounted filesystem
-	err := filepath.Walk(mountPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			klog.Warningf("Error walking path %s: %v", path, err)
-			return nil // Continue walking even if we encounter errors
-		}
-
-		// Skip the mount point itself as we already handled it
-		if path == mountPath {
-			return nil
-		}
-
-		// Set group ownership for all files and directories
-		if err := os.Chown(path, int(*fsGroup), int(*fsGroup)); err != nil {
-			klog.Warningf("Failed to set group ownership for %s: %v", path, err)
-			return nil // Continue even if chown fails for individual files
-		}
-
-		// Set appropriate permissions based on file type
-		var newMode os.FileMode
-		if info.IsDir() {
-			// Directories: add group write and execute permissions
-			newMode = info.Mode() | 0070 // Add rwx for group
-		} else {
-			// Regular files: add group read/write permissions
-			newMode = info.Mode() | 0060 // Add rw- for group
-		}
-
-		if err := os.Chmod(path, newMode); err != nil {
-			klog.Warningf("Failed to set permissions for %s: %v", path, err)
-			return nil // Continue even if chmod fails for individual files
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return fmt.Errorf("failed to walk filesystem for permission changes: %v", err)
-	}
-
-	klog.Infof("Successfully applied fsGroup %d to filesystem content at %s", *fsGroup, mountPath)
 	return nil
 }
