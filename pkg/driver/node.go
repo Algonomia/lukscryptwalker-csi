@@ -164,6 +164,12 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return nil, status.Errorf(codes.Internal, "Failed to bind mount: %v", err)
 	}
 
+	// Apply fsGroup to bind mount target to ensure the mount point itself has correct ownership
+	// This addresses race conditions with Kubernetes' own fsGroup handling
+	if err := ns.applyFsGroupToMountedFilesystem(targetPath, fsGroup); err != nil {
+		return nil, status.Errorf(codes.Internal, "Failed to apply fsGroup to bind mount target: %v", err)
+	}
+
 	klog.Infof("Successfully published volume %s", volumeID)
 	return &csi.NodePublishVolumeResponse{}, nil
 }
