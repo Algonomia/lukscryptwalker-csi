@@ -1145,8 +1145,9 @@ func (ns *NodeServer) applyFsGroupToMountedFilesystem(mountPath string, fsGroup 
 	klog.Infof("Applying fsGroup %d to mounted filesystem at %s", *fsGroup, mountPath)
 
 	// First, set ownership and permissions on the mount point itself
-	if err := os.Chown(mountPath, 0, int(*fsGroup)); err != nil {
-		return fmt.Errorf("failed to set group ownership on mount point: %v", err)
+	// Set both user and group to fsGroup so the pod's user can write
+	if err := os.Chown(mountPath, int(*fsGroup), int(*fsGroup)); err != nil {
+		return fmt.Errorf("failed to set ownership on mount point: %v", err)
 	}
 
 	if err := os.Chmod(mountPath, 0775); err != nil {
@@ -1166,7 +1167,7 @@ func (ns *NodeServer) applyFsGroupToMountedFilesystem(mountPath string, fsGroup 
 		}
 
 		// Set group ownership for all files and directories
-		if err := os.Chown(path, 0, int(*fsGroup)); err != nil {
+		if err := os.Chown(path, int(*fsGroup), int(*fsGroup)); err != nil {
 			klog.Warningf("Failed to set group ownership for %s: %v", path, err)
 			return nil // Continue even if chown fails for individual files
 		}
