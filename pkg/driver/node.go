@@ -152,8 +152,7 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return nil, status.Errorf(codes.Internal, "Failed to ensure volume staged: %v", err)
 	}
 
-	// Create bind mount with fsGroup applied via mount options
-	// This uses built-in mount uid/gid options for clean ownership handling
+	// Create bind mount
 	if err := ns.bindMount(stagingTargetPath, targetPath, req.GetReadonly(), fsGroup); err != nil {
 		return nil, status.Errorf(codes.Internal, "Failed to bind mount: %v", err)
 	}
@@ -343,7 +342,7 @@ func (ns *NodeServer) setupLUKSDevice(params *StagingParameters) error {
 	return ns.luksManager.FormatAndOpenLUKS(params.backingFile, params.mapperName, params.passphrase)
 }
 
-// mountAndConfigureVolume mounts the device
+// mountAndConfigureVolume mounts the device and applies fsGroup permissions
 func (ns *NodeServer) mountAndConfigureVolume(params *StagingParameters) error {
 	// Format the device if needed
 	if err := ns.formatDevice(params.mappedDevice, params.volumeCapability); err != nil {
@@ -353,6 +352,13 @@ func (ns *NodeServer) mountAndConfigureVolume(params *StagingParameters) error {
 	// Mount the device
 	if err := ns.mountDevice(params.mappedDevice, params.stagingTargetPath, params.volumeCapability); err != nil {
 		return fmt.Errorf("failed to mount device: %v", err)
+	}
+
+	// Apply fsGroup permissions to the real mounted filesystem before bind mounting
+	if params.fsGroup != nil {
+		if err := ns.applyFsGroupPermissions(params.stagingTargetPath, *params.fsGroup); err != nil {
+			return fmt.Errorf("failed to apply fsGroup permissions to staging path: %v", err)
+		}
 	}
 
 	return nil
@@ -754,31 +760,15 @@ func (ns *NodeServer) mountDevice(devicePath, targetPath string, capability *csi
 	return nil
 }
 
-// bindMount creates a bind mount from source to target with optional fsGroup ownership
+// bindMount creates a simple bind mount from source to target
 func (ns *NodeServer) bindMount(sourcePath, targetPath string, readonly bool, fsGroup *int64) error {
 	// Create target directory
 	if err := os.MkdirAll(targetPath, 0755); err != nil {
 		return fmt.Errorf("failed to create target directory: %v", err)
 	}
 
-	// Prepare bind mount options
-	var mountOptions []string
-
-	// Add fsGroup as uid/gid mount options if specified
-	if fsGroup != nil {
-		mountOptions = append(mountOptions, fmt.Sprintf("uid=%d", *fsGroup))
-		mountOptions = append(mountOptions, fmt.Sprintf("gid=%d", *fsGroup))
-		// Set umask to allow group write access (0002 = rwxrwxr-x)
-		mountOptions = append(mountOptions, "umask=0002")
-		klog.Infof("Using bind mount options for fsGroup %d: %v", *fsGroup, mountOptions)
-	}
-
-	// Create bind mount with options
-	args := []string{"--bind"}
-	if len(mountOptions) > 0 {
-		args = append(args, "-o", strings.Join(mountOptions, ","))
-	}
-	args = append(args, sourcePath, targetPath)
+	// Create simple bind mount (no options - bind mounts don't support uid/gid)
+	args := []string{"--bind", sourcePath, targetPath}
 
 	klog.Infof("Executing bind mount: mount %v", args)
 	cmd := exec.Command("mount", args...)
@@ -852,7 +842,7 @@ func (ns *NodeServer) extractFsGroup(volumeContext map[string]string) *int64 {
 			return &fsGroup
 		}
 	}
-	
+
 	// Fall back to auto-detection from pod security context
 	if fsGroupStr, exists := volumeContext["csi.storage.k8s.io/pod.spec.securityContext.fsGroup"]; exists {
 		if fsGroup, err := strconv.ParseInt(fsGroupStr, 10, 64); err == nil {
@@ -860,8 +850,26 @@ func (ns *NodeServer) extractFsGroup(volumeContext map[string]string) *int64 {
 			return &fsGroup
 		}
 	}
-	
+
 	klog.Infof("No fsGroup found - using default permissions")
+	return nil
+}
+
+// applyFsGroupPermissions applies fsGroup ownership to the bind mount target
+func (ns *NodeServer) applyFsGroupPermissions(targetPath string, fsGroup int64) error {
+	klog.Infof("Applying fsGroup %d permissions to bind mount target %s", fsGroup, targetPath)
+
+	// Change ownership of the mount point to the fsGroup
+	if err := os.Chown(targetPath, int(fsGroup), int(fsGroup)); err != nil {
+		return fmt.Errorf("failed to change ownership of %s to group %d: %v", targetPath, fsGroup, err)
+	}
+
+	// Set group writable permissions (0775)
+	if err := os.Chmod(targetPath, 0775); err != nil {
+		return fmt.Errorf("failed to set permissions on %s: %v", targetPath, err)
+	}
+
+	klog.Infof("Successfully applied fsGroup %d permissions to %s", fsGroup, targetPath)
 	return nil
 }
 
@@ -1038,6 +1046,14 @@ func (ns *NodeServer) restoreLUKSDeviceAndMount(volumeID, backingFile, stagingTa
 	if err := ns.mountDevice(mappedDevice, stagingTargetPath, volumeCapability); err != nil {
 		ns.luksManager.CloseLUKS(mapperName) // Cleanup on failure
 		return fmt.Errorf("failed to mount device: %v", err)
+	}
+
+	// Apply fsGroup permissions if specified in volume context
+	fsGroup := ns.extractFsGroup(volumeContext)
+	if fsGroup != nil {
+		if err := ns.applyFsGroupPermissions(stagingTargetPath, *fsGroup); err != nil {
+			return fmt.Errorf("failed to apply fsGroup permissions during restore: %v", err)
+		}
 	}
 
 	return nil
