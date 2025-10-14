@@ -762,9 +762,12 @@ func (ns *NodeServer) mountDevice(devicePath, targetPath string, capability *csi
 
 // bindMount creates a simple bind mount from source to target
 func (ns *NodeServer) bindMount(sourcePath, targetPath string, readonly bool, fsGroup *int64) error {
-	// Create target directory
-	if err := os.MkdirAll(targetPath, 0755); err != nil {
-		return fmt.Errorf("failed to create target directory: %v", err)
+	// Create target directory in host namespace using nsenter
+	mkdirArgs := []string{"-t", "1", "-m", "-u", "mkdir", "-p", targetPath}
+	klog.Infof("Creating target directory with nsenter: nsenter %v", mkdirArgs)
+	mkdirCmd := exec.Command("nsenter", mkdirArgs...)
+	if err := mkdirCmd.Run(); err != nil {
+		return fmt.Errorf("failed to create target directory in host namespace: %v", err)
 	}
 
 	// Create bind mount using nsenter to operate in host namespace
@@ -782,11 +785,6 @@ func (ns *NodeServer) bindMount(sourcePath, targetPath string, readonly bool, fs
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("failed to remount as readonly: %v", err)
 		}
-	}
-
-	// Ensure bind mount is ready and accessible before returning
-	if err := ns.verifyMountReadiness(targetPath, fsGroup); err != nil {
-		return fmt.Errorf("failed to verify mount readiness: %v", err)
 	}
 
 	return nil
@@ -1061,68 +1059,6 @@ func (ns *NodeServer) restoreLUKSDeviceAndMount(volumeID, backingFile, stagingTa
 	if fsGroup != nil {
 		if err := ns.applyFsGroupPermissions(stagingTargetPath, *fsGroup); err != nil {
 			return fmt.Errorf("failed to apply fsGroup permissions during restore: %v", err)
-		}
-	}
-
-	return nil
-}
-
-// verifyMountReadiness ensures the mount is fully ready and accessible
-func (ns *NodeServer) verifyMountReadiness(targetPath string, fsGroup *int64) error {
-	klog.Infof("Verifying mount readiness for %s", targetPath)
-
-	// Wait for mount to be stable with retries
-	maxRetries := 5
-	for i := 0; i < maxRetries; i++ {
-		// Check if path is actually mounted
-		if !ns.isMountPoint(targetPath) {
-			if i == maxRetries-1 {
-				return fmt.Errorf("mount point %s is not stable after %d retries", targetPath, maxRetries)
-			}
-			klog.Infof("Mount point %s not ready, retry %d/%d", targetPath, i+1, maxRetries)
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-
-		// Test file system accessibility
-		if err := ns.testFilesystemAccess(targetPath, fsGroup); err != nil {
-			if i == maxRetries-1 {
-				return fmt.Errorf("filesystem access test failed after %d retries: %v", maxRetries, err)
-			}
-			klog.Infof("Filesystem access test failed, retry %d/%d: %v", i+1, maxRetries, err)
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-
-		klog.Infof("Mount readiness verified for %s", targetPath)
-		return nil
-	}
-
-	return fmt.Errorf("mount readiness verification failed for %s", targetPath)
-}
-
-// testFilesystemAccess tests if the filesystem is accessible and writable
-func (ns *NodeServer) testFilesystemAccess(targetPath string, fsGroup *int64) error {
-	// Test read access
-	entries, err := os.ReadDir(targetPath)
-	if err != nil {
-		return fmt.Errorf("failed to read directory: %v", err)
-	}
-
-	klog.Infof("Successfully read directory %s with %d entries", targetPath, len(entries))
-
-	// Test write access if fsGroup is specified
-	if fsGroup != nil {
-		testFile := targetPath + "/.csi-mount-test"
-		if err := os.WriteFile(testFile, []byte("test"), 0644); err != nil {
-			return fmt.Errorf("failed to write test file: %v", err)
-		}
-
-		// Clean up test file
-		if err := os.Remove(testFile); err != nil {
-			klog.Warningf("Failed to remove test file %s: %v", testFile, err)
-		} else {
-			klog.Infof("Successfully verified write access for %s", targetPath)
 		}
 	}
 
