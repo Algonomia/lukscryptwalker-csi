@@ -866,16 +866,38 @@ func (ns *NodeServer) extractFsGroup(volumeContext map[string]string) *int64 {
 func (ns *NodeServer) applyFsGroupPermissions(targetPath string, fsGroup int64) error {
     klog.Infof("Applying fsGroup %d permissions recursively to %s", fsGroup, targetPath)
 
+    // Check permissions BEFORE applying changes
+    beforeCmd := exec.Command("ls", "-lah", targetPath)
+    if beforeOutput, err := beforeCmd.CombinedOutput(); err == nil {
+        klog.Infof("BEFORE fsGroup application - %s permissions: %s", targetPath, strings.TrimSpace(string(beforeOutput)))
+    } else {
+        klog.Warningf("Failed to check permissions before fsGroup application: %v", err)
+    }
+
     // Recursive chown
-    cmd := exec.Command("chown", "-R", fmt.Sprintf("%d:%d", fsGroup, fsGroup), targetPath)
-    if output, err := cmd.CombinedOutput(); err != nil {
+    chownCmd := exec.Command("chown", "-R", fmt.Sprintf("%d:%d", fsGroup, fsGroup), targetPath)
+    if output, err := chownCmd.CombinedOutput(); err != nil {
+        klog.Errorf("chown command failed: %v, output: %s", err, string(output))
         return fmt.Errorf("failed to recursively apply fsGroup: %v, output: %s", err, string(output))
+    } else {
+        klog.Infof("chown command successful, output: %s", string(output))
     }
 
     // Ensure group writable
-    cmd = exec.Command("chmod", "-R", "775", targetPath)
-    if output, err := cmd.CombinedOutput(); err != nil {
+    chmodCmd := exec.Command("chmod", "-R", "775", targetPath)
+    if output, err := chmodCmd.CombinedOutput(); err != nil {
+        klog.Errorf("chmod command failed: %v, output: %s", err, string(output))
         return fmt.Errorf("failed to recursively chmod: %v, output: %s", err, string(output))
+    } else {
+        klog.Infof("chmod command successful, output: %s", string(output))
+    }
+
+    // Check permissions AFTER applying changes
+    afterCmd := exec.Command("ls", "-lah", targetPath)
+    if afterOutput, err := afterCmd.CombinedOutput(); err == nil {
+        klog.Infof("AFTER fsGroup application - %s permissions: %s", targetPath, strings.TrimSpace(string(afterOutput)))
+    } else {
+        klog.Warningf("Failed to check permissions after fsGroup application: %v", err)
     }
 
     klog.Infof("Successfully applied fsGroup %d permissions recursively to %s", fsGroup, targetPath)
