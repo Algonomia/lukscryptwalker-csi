@@ -7,5 +7,6 @@ metadata:
 spec:
   attachRequired: {{ .Values.csiDriver.attachRequired }}
   podInfoOnMount: {{ .Values.csiDriver.podInfoOnMount }}
+  fsGroupPolicy: None
   volumeLifecycleModes:
   - Persistent

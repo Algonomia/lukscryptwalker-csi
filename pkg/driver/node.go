@@ -784,6 +784,13 @@ func (ns *NodeServer) bindMount(sourcePath, targetPath string, readonly bool, fs
 		}
 	}
 
+	// Apply fsGroup permissions to bind mount target if specified
+	if fsGroup != nil {
+		if err := ns.applyFsGroupPermissions(targetPath, *fsGroup); err != nil {
+			return fmt.Errorf("failed to apply fsGroup permissions to bind mount target: %v", err)
+		}
+	}
+
 	// Ensure bind mount is ready and accessible before returning
 	if err := ns.verifyMountReadiness(targetPath, fsGroup); err != nil {
 		return fmt.Errorf("failed to verify mount readiness: %v", err)
