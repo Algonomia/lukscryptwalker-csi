@@ -767,13 +767,13 @@ func (ns *NodeServer) bindMount(sourcePath, targetPath string, readonly bool, fs
 		return fmt.Errorf("failed to create target directory: %v", err)
 	}
 
-	// Create simple bind mount (no options - bind mounts don't support uid/gid)
-	args := []string{"--bind", sourcePath, targetPath}
+	// Create bind mount using nsenter to operate in host namespace
+	args := []string{"-t", "1", "-m", "-u", "mount", "--bind", sourcePath, targetPath}
 
-	klog.Infof("Executing bind mount: mount %v", args)
-	cmd := exec.Command("mount", args...)
+	klog.Infof("Executing nsenter bind mount: nsenter %v", args)
+	cmd := exec.Command("nsenter", args...)
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to bind mount %s to %s: %v", sourcePath, targetPath, err)
+		return fmt.Errorf("failed to nsenter bind mount %s to %s: %v", sourcePath, targetPath, err)
 	}
 
 	// Set readonly if requested
