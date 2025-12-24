@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/lukscryptwalker-csi/pkg/driver"
+	"github.com/lukscryptwalker-csi/pkg/rclone"
 	"k8s.io/klog"
 )
 
@@ -30,6 +31,12 @@ func main() {
 		klog.Fatal("NodeID cannot be empty")
 	}
 
+	// Initialize rclone for S3 sync functionality
+	if err := rclone.Initialize(); err != nil {
+		klog.Fatalf("Failed to initialize rclone: %v", err)
+	}
+	defer rclone.Finalize()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -45,7 +52,7 @@ func main() {
 
 	d := driver.NewDriver(*endpoint, *nodeID)
 	klog.Info("Starting LUKS CSI driver")
-	
+
 	if err := d.Run(ctx); err != nil {
 		klog.Fatalf("Failed to run CSI driver: %v", err)
 	}

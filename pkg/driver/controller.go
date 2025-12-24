@@ -5,6 +5,8 @@ import (
 	"fmt"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/lukscryptwalker-csi/pkg/rclone"
+	"github.com/lukscryptwalker-csi/pkg/secrets"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/klog"
@@ -78,11 +80,47 @@ func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
 	}
 
-	// Controller's job: Validate deletion request
-	// Note: For local storage CSI, the node service should handle cleanup during NodeUnstageVolume
-	// The controller just confirms the volume can be deleted from the cluster perspective
-	klog.Infof("Controller approving deletion of volume: %s", volumeID)
+	// Check if this is an S3 volume by looking at secrets
+	reqSecrets := req.GetSecrets()
+	klog.V(4).Infof("DeleteVolume secrets: %v", reqSecrets)
+
+	if reqSecrets == nil || len(reqSecrets) == 0 {
+		klog.Infof("No secrets provided to DeleteVolume - S3 data will not be deleted. Configure provisioner-secret-name/namespace in StorageClass for ReclaimPolicy:Delete to work with S3.")
+	} else {
+		// Use the secrets helper to extract S3 configuration
+		s3Creds := secrets.S3ConfigFromSecrets(reqSecrets)
+		if s3Creds == nil {
+			klog.Infof("No S3 credentials found in secrets (keys: %v) - not an S3 volume or missing credentials", getSecretKeys(reqSecrets))
+		} else {
+			klog.Infof("Deleting S3 data for volume: %s", volumeID)
+
+			s3Config := &rclone.S3Config{
+				Region:          s3Creds.Region,
+				Endpoint:        s3Creds.Endpoint,
+				AccessKeyID:     s3Creds.AccessKeyID,
+				SecretAccessKey: s3Creds.SecretAccessKey,
+				Bucket:          s3Creds.Bucket,
+			}
+
+			if err := rclone.DeleteVolumeData(s3Config, volumeID, s3Creds.PathPrefix); err != nil {
+				klog.Errorf("Failed to delete S3 data for volume %s: %v", volumeID, err)
+				// Don't fail the deletion - the volume should still be removed from Kubernetes
+				// The S3 data might need manual cleanup if this fails
+			}
+		}
+	}
+
+	klog.Infof("Controller completed deletion of volume: %s", volumeID)
 	return &csi.DeleteVolumeResponse{}, nil
+}
+
+// getSecretKeys returns the keys from a secrets map (for logging, without exposing values)
+func getSecretKeys(secrets map[string]string) []string {
+	keys := make([]string, 0, len(secrets))
+	for k := range secrets {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 func (cs *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {

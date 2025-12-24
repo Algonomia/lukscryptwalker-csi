@@ -31,7 +31,7 @@ build/
 ehthumbs.db
 Thumbs.db
 
-# Editor and IDE files (excluding .claude and .idea)
+# Editor and IDE files
 *.swp
 *.swo
 *~
@@ -65,6 +65,8 @@ temp/
 # Helm
 *.tgz
 charts/*.tgz
+**/values_test.yaml
+**/values-test.yaml
 
 # Local environment variables
 .env
@@ -89,11 +91,8 @@ debug.test
 # Air (Go live reload)
 .air.toml
 
-# GoLand
-# (Keeping .idea excluded as requested)
-
-# VS Code
-# (Keeping .vscode excluded)
+# GoLand / JetBrains IDEs
+.idea/
 
 # Emacs
 *~

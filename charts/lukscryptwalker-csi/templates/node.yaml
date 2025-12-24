@@ -21,6 +21,7 @@ spec:
       {{- include "lukscryptwalker-csi.imagePullSecrets" . | nindent 6 }}
       serviceAccountName: {{ include "lukscryptwalker-csi.node.serviceAccountName" . }}
       hostNetwork: true
+      hostPID: true
       {{- with .Values.podSecurityContext.node }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -77,6 +78,9 @@ spec:
         - name: local-path-dir
           mountPath: {{ .Values.storage.defaultPath }}
           mountPropagation: "Bidirectional"
+        - name: cache-dir
+          mountPath: /var/lib/lukscrypt-cache
+          mountPropagation: "Bidirectional"
         {{- with .Values.node.resources }}
         resources:
           {{- toYaml . | nindent 10 }}
@@ -100,6 +104,10 @@ spec:
       - name: local-path-dir
         hostPath:
           path: {{ .Values.storage.defaultPath }}
+          type: DirectoryOrCreate
+      - name: cache-dir
+        hostPath:
+          path: /var/lib/lukscrypt-cache
           type: DirectoryOrCreate
       {{- with .Values.node.nodeSelector }}
       nodeSelector:

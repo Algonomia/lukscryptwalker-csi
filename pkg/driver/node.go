@@ -5,46 +5,45 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/lukscryptwalker-csi/pkg/luks"
+	"github.com/lukscryptwalker-csi/pkg/secrets"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"k8s.io/klog"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/klog"
 )
 
 // Constants
 const (
-	DefaultLocalPath     = "/opt/local-path-provisioner"
-	SecretNamespaceKey   = "csi.storage.k8s.io/node-stage-secret-namespace"
-	SecretNameKey        = "csi.storage.k8s.io/node-stage-secret-name"
-	PassphraseKeyParam   = "passphraseKey"
-	DefaultPassphraseKey = "passphrase"
+	DefaultLocalPath = "/opt/local-path-provisioner"
 )
 
 // NodeServer implements the CSI Node service
 type NodeServer struct {
-	driver      *Driver
-	luksManager *luks.LUKSManager
-	clientset   kubernetes.Interface
+	driver         *Driver
+	luksManager    *luks.LUKSManager
+	clientset      kubernetes.Interface
+	secretsManager *secrets.SecretsManager
+	s3SyncMgr      *S3SyncManager
 }
 
 // NewNodeServer creates a new NodeServer instance
 func NewNodeServer(d *Driver) *NodeServer {
 	clientset := initializeKubernetesClient()
-	
+
 	return &NodeServer{
-		driver:      d,
-		luksManager: luks.NewLUKSManager(),
-		clientset:   clientset,
+		driver:         d,
+		luksManager:    luks.NewLUKSManager(),
+		clientset:      clientset,
+		secretsManager: secrets.NewSecretsManager(clientset),
+		s3SyncMgr:      NewS3SyncManager(),
 	}
 }
 
@@ -99,14 +98,22 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		return nil, status.Errorf(codes.Internal, "Failed to prepare volume staging: %v", err)
 	}
 
-	// Setup LUKS encryption
-	if err := ns.setupLUKSDevice(stageParams); err != nil {
-		return nil, status.Errorf(codes.Internal, "Failed to setup LUKS device: %v", err)
-	}
+	// Choose storage backend
+	if ns.isS3Backend(req.GetVolumeContext()) {
+		// S3 backend - no LUKS, files encrypted individually
+		if err := ns.setupS3Volume(stageParams, req.GetVolumeContext(), req.GetSecrets()); err != nil {
+			return nil, status.Errorf(codes.Internal, "Failed to setup S3 volume: %v", err)
+		}
+	} else {
+		// Local LUKS backend - traditional approach
+		if err := ns.setupLUKSDevice(stageParams); err != nil {
+			return nil, status.Errorf(codes.Internal, "Failed to setup LUKS device: %v", err)
+		}
 
-	// Mount and configure the volume
-	if err := ns.mountAndConfigureVolume(stageParams); err != nil {
-		return nil, status.Errorf(codes.Internal, "Failed to mount and configure volume: %v", err)
+		// Mount and configure the LUKS volume
+		if err := ns.mountAndConfigureVolume(stageParams); err != nil {
+			return nil, status.Errorf(codes.Internal, "Failed to mount and configure volume: %v", err)
+		}
 	}
 
 	klog.Infof("Successfully staged volume %s", volumeID)
@@ -124,6 +131,12 @@ func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 
 	volumeID := req.GetVolumeId()
 	stagingTargetPath := req.GetStagingTargetPath()
+
+	// Cleanup S3 sync first if configured
+	if err := ns.cleanupS3Sync(volumeID); err != nil {
+		klog.Errorf("Failed to cleanup S3 sync for volume %s: %v", volumeID, err)
+		// Don't fail the unstage operation
+	}
 
 	// Perform cleanup operations
 	if err := ns.cleanupVolumeStaging(volumeID, stagingTargetPath); err != nil {
@@ -153,15 +166,9 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return nil, status.Errorf(codes.Internal, "Failed to ensure volume staged: %v", err)
 	}
 
-	// Bind mount from staging to target
+	// Create bind mount
 	if err := ns.bindMount(stagingTargetPath, targetPath, req.GetReadonly(), fsGroup); err != nil {
 		return nil, status.Errorf(codes.Internal, "Failed to bind mount: %v", err)
-	}
-
-	// Apply fsGroup to the bind mount target to ensure permissions are correct
-	// This is critical because bind mounts may not immediately reflect staging permissions
-	if err := ns.applyFsGroupToMountedFilesystem(targetPath, fsGroup); err != nil {
-		return nil, status.Errorf(codes.Internal, "Failed to apply fsGroup to bind mount target: %v", err)
 	}
 
 	klog.Infof("Successfully published volume %s", volumeID)
@@ -197,7 +204,7 @@ func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 
 	// Check if volume is already expanded (idempotency)
 	if ns.isVolumeAlreadyExpanded(expandParams.backingFile, expandParams.requestedBytes) {
-		klog.Infof("Volume %s is already expanded to %d bytes, returning success", 
+		klog.Infof("Volume %s is already expanded to %d bytes, returning success",
 			expandParams.volumeID, expandParams.requestedBytes)
 		return &csi.NodeExpandVolumeResponse{CapacityBytes: expandParams.requestedBytes}, nil
 	}
@@ -289,7 +296,7 @@ func (ns *NodeServer) validatePublishVolumeRequest(req *csi.NodePublishVolumeReq
 }
 
 // =============================================================================
-// Volume Staging Operations
+// Volume Staging Preparation
 // =============================================================================
 
 // StagingParameters holds parameters for volume staging operations
@@ -313,7 +320,7 @@ func (ns *NodeServer) prepareVolumeStaging(req *csi.NodeStageVolumeRequest) (*St
 	fsGroup := ns.extractFsGroup(req.GetVolumeContext())
 
 	// Ensure local path directory exists
-	if err := ns.setDirectoryPermissions(localPath, fsGroup); err != nil {
+	if err := os.MkdirAll(localPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create local path directory %s: %v", localPath, err)
 	}
 
@@ -344,31 +351,6 @@ func (ns *NodeServer) prepareVolumeStaging(req *csi.NodeStageVolumeRequest) (*St
 	}, nil
 }
 
-// setupLUKSDevice sets up and opens the LUKS encrypted device
-func (ns *NodeServer) setupLUKSDevice(params *StagingParameters) error {
-	return ns.luksManager.FormatAndOpenLUKS(params.backingFile, params.mapperName, params.passphrase)
-}
-
-// mountAndConfigureVolume mounts the device and sets up permissions
-func (ns *NodeServer) mountAndConfigureVolume(params *StagingParameters) error {
-	// Format the device if needed
-	if err := ns.formatDevice(params.mappedDevice, params.volumeCapability); err != nil {
-		return fmt.Errorf("failed to format device: %v", err)
-	}
-
-	// Mount the device
-	if err := ns.mountDevice(params.mappedDevice, params.stagingTargetPath, params.volumeCapability); err != nil {
-		return fmt.Errorf("failed to mount device: %v", err)
-	}
-
-	// Apply fsGroup to the mounted filesystem content
-	if err := ns.applyFsGroupToMountedFilesystem(params.stagingTargetPath, params.fsGroup); err != nil {
-		return fmt.Errorf("failed to apply fsGroup to mounted filesystem: %v", err)
-	}
-
-	return nil
-}
-
 // ensureVolumeStaged ensures the volume is staged, restoring if needed after reboot
 func (ns *NodeServer) ensureVolumeStaged(ctx context.Context, req *csi.NodePublishVolumeRequest) error {
 	volumeID := req.GetVolumeId()
@@ -380,242 +362,6 @@ func (ns *NodeServer) ensureVolumeStaged(ctx context.Context, req *csi.NodePubli
 	}
 
 	return nil
-}
-
-// cleanupVolumeStaging cleans up volume staging resources
-func (ns *NodeServer) cleanupVolumeStaging(volumeID, stagingTargetPath string) error {
-	// Unmount the staging target
-	if err := ns.unmountPath(stagingTargetPath); err != nil {
-		klog.Errorf("Failed to unmount staging path %s: %v", stagingTargetPath, err)
-		// Continue with cleanup even if unmount fails
-	}
-
-	// Close LUKS device
-	mapperName := ns.luksManager.GenerateMapperName(volumeID)
-	if err := ns.luksManager.CloseLUKS(mapperName); err != nil {
-		return fmt.Errorf("failed to close LUKS device: %v", err)
-	}
-
-	// Clean up backing files and directories
-	localPath := GetLocalPath(volumeID)
-	if err := os.RemoveAll(localPath); err != nil && !os.IsNotExist(err) {
-		klog.Warningf("Failed to clean up volume directory %s: %v", localPath, err)
-		// Don't fail the unstage operation due to cleanup issues
-	} else if !os.IsNotExist(err) {
-		klog.Infof("Successfully cleaned up volume directory: %s", localPath)
-	}
-
-	return nil
-}
-
-// restoreVolumeStaging restores a volume's staging mount after node reboot
-func (ns *NodeServer) restoreVolumeStaging(ctx context.Context, volumeID, stagingTargetPath string, volumeContext, secrets map[string]string) error {
-	klog.Infof("Restoring volume staging for volume %s at %s", volumeID, stagingTargetPath)
-
-	// Validate backing file exists
-	backingFile := GenerateBackingFilePath(GetLocalPath(volumeID), volumeID)
-	if _, err := os.Stat(backingFile); os.IsNotExist(err) {
-		return fmt.Errorf("backing file %s does not exist", backingFile)
-	}
-
-	// Get passphrase
-	passphrase, err := ns.getPassphraseForRestore(ctx, volumeID, volumeContext, secrets)
-	if err != nil {
-		return fmt.Errorf("failed to get passphrase: %v", err)
-	}
-
-	// Restore LUKS device and mount
-	if err := ns.restoreLUKSDeviceAndMount(volumeID, backingFile, stagingTargetPath, passphrase, volumeContext); err != nil {
-		return fmt.Errorf("failed to restore LUKS device and mount: %v", err)
-	}
-
-	klog.Infof("Successfully restored volume staging for volume %s", volumeID)
-	return nil
-}
-
-// =============================================================================
-// Volume Expansion Operations
-// =============================================================================
-
-// ExpansionParameters holds parameters for volume expansion operations
-type ExpansionParameters struct {
-	volumeID       string
-	volumePath     string
-	requestedBytes int64
-	backingFile    string
-	mapperName     string
-	mappedDevice   string
-	scParams       map[string]string
-}
-
-// validateAndPrepareExpansionRequest validates and prepares expansion parameters
-func (ns *NodeServer) validateAndPrepareExpansionRequest(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*ExpansionParameters, error) {
-	klog.Infof("Starting validation and preparation for volume expansion request")
-	
-	// Validate basic parameters
-	if req.GetVolumeId() == "" {
-		klog.Errorf("Volume ID missing in expansion request")
-		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
-	}
-	if req.GetVolumePath() == "" {
-		klog.Errorf("Volume path missing in expansion request")
-		return nil, status.Error(codes.InvalidArgument, "Volume path missing in request")
-	}
-	if req.GetCapacityRange() == nil {
-		klog.Errorf("Capacity range missing in expansion request")
-		return nil, status.Error(codes.InvalidArgument, "Capacity range missing in request")
-	}
-
-	volumeID := req.GetVolumeId()
-	requestedBytes := req.GetCapacityRange().GetRequiredBytes()
-	if requestedBytes == 0 {
-		requestedBytes = req.GetCapacityRange().GetLimitBytes()
-	}
-	
-	klog.Infof("Validated basic parameters - volumeID: %s, requestedBytes: %d", volumeID, requestedBytes)
-
-	// Get StorageClass parameters for passphrase retrieval
-	klog.Infof("Retrieving PV for volumeID: %s", volumeID)
-	pv, err := ns.getPVByVolumeID(ctx, volumeID)
-	if err != nil {
-		klog.Errorf("Failed to get PV for volumeID %s: %v", volumeID, err)
-		return nil, status.Errorf(codes.FailedPrecondition, "PV for volumeID %s not found: %v", volumeID, err)
-	}
-	klog.Infof("Successfully retrieved PV for volumeID %s, StorageClass: %s", volumeID, pv.Spec.StorageClassName)
-
-	klog.Infof("Retrieving StorageClass parameters for: %s", pv.Spec.StorageClassName)
-	scParams, err := ns.getStorageClassParameters(ctx, pv.Spec.StorageClassName)
-	if err != nil {
-		klog.Errorf("Failed to get StorageClass %s parameters: %v", pv.Spec.StorageClassName, err)
-		return nil, status.Errorf(codes.FailedPrecondition, "Parameters for StorageClass %s not found: %v", 
-			pv.Spec.StorageClassName, err)
-	}
-	klog.Infof("Successfully retrieved StorageClass parameters")
-
-	// Prepare paths and device names
-	localPath := GetLocalPath(volumeID)
-	backingFile := GenerateBackingFilePath(localPath, volumeID)
-	mapperName := ns.luksManager.GenerateMapperName(volumeID)
-	mappedDevice := ns.luksManager.GetMappedDevicePath(mapperName)
-	
-	klog.Infof("Generated paths - localPath: %s, backingFile: %s, mapperName: %s, mappedDevice: %s", 
-		localPath, backingFile, mapperName, mappedDevice)
-
-	// Validate LUKS device is opened
-	klog.Infof("Checking if LUKS device %s is opened", mapperName)
-	if !ns.luksManager.IsLUKSOpened(mapperName) {
-		klog.Errorf("LUKS device %s is not opened - expansion cannot proceed", mapperName)
-		return nil, status.Errorf(codes.FailedPrecondition, "LUKS device %s is not opened", mapperName)
-	}
-	klog.Infof("LUKS device %s is opened and ready for expansion", mapperName)
-
-	klog.Infof("Successfully completed validation and preparation for volume expansion")
-	return &ExpansionParameters{
-		volumeID:       volumeID,
-		volumePath:     req.GetVolumePath(),
-		requestedBytes: requestedBytes,
-		backingFile:    backingFile,
-		mapperName:     mapperName,
-		mappedDevice:   mappedDevice,
-		scParams:       scParams,
-	}, nil
-}
-
-// performVolumeExpansion performs the actual volume expansion operations
-func (ns *NodeServer) performVolumeExpansion(ctx context.Context, params *ExpansionParameters) error {
-	klog.Infof("Starting volume expansion for %s to %d bytes", params.volumeID, params.requestedBytes)
-	
-	// Expand backing file
-	klog.Infof("Expanding backing file %s to %d bytes", params.backingFile, params.requestedBytes)
-	if err := ExpandBackingFile(params.backingFile, params.requestedBytes); err != nil {
-		klog.Errorf("Failed to expand backing file %s: %v", params.backingFile, err)
-		return status.Errorf(codes.Internal, "Failed to expand backing file: %v", err)
-	}
-	klog.Infof("Successfully expanded backing file %s", params.backingFile)
-
-	// Refresh loop device
-	klog.Infof("Refreshing loop device for backing file %s", params.backingFile)
-	if err := ns.refreshLoopDevice(params.backingFile); err != nil {
-		klog.Warningf("Failed to refresh loop device for %s: %v", params.backingFile, err)
-	} else {
-		klog.Infof("Successfully refreshed loop device for backing file %s", params.backingFile)
-	}
-
-	// Get passphrase and resize LUKS
-	klog.Infof("Retrieving passphrase for LUKS resize of device %s", params.mapperName)
-	passphrase, err := ns.getPassphraseForExpansion(ctx, params.scParams)
-	if err != nil {
-		klog.Errorf("Failed to get passphrase for LUKS resize: %v", err)
-		return status.Errorf(codes.Internal, "Failed to get passphrase for LUKS resize: %v", err)
-	}
-	klog.Infof("Successfully retrieved passphrase for LUKS resize")
-
-	klog.Infof("Resizing LUKS device %s", params.mapperName)
-	if err := ns.luksManager.ResizeLUKS(params.mapperName, passphrase); err != nil {
-		klog.Errorf("Failed to resize LUKS device %s: %v", params.mapperName, err)
-		return status.Errorf(codes.Internal, "Failed to resize LUKS device: %v", err)
-	}
-	klog.Infof("Successfully resized LUKS device %s", params.mapperName)
-
-	// Resize filesystem
-	klog.Infof("Resizing filesystem on device %s (volume path: %s)", params.mappedDevice, params.volumePath)
-	if err := ns.resizeFilesystem(params.mappedDevice, params.volumePath); err != nil {
-		klog.Errorf("Failed to resize filesystem on %s: %v", params.mappedDevice, err)
-		return status.Errorf(codes.Internal, "Failed to resize filesystem: %v", err)
-	}
-	klog.Infof("Successfully resized filesystem on device %s", params.mappedDevice)
-
-	klog.Infof("Volume expansion completed successfully for %s", params.volumeID)
-	return nil
-}
-
-// =============================================================================
-// Volume State Management
-// =============================================================================
-
-// isVolumeStaged checks if a volume is already staged at the given path
-func (ns *NodeServer) isVolumeStaged(volumeID, stagingTargetPath string) bool {
-	mapperName := ns.luksManager.GenerateMapperName(volumeID)
-	
-	// Check if LUKS device is opened
-	if !ns.luksManager.IsLUKSOpened(mapperName) {
-		klog.Infof("LUKS device %s is not opened", mapperName)
-		return false
-	}
-	
-	// Check if staging target path is mounted
-	if !ns.isMountPoint(stagingTargetPath) {
-		klog.Infof("Staging target path %s is not mounted", stagingTargetPath)
-		return false
-	}
-	
-	// Verify mount is from our mapped device
-	mappedDevice := ns.luksManager.GetMappedDevicePath(mapperName)
-	if !ns.isMountedFrom(stagingTargetPath, mappedDevice) {
-		klog.Infof("Staging target path %s is not mounted from our device %s", stagingTargetPath, mappedDevice)
-		return false
-	}
-	
-	klog.Infof("Volume %s is already staged at %s", volumeID, stagingTargetPath)
-	return true
-}
-
-// isVolumeAlreadyExpanded checks if the backing file is already expanded to the requested size
-func (ns *NodeServer) isVolumeAlreadyExpanded(backingFile string, requestedBytes int64) bool {
-	fileInfo, err := os.Stat(backingFile)
-	if err != nil {
-		klog.Infof("Cannot stat backing file %s: %v", backingFile, err)
-		return false
-	}
-	
-	currentSize := fileInfo.Size()
-	if currentSize >= requestedBytes {
-		klog.Infof("Backing file %s is already %d bytes (requested: %d bytes)", backingFile, currentSize, requestedBytes)
-		return true
-	}
-	
-	klog.Infof("Backing file %s is %d bytes, needs expansion to %d bytes", backingFile, currentSize, requestedBytes)
-	return false
 }
 
 // =============================================================================
@@ -635,7 +381,7 @@ func (ns *NodeServer) isMountedFrom(path, device string) bool {
 	if err != nil {
 		return false
 	}
-	
+
 	mountedFrom := strings.TrimSpace(string(output))
 	return mountedFrom == device
 }
@@ -649,134 +395,23 @@ func (ns *NodeServer) unmountPath(targetPath string) error {
 	return nil
 }
 
-// refreshLoopDevice finds and refreshes the loop device associated with a backing file
-func (ns *NodeServer) refreshLoopDevice(backingFile string) error {
-	klog.Infof("Refreshing loop device for backing file: %s", backingFile)
-	
-	// Find associated loop device
-	cmd := exec.Command("losetup", "-j", backingFile)
-	output, err := cmd.Output()
-	if err != nil {
-		return fmt.Errorf("failed to find loop device for %s: %v", backingFile, err)
-	}
-	
-	outputStr := strings.TrimSpace(string(output))
-	if outputStr == "" {
-		return fmt.Errorf("no loop device found for backing file %s", backingFile)
-	}
-	
-	// Parse and refresh loop device
-	lines := strings.Split(outputStr, "\n")
-	for _, line := range lines {
-		if strings.Contains(line, ":") {
-			parts := strings.Split(line, ":")
-			if len(parts) > 0 {
-				loopDevice := strings.TrimSpace(parts[0])
-				klog.Infof("Found loop device %s for backing file %s", loopDevice, backingFile)
-				
-				refreshCmd := exec.Command("losetup", "-c", loopDevice)
-				if err := refreshCmd.Run(); err != nil {
-					return fmt.Errorf("failed to refresh loop device %s: %v", loopDevice, err)
-				}
-				
-				klog.Infof("Successfully refreshed loop device %s", loopDevice)
-				return nil
-			}
-		}
-	}
-	
-	return fmt.Errorf("could not parse loop device from output: %s", outputStr)
-}
-
-// =============================================================================
-// Filesystem Operations
-// =============================================================================
-
-// formatDevice formats a device with the specified filesystem
-func (ns *NodeServer) formatDevice(devicePath string, capability *csi.VolumeCapability) error {
-	mount := capability.GetMount()
-	if mount == nil {
-		return fmt.Errorf("only mount access type is supported")
-	}
-
-	fsType := mount.GetFsType()
-	if fsType == "" {
-		fsType = "ext4"
-	}
-
-	// Check if device is already formatted
-	cmd := exec.Command("blkid", devicePath)
-	if cmd.Run() == nil {
-		klog.Infof("Device %s is already formatted", devicePath)
-		return nil
-	}
-
-	klog.Infof("Formatting device %s with filesystem %s", devicePath, fsType)
-	
-	var formatCmd *exec.Cmd
-	switch fsType {
-	case "ext4":
-		formatCmd = exec.Command("mkfs.ext4", "-F", devicePath)
-	case "ext3":
-		formatCmd = exec.Command("mkfs.ext3", "-F", devicePath)
-	case "xfs":
-		formatCmd = exec.Command("mkfs.xfs", "-f", devicePath)
-	default:
-		return fmt.Errorf("unsupported filesystem type: %s", fsType)
-	}
-
-	if err := formatCmd.Run(); err != nil {
-		return fmt.Errorf("failed to format device %s: %v", devicePath, err)
-	}
-
-	return nil
-}
-
-// mountDevice mounts a device to the specified target path
-func (ns *NodeServer) mountDevice(devicePath, targetPath string, capability *csi.VolumeCapability) error {
-	mount := capability.GetMount()
-	if mount == nil {
-		return fmt.Errorf("only mount access type is supported")
-	}
-
-	// Create target directory
-	if err := os.MkdirAll(targetPath, 0777); err != nil {
-		return fmt.Errorf("failed to create target directory: %v", err)
-	}
-
-	fsType := mount.GetFsType()
-	if fsType == "" {
-		fsType = "ext4"
-	}
-
-	// Prepare mount arguments
-	args := []string{"-t", fsType}
-	mountOptions := mount.GetMountFlags()
-	if len(mountOptions) > 0 {
-		args = append(args, "-o", strings.Join(mountOptions, ","))
-	}
-	args = append(args, devicePath, targetPath)
-
-	cmd := exec.Command("mount", args...)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to mount device %s to %s: %v", devicePath, targetPath, err)
-	}
-
-	return nil
-}
-
-// bindMount creates a bind mount from source to target
+// bindMount creates a simple bind mount from source to target
 func (ns *NodeServer) bindMount(sourcePath, targetPath string, readonly bool, fsGroup *int64) error {
-	// Create target directory with appropriate permissions
-	if err := ns.setDirectoryPermissions(targetPath, fsGroup); err != nil {
-		return err
+	// Create target directory in host namespace using nsenter
+	mkdirArgs := []string{"-t", "1", "-m", "-u", "mkdir", "-p", targetPath}
+	klog.Infof("Creating target directory with nsenter: nsenter %v", mkdirArgs)
+	mkdirCmd := exec.Command("nsenter", mkdirArgs...)
+	if err := mkdirCmd.Run(); err != nil {
+		return fmt.Errorf("failed to create target directory in host namespace: %v", err)
 	}
 
-	// Create bind mount
-	args := []string{"--bind", sourcePath, targetPath}
-	cmd := exec.Command("mount", args...)
+	// Create bind mount using nsenter to operate in host namespace
+	args := []string{"-t", "1", "-m", "-u", "mount", "--bind", sourcePath, targetPath}
+
+	klog.Infof("Executing nsenter bind mount: nsenter %v", args)
+	cmd := exec.Command("nsenter", args...)
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to bind mount %s to %s: %v", sourcePath, targetPath, err)
+		return fmt.Errorf("failed to nsenter bind mount %s to %s: %v", sourcePath, targetPath, err)
 	}
 
 	// Set readonly if requested
@@ -787,48 +422,6 @@ func (ns *NodeServer) bindMount(sourcePath, targetPath string, readonly bool, fs
 		}
 	}
 
-	// Ensure bind mount is ready and accessible before returning
-	if err := ns.verifyMountReadiness(targetPath, fsGroup); err != nil {
-		return fmt.Errorf("failed to verify mount readiness: %v", err)
-	}
-
-	return nil
-}
-
-// resizeFilesystem resizes the filesystem on the given device
-func (ns *NodeServer) resizeFilesystem(devicePath, volumePath string) error {
-	klog.Infof("Resizing filesystem on device %s", devicePath)
-
-	// Detect filesystem type
-	cmd := exec.Command("blkid", "-s", "TYPE", "-o", "value", devicePath)
-	output, err := cmd.Output()
-	if err != nil {
-		return fmt.Errorf("failed to detect filesystem type on %s: %v", devicePath, err)
-	}
-
-	fsType := strings.TrimSpace(string(output))
-	if fsType == "" {
-		return fmt.Errorf("no filesystem found on device %s", devicePath)
-	}
-
-	klog.Infof("Detected filesystem type: %s on device %s", fsType, devicePath)
-
-	// Choose appropriate resize command
-	var resizeCmd *exec.Cmd
-	switch fsType {
-	case "ext2", "ext3", "ext4":
-		resizeCmd = exec.Command("resize2fs", devicePath)
-	case "xfs":
-		resizeCmd = exec.Command("xfs_growfs", volumePath)
-	default:
-		return fmt.Errorf("unsupported filesystem type for resize: %s", fsType)
-	}
-
-	if err := resizeCmd.Run(); err != nil {
-		return fmt.Errorf("failed to resize %s filesystem on %s: %v", fsType, devicePath, err)
-	}
-
-	klog.Infof("Successfully resized %s filesystem on device %s", fsType, devicePath)
 	return nil
 }
 
@@ -845,7 +438,7 @@ func (ns *NodeServer) extractFsGroup(volumeContext map[string]string) *int64 {
 			return &fsGroup
 		}
 	}
-	
+
 	// Fall back to auto-detection from pod security context
 	if fsGroupStr, exists := volumeContext["csi.storage.k8s.io/pod.spec.securityContext.fsGroup"]; exists {
 		if fsGroup, err := strconv.ParseInt(fsGroupStr, 10, 64); err == nil {
@@ -853,40 +446,34 @@ func (ns *NodeServer) extractFsGroup(volumeContext map[string]string) *int64 {
 			return &fsGroup
 		}
 	}
-	
+
 	klog.Infof("No fsGroup found - using default permissions")
 	return nil
 }
 
-// setDirectoryPermissions sets directory permissions based on fsGroup
-func (ns *NodeServer) setDirectoryPermissions(path string, fsGroup *int64) error {
-	var mode os.FileMode = 0755 // Default permissions
-	if fsGroup != nil {
-		mode = 0775 // Group writable when fsGroup is set
-		klog.Infof("Creating directory %s with mode 0775 and group ownership %d", path, *fsGroup)
+// applyFsGroupPermissions applies fsGroup ownership to the bind mount target
+func (ns *NodeServer) applyFsGroupPermissions(targetPath string, fsGroup int64) error {
+	klog.Infof("Applying fsGroup %d permissions recursively to %s", fsGroup, targetPath)
+
+	// Recursive chown using nsenter to operate in host namespace
+	chownCmd := exec.Command("nsenter", "-t", "1", "-m", "-u", "chown", "-R", fmt.Sprintf("%d:%d", fsGroup, fsGroup), targetPath)
+	if output, err := chownCmd.CombinedOutput(); err != nil {
+		klog.Errorf("nsenter chown command failed: %v, output: %s", err, string(output))
+		return fmt.Errorf("failed to recursively apply fsGroup with nsenter: %v, output: %s", err, string(output))
 	} else {
-		klog.Infof("Creating directory %s with mode 0755 (no fsGroup)", path)
+		klog.Infof("nsenter chown command successful, output: %s", string(output))
 	}
-	
-	if err := os.MkdirAll(path, mode); err != nil {
-		return fmt.Errorf("failed to create directory: %v", err)
+
+	// Ensure group writable using nsenter
+	chmodCmd := exec.Command("nsenter", "-t", "1", "-m", "-u", "chmod", "-R", "775", targetPath)
+	if output, err := chmodCmd.CombinedOutput(); err != nil {
+		klog.Errorf("nsenter chmod command failed: %v, output: %s", err, string(output))
+		return fmt.Errorf("failed to recursively chmod with nsenter: %v, output: %s", err, string(output))
+	} else {
+		klog.Infof("nsenter chmod command successful, output: %s", string(output))
 	}
-	
-	// Set ownership if fsGroup is specified
-	if fsGroup != nil {
-		if err := os.Chmod(path, mode); err != nil {
-			klog.Warningf("Failed to set permissions %o: %v", mode, err)
-		} else {
-			klog.Infof("Successfully set permissions %o for %s", mode, path)
-		}
-		
-		if err := os.Chown(path, int(*fsGroup), int(*fsGroup)); err != nil {
-			klog.Warningf("Failed to change ownership to %d:%d: %v", *fsGroup, *fsGroup, err)
-		} else {
-			klog.Infof("Successfully set ownership to %d:%d for %s", *fsGroup, *fsGroup, path)
-		}
-	}
-	
+
+	klog.Infof("Successfully applied fsGroup %d permissions recursively to %s", fsGroup, targetPath)
 	return nil
 }
 
@@ -894,87 +481,87 @@ func (ns *NodeServer) setDirectoryPermissions(path string, fsGroup *int64) error
 // Passphrase and Secret Management
 // =============================================================================
 
-// getPassphraseFromRequest extracts passphrase from the staging request
+// getPassphraseFromRequest extracts passphrase from the staging request using SecretsManager
 func (ns *NodeServer) getPassphraseFromRequest(req *csi.NodeStageVolumeRequest) (string, error) {
-	passphraseKey := req.GetVolumeContext()[PassphraseKeyParam]
-	if passphraseKey == "" {
-		passphraseKey = DefaultPassphraseKey
-	}
-	
-	return ns.getPassphrase(req.GetSecrets(), passphraseKey)
-}
+	ctx := context.Background()
+	volumeID := req.GetVolumeId()
+	volumeContext := req.GetVolumeContext()
 
-// getPassphraseForRestore retrieves passphrase for volume restore operations
-func (ns *NodeServer) getPassphraseForRestore(ctx context.Context, volumeID string, volumeContext, secrets map[string]string) (string, error) {
-	passphraseKey := volumeContext[PassphraseKeyParam]
-	if passphraseKey == "" {
-		passphraseKey = DefaultPassphraseKey
-	}
-
-	// Try from provided secrets first
-	if len(secrets) > 0 {
-		if passphrase, err := ns.getPassphrase(secrets, passphraseKey); err == nil {
-			return passphrase, nil
-		}
-		klog.Warningf("Failed to get passphrase from provided secrets")
-	}
-	
-	// Fallback to StorageClass parameters
+	// Get StorageClass parameters - secret references are there, not in volumeContext
 	pv, err := ns.getPVByVolumeID(ctx, volumeID)
 	if err != nil {
 		return "", fmt.Errorf("failed to get PV for volume %s: %v", volumeID, err)
 	}
-	
+
 	scParams, err := ns.getStorageClassParameters(ctx, pv.Spec.StorageClassName)
 	if err != nil {
 		return "", fmt.Errorf("failed to get StorageClass parameters: %v", err)
 	}
-	
-	return ns.getPassphraseForExpansion(ctx, scParams)
-}
 
-// getPassphrase retrieves passphrase from secrets map
-func (ns *NodeServer) getPassphrase(secrets map[string]string, passphraseKey string) (string, error) {
-	if passphrase, ok := secrets[passphraseKey]; ok {
-		return passphrase, nil
-	}
-	return "", fmt.Errorf("passphrase not found in secrets with key '%s'", passphraseKey)
-}
+	// Extract secret parameters from StorageClass parameters and volume context
+	secretParams := secrets.ExtractSecretParams(scParams, volumeContext)
+	klog.V(4).Infof("getPassphraseFromRequest: extracted secretParams - LUKS: %s/%s, passphraseKey: %s",
+		secretParams.LUKSSecret.Namespace, secretParams.LUKSSecret.Name,
+		secretParams.PassphraseKey)
 
-// getPassphraseForExpansion retrieves passphrase for volume expansion
-func (ns *NodeServer) getPassphraseForExpansion(ctx context.Context, scParams map[string]string) (string, error) {
-	if ns.clientset == nil {
-		return "", fmt.Errorf("kubernetes clientset not available")
-	}
-
-	secretName, ok := scParams["csi.storage.k8s.io/node-stage-secret-name"]
-	if !ok {
-		return "", fmt.Errorf("node-stage-secret-name not found in StorageClass parameters")
-	}
-	
-	secretNamespace, ok := scParams["csi.storage.k8s.io/node-stage-secret-namespace"]
-	if !ok {
-		return "", fmt.Errorf("node-stage-secret-namespace not found in StorageClass parameters")
-	}
-	
-	passphraseKey, ok := scParams["passphraseKey"]
-	if !ok {
-		passphraseKey = DefaultPassphraseKey
-	}
-
-	// Retrieve the secret
-	secretObj, err := ns.clientset.CoreV1().Secrets(secretNamespace).Get(ctx, secretName, metav1.GetOptions{})
+	// Fetch secrets from Kubernetes
+	volSecrets, err := ns.secretsManager.FetchVolumeSecrets(ctx, secretParams)
 	if err != nil {
-		return "", fmt.Errorf("failed to get secret %s/%s: %v", secretNamespace, secretName, err)
+		return "", fmt.Errorf("failed to fetch secrets: %w", err)
 	}
 
-	// Convert secret data to string map
-	secrets := make(map[string]string, len(secretObj.Data))
-	for k, v := range secretObj.Data {
-		secrets[k] = string(v)
+	if volSecrets.Passphrase == "" {
+		return "", fmt.Errorf("LUKS passphrase not found in secrets")
 	}
 
-	return ns.getPassphrase(secrets, passphraseKey)
+	return volSecrets.Passphrase, nil
+}
+
+// getPassphraseForRestore retrieves passphrase for volume restore operations using SecretsManager
+func (ns *NodeServer) getPassphraseForRestore(ctx context.Context, volumeID string, volumeContext, _ map[string]string) (string, error) {
+	// Get StorageClass parameters for secret references
+	pv, err := ns.getPVByVolumeID(ctx, volumeID)
+	if err != nil {
+		return "", fmt.Errorf("failed to get PV for volume %s: %v", volumeID, err)
+	}
+
+	scParams, err := ns.getStorageClassParameters(ctx, pv.Spec.StorageClassName)
+	if err != nil {
+		return "", fmt.Errorf("failed to get StorageClass parameters: %v", err)
+	}
+
+	// Extract secret parameters from StorageClass and volume context
+	secretParams := secrets.ExtractSecretParams(scParams, volumeContext)
+
+	// Fetch secrets from Kubernetes
+	volSecrets, err := ns.secretsManager.FetchVolumeSecrets(ctx, secretParams)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch secrets: %w", err)
+	}
+
+	if volSecrets.Passphrase == "" {
+		return "", fmt.Errorf("LUKS passphrase not found in secrets")
+	}
+
+	return volSecrets.Passphrase, nil
+}
+
+// getPassphraseForExpansion retrieves passphrase for volume expansion using SecretsManager
+func (ns *NodeServer) getPassphraseForExpansion(ctx context.Context, scParams map[string]string) (string, error) {
+	// Extract secret parameters from StorageClass parameters
+	secretParams := secrets.ExtractSecretParams(scParams, nil)
+
+	// Fetch secrets from Kubernetes
+	volSecrets, err := ns.secretsManager.FetchVolumeSecrets(ctx, secretParams)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch secrets: %w", err)
+	}
+
+	if volSecrets.Passphrase == "" {
+		return "", fmt.Errorf("LUKS passphrase not found in secrets")
+	}
+
+	return volSecrets.Passphrase, nil
 }
 
 // =============================================================================
@@ -986,7 +573,7 @@ func (ns *NodeServer) getPVByVolumeID(ctx context.Context, volumeID string) (*co
 	if ns.clientset == nil {
 		return nil, fmt.Errorf("kubernetes clientset not available")
 	}
-	
+
 	pvList, err := ns.clientset.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list PVs: %v", err)
@@ -1006,7 +593,7 @@ func (ns *NodeServer) getStorageClassParameters(ctx context.Context, name string
 	if ns.clientset == nil {
 		return nil, fmt.Errorf("kubernetes clientset not available")
 	}
-	
+
 	if name == "" {
 		return nil, fmt.Errorf("storageClassName is empty")
 	}
@@ -1017,183 +604,4 @@ func (ns *NodeServer) getStorageClassParameters(ctx context.Context, name string
 	}
 
 	return sc.Parameters, nil
-}
-
-// =============================================================================
-// Utility Functions
-// =============================================================================
-
-// ensureBackingFileExists creates the backing file if it doesn't exist
-func (ns *NodeServer) ensureBackingFileExists(req *csi.NodeStageVolumeRequest, backingFile string) error {
-	if _, err := os.Stat(backingFile); os.IsNotExist(err) {
-		capacityStr := req.GetVolumeContext()["capacity"]
-		if capacityStr == "" {
-			capacityStr = "1073741824" // Default 1GB in bytes
-		}
-		
-		if err := CreateBackingFile(backingFile, capacityStr); err != nil {
-			return fmt.Errorf("failed to create backing file: %v", err)
-		}
-	}
-	
-	return nil
-}
-
-// restoreLUKSDeviceAndMount restores LUKS device and creates mount
-func (ns *NodeServer) restoreLUKSDeviceAndMount(volumeID, backingFile, stagingTargetPath, passphrase string, volumeContext map[string]string) error {
-	mapperName := ns.luksManager.GenerateMapperName(volumeID)
-
-	// Open LUKS device
-	if err := ns.luksManager.OpenLUKS(backingFile, mapperName, passphrase); err != nil {
-		return fmt.Errorf("failed to open LUKS device: %v", err)
-	}
-
-	// Create basic volume capability (assume ext4)
-	volumeCapability := &csi.VolumeCapability{
-		AccessType: &csi.VolumeCapability_Mount{
-			Mount: &csi.VolumeCapability_MountVolume{
-				FsType: "ext4",
-			},
-		},
-	}
-
-	// Mount device
-	mappedDevice := ns.luksManager.GetMappedDevicePath(mapperName)
-	if err := ns.mountDevice(mappedDevice, stagingTargetPath, volumeCapability); err != nil {
-		ns.luksManager.CloseLUKS(mapperName) // Cleanup on failure
-		return fmt.Errorf("failed to mount device: %v", err)
-	}
-
-	// Set permissions
-	fsGroup := ns.extractFsGroup(volumeContext)
-	if err := ns.setDirectoryPermissions(stagingTargetPath, fsGroup); err != nil {
-		klog.Warningf("Failed to set directory permissions: %v", err)
-	}
-
-	return nil
-}
-
-// verifyMountReadiness ensures the mount is fully ready and accessible
-func (ns *NodeServer) verifyMountReadiness(targetPath string, fsGroup *int64) error {
-	klog.Infof("Verifying mount readiness for %s", targetPath)
-
-	// Wait for mount to be stable with retries
-	maxRetries := 5
-	for i := 0; i < maxRetries; i++ {
-		// Check if path is actually mounted
-		if !ns.isMountPoint(targetPath) {
-			if i == maxRetries-1 {
-				return fmt.Errorf("mount point %s is not stable after %d retries", targetPath, maxRetries)
-			}
-			klog.Infof("Mount point %s not ready, retry %d/%d", targetPath, i+1, maxRetries)
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-
-		// Test file system accessibility
-		if err := ns.testFilesystemAccess(targetPath, fsGroup); err != nil {
-			if i == maxRetries-1 {
-				return fmt.Errorf("filesystem access test failed after %d retries: %v", maxRetries, err)
-			}
-			klog.Infof("Filesystem access test failed, retry %d/%d: %v", i+1, maxRetries, err)
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-
-		klog.Infof("Mount readiness verified for %s", targetPath)
-		return nil
-	}
-
-	return fmt.Errorf("mount readiness verification failed for %s", targetPath)
-}
-
-// testFilesystemAccess tests if the filesystem is accessible and writable
-func (ns *NodeServer) testFilesystemAccess(targetPath string, fsGroup *int64) error {
-	// Test read access
-	entries, err := os.ReadDir(targetPath)
-	if err != nil {
-		return fmt.Errorf("failed to read directory: %v", err)
-	}
-
-	klog.Infof("Successfully read directory %s with %d entries", targetPath, len(entries))
-
-	// Test write access if fsGroup is specified
-	if fsGroup != nil {
-		testFile := targetPath + "/.csi-mount-test"
-		if err := os.WriteFile(testFile, []byte("test"), 0644); err != nil {
-			return fmt.Errorf("failed to write test file: %v", err)
-		}
-
-		// Clean up test file
-		if err := os.Remove(testFile); err != nil {
-			klog.Warningf("Failed to remove test file %s: %v", testFile, err)
-		} else {
-			klog.Infof("Successfully verified write access for %s", targetPath)
-		}
-	}
-
-	return nil
-}
-
-// applyFsGroupToMountedFilesystem applies fsGroup permissions to the content of the mounted filesystem
-func (ns *NodeServer) applyFsGroupToMountedFilesystem(mountPath string, fsGroup *int64) error {
-	if fsGroup == nil {
-		klog.Infof("No fsGroup specified, skipping filesystem permission setup for %s", mountPath)
-		return nil
-	}
-
-	klog.Infof("Applying fsGroup %d to mounted filesystem at %s", *fsGroup, mountPath)
-
-	// First, set ownership and permissions on the mount point itself
-	// Set both user and group to fsGroup so the pod's user can write
-	if err := os.Chown(mountPath, int(*fsGroup), int(*fsGroup)); err != nil {
-		return fmt.Errorf("failed to set ownership on mount point: %v", err)
-	}
-
-	if err := os.Chmod(mountPath, 0775); err != nil {
-		return fmt.Errorf("failed to set permissions on mount point: %v", err)
-	}
-
-	// Apply permissions recursively to all content in the mounted filesystem
-	err := filepath.Walk(mountPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			klog.Warningf("Error walking path %s: %v", path, err)
-			return nil // Continue walking even if we encounter errors
-		}
-
-		// Skip the mount point itself as we already handled it
-		if path == mountPath {
-			return nil
-		}
-
-		// Set group ownership for all files and directories
-		if err := os.Chown(path, int(*fsGroup), int(*fsGroup)); err != nil {
-			klog.Warningf("Failed to set group ownership for %s: %v", path, err)
-			return nil // Continue even if chown fails for individual files
-		}
-
-		// Set appropriate permissions based on file type
-		var newMode os.FileMode
-		if info.IsDir() {
-			// Directories: add group write and execute permissions
-			newMode = info.Mode() | 0070 // Add rwx for group
-		} else {
-			// Regular files: add group read/write permissions
-			newMode = info.Mode() | 0060 // Add rw- for group
-		}
-
-		if err := os.Chmod(path, newMode); err != nil {
-			klog.Warningf("Failed to set permissions for %s: %v", path, err)
-			return nil // Continue even if chmod fails for individual files
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return fmt.Errorf("failed to walk filesystem for permission changes: %v", err)
-	}
-
-	klog.Infof("Successfully applied fsGroup %d to filesystem content at %s", *fsGroup, mountPath)
-	return nil
 }

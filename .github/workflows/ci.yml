@@ -1,0 +1,271 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  GO_VERSION: '1.24'
+  ALPINE_VERSION: '3.18'
+  GOLANGCI_LINT_VERSION: 'v1.55'
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    container:
+      image: golang:1.24-alpine
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: apk add --no-cache git gcc musl-dev
+
+      - name: Install golangci-lint
+        run: |
+          wget -O- -nv https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b /usr/local/bin ${{ env.GOLANGCI_LINT_VERSION }}
+
+      - name: Run golangci-lint
+        run: golangci-lint run --timeout=10m
+
+      - name: Verify go mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: ['1.22', '1.23', '1.24']
+    container:
+      image: golang:${{ matrix.go-version }}-alpine
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          apk add --no-cache git gcc musl-dev cryptsetup
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run tests
+        run: |
+          CGO_ENABLED=1 go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Upload coverage to Codecov
+        if: matrix.go-version == '1.24'
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.out
+          flags: unittests
+          name: codecov-umbrella
+
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner (repo)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Run Gosec Security Scanner
+        uses: securego/gosec@master
+        with:
+          args: '-no-fail -fmt sarif -out gosec-results.sarif ./...'
+
+      - name: Upload Gosec SARIF file
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: gosec-results.sarif
+
+  build:
+    name: Build Binary
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    container:
+      image: golang:1.24-alpine
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: apk add --no-cache git
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build binary
+        run: |
+          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+          GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+          BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -ldflags="-X github.com/algonomia/lukscryptwalker-csi/pkg/version.Version=${VERSION} \
+            -X github.com/algonomia/lukscryptwalker-csi/pkg/version.GitCommit=${GIT_COMMIT} \
+            -X github.com/algonomia/lukscryptwalker-csi/pkg/version.BuildDate=${BUILD_DATE} \
+            -w -s" \
+            -a -installsuffix cgo -o bin/lukscryptwalker-csi ./cmd/main.go
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: lukscryptwalker-csi-binary
+          path: bin/lukscryptwalker-csi
+
+  docker-build:
+    name: Docker Build Test
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          tags: |
+            lukscryptwalker-csi:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  helm-lint:
+    name: Helm Chart Lint
+    runs-on: ubuntu-latest
+    container:
+      image: alpine/helm:3.13.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint Helm chart
+        run: |
+          helm lint charts/lukscryptwalker-csi
+
+      - name: Template Helm chart
+        run: |
+          helm template lukscryptwalker-csi charts/lukscryptwalker-csi --namespace kube-system > /dev/null
+
+  integration:
+    name: Integration Test (Kind)
+    runs-on: ubuntu-latest
+    needs: [build]
+    strategy:
+      matrix:
+        k8s-version: ['1.26.6', '1.27.3', '1.28.0']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: lukscryptwalker-csi-binary
+          path: bin/
+
+      - name: Make binary executable
+        run: chmod +x bin/lukscryptwalker-csi
+
+      - name: Build Docker image
+        run: docker build -t lukscryptwalker-csi:test .
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1.8.0
+        with:
+          node_image: kindest/node:v${{ matrix.k8s-version }}
+          cluster_name: kind
+          config: |
+            kind: Cluster
+            apiVersion: kind.x-k8s.io/v1alpha4
+            nodes:
+            - role: control-plane
+              extraMounts:
+              - hostPath: /tmp
+                containerPath: /tmp
+            - role: worker
+              extraMounts:
+              - hostPath: /tmp
+                containerPath: /tmp
+
+      - name: Load Docker image to kind
+        run: |
+          kind load docker-image lukscryptwalker-csi:test --name kind
+
+      - name: Install Helm chart
+        run: |
+          helm install lukscryptwalker-csi charts/lukscryptwalker-csi \
+            --namespace kube-system \
+            --create-namespace \
+            --set image.repository=lukscryptwalker-csi \
+            --set image.tag=test \
+            --set image.pullPolicy=Never \
+            --wait --timeout 5m
+
+      - name: Verify deployment
+        run: |
+          kubectl wait --for=condition=ready pod -l app=lukscryptwalker-csi-controller -n kube-system --timeout=120s
+          kubectl wait --for=condition=ready pod -l app=lukscryptwalker-csi-node -n kube-system --timeout=120s
+
+      - name: Check CSI driver
+        run: |
+          kubectl get csidriver
+          kubectl get storageclass
+          kubectl get pods -n kube-system -l app.kubernetes.io/name=lukscryptwalker-csi
+
+      - name: Create test PVC
+        run: |
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: luks-secret
+            namespace: kube-system
+          data:
+            passphrase: $(echo -n "test-passphrase-123" | base64)
+          ---
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: test-pvc
+            namespace: default
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 1Gi
+            storageClassName: lukscryptwalker-local
+          EOF
+
+          # Wait for PVC to be bound
+          kubectl wait --for=condition=Bound pvc/test-pvc -n default --timeout=60s || true
+
+      - name: Debug logs on failure
+        if: failure()
+        run: |
+          kubectl logs -n kube-system -l app=lukscryptwalker-csi-controller --tail=100
+          kubectl logs -n kube-system -l app=lukscryptwalker-csi-node --tail=100
+          kubectl describe pods -n kube-system -l app.kubernetes.io/name=lukscryptwalker-csi
+          kubectl get events -n kube-system --sort-by='.lastTimestamp'
