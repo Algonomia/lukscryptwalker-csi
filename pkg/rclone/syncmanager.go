@@ -421,7 +421,7 @@ func (mm *MountManager) teardownEncryptedCache() error {
 	// Find and detach loop device
 	loopDevice, err := mm.findLoopDevice(backingFile)
 	if err == nil && loopDevice != "" {
-		mm.detachLoopDevice(loopDevice)
+		_ = mm.detachLoopDevice(loopDevice) // Best effort cleanup
 	}
 
 	mm.cacheMounted = false
