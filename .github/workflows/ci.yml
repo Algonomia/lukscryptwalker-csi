@@ -121,7 +121,7 @@ jobs:
             -a -installsuffix cgo -o bin/lukscryptwalker-csi ./cmd/main.go
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: lukscryptwalker-csi-binary
           path: bin/lukscryptwalker-csi
