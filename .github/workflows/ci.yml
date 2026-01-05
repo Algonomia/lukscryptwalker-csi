@@ -10,7 +10,7 @@ on:
 env:
   GO_VERSION: '1.25'
   ALPINE_VERSION: '3.18'
-  GOLANGCI_LINT_VERSION: 'v1.64.5'
+  GOLANGCI_LINT_VERSION: 'v2.7.2'
 
 jobs:
   lint:
@@ -54,7 +54,7 @@ jobs:
           CGO_ENABLED=1 go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3
+        uses: codecov/codecov-action@v5
         with:
           file: ./coverage.out
           flags: unittests
@@ -76,7 +76,7 @@ jobs:
           severity: 'CRITICAL,HIGH'
 
       - name: Upload Trivy results to GitHub Security
-        uses: github/codeql-action/upload-sarif@v2
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: 'trivy-results.sarif'
@@ -87,7 +87,7 @@ jobs:
           args: '-no-fail -fmt sarif -out gosec-results.sarif ./...'
 
       - name: Upload Gosec SARIF file
-        uses: github/codeql-action/upload-sarif@v2
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: gosec-results.sarif
@@ -121,7 +121,7 @@ jobs:
             -a -installsuffix cgo -o bin/lukscryptwalker-csi ./cmd/main.go
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: lukscryptwalker-csi-binary
           path: bin/lukscryptwalker-csi
@@ -169,7 +169,7 @@ jobs:
     needs: [build]
     strategy:
       matrix:
-        k8s-version: ['1.26.6', '1.27.3', '1.28.0']
+        k8s-version: ['1.31.0']
     steps:
       - uses: actions/checkout@v4
 
@@ -186,22 +186,10 @@ jobs:
         run: docker build -t lukscryptwalker-csi:test .
 
       - name: Create kind cluster
-        uses: helm/kind-action@v1.8.0
+        uses: helm/kind-action@v1.13.0
         with:
           node_image: kindest/node:v${{ matrix.k8s-version }}
           cluster_name: kind
-          config: |
-            kind: Cluster
-            apiVersion: kind.x-k8s.io/v1alpha4
-            nodes:
-            - role: control-plane
-              extraMounts:
-              - hostPath: /tmp
-                containerPath: /tmp
-            - role: worker
-              extraMounts:
-              - hostPath: /tmp
-                containerPath: /tmp
 
       - name: Load Docker image to kind
         run: |
