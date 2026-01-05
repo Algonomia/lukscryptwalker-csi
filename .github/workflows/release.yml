@@ -234,6 +234,7 @@ jobs:
           fi
           VERSION="${VERSION#v}"
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "repo_name=${GITHUB_REPOSITORY,,}" >> $GITHUB_OUTPUT
 
       - name: Update Chart.yaml
         run: |
@@ -245,7 +246,7 @@ jobs:
           # Only update the main image tag (line 3), not sidecar images
           sed -i '3s/tag:.*/tag: "v${{ steps.get_version.outputs.version }}"/' charts/lukscryptwalker-csi/values.yaml
           # Only update the main image repository (line 2) - use lowercase repo name
-          sed -i '2s|repository:.*|repository: ${{ env.REGISTRY }}/${GITHUB_REPOSITORY,,}|' charts/lukscryptwalker-csi/values.yaml
+          sed -i '2s|repository:.*|repository: ${{ env.REGISTRY }}/${{ steps.get_version.outputs.repo_name }}|' charts/lukscryptwalker-csi/values.yaml
 
       - name: Commit and push changes
         run: |
