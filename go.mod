@@ -51,7 +51,7 @@ require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/ebitengine/purego v0.9.1 // indirect
 	github.com/emicklei/go-restful/v3 v3.12.2 // indirect
-	github.com/fsnotify/fsnotify v1.7.0 // indirect
+	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.11 // indirect
 	github.com/go-chi/chi/v5 v5.2.3 // indirect
