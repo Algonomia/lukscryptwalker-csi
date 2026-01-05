@@ -10,7 +10,7 @@ metadata:
 type: Opaque
 data:
   {{- if .Values.secret.passphrase }}
-  {{ .Values.secret.passphraseKey }}: {{ .Values.secret.passphrase }}
+  {{ .Values.secret.passphraseKey }}: {{ .Values.secret.passphrase | b64enc | quote }}
   {{- else }}
   # Auto-generated passphrase (base64 encoded)
   {{ .Values.secret.passphraseKey }}: {{ randAlphaNum 32 | b64enc | quote }}

@@ -1,0 +1,31 @@
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  name: s3-test-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: lukscryptwalker-ovh
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: s3-test-pod
+spec:
+  containers:
+    - name: s3-test
+      image: busybox
+      command:
+        - "/bin/sh"
+        - "-c"
+        - "echo 'Testing S3 storage...' > /data/test-file; cat /data/test-file; echo 'Sleeping...'; sleep 3600"
+      volumeMounts:
+        - name: s3-vol
+          mountPath: /data
+  volumes:
+    - name: s3-vol
+      persistentVolumeClaim:
+        claimName: s3-test-pvc

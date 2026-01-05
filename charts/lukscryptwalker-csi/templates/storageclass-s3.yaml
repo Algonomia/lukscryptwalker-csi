@@ -1,0 +1,106 @@
+{{- range .Values.s3StorageClasses }}
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .name }}
+  labels:
+    {{- include "lukscryptwalker-csi.labels" $ | nindent 4 }}
+  {{- if .isDefault }}
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+  {{- end }}
+provisioner: {{ $.Values.csiDriver.name }}
+parameters:
+  # Storage backend type
+  storage-backend: "s3"
+
+  # S3 Configuration
+  s3-bucket: {{ .s3.bucket | quote }}
+  s3-region: {{ .s3.region | quote }}
+  {{- if .s3.endpoint }}
+  s3-endpoint: {{ .s3.endpoint | quote }}
+  {{- end }}
+  {{- if .s3.forcePathStyle }}
+  s3-force-path-style: {{ .s3.forcePathStyle | quote }}
+  {{- end }}
+  {{- if .s3.pathPrefix }}
+  s3-path-prefix: {{ .s3.pathPrefix | quote }}
+  {{- end }}
+
+  # S3 Credentials (from secret)
+  s3-access-key-id-secret-name: {{ .s3.credentialsSecret.name | quote }}
+  s3-access-key-id-secret-namespace: {{ .s3.credentialsSecret.namespace | quote }}
+  s3-secret-access-key-secret-name: {{ .s3.credentialsSecret.name | quote }}
+  s3-secret-access-key-secret-namespace: {{ .s3.credentialsSecret.namespace | quote }}
+
+  # LUKS encryption parameters
+  csi.storage.k8s.io/node-stage-secret-name: {{ .secret.name | quote }}
+  csi.storage.k8s.io/node-stage-secret-namespace: {{ .secret.namespace | quote }}
+  passphraseKey: {{ .secret.passphraseKey | quote }}
+
+  # Provisioner secrets for DeleteVolume (ReclaimPolicy: Delete)
+  csi.storage.k8s.io/provisioner-secret-name: {{ .s3.credentialsSecret.name | quote }}
+  csi.storage.k8s.io/provisioner-secret-namespace: {{ .s3.credentialsSecret.namespace | quote }}
+
+  # VFS Cache Configuration (rclone mount mode)
+  {{- if .vfsCache }}
+  {{- if .vfsCache.mode }}
+  rclone-vfs-cache-mode: {{ .vfsCache.mode | quote }}
+  {{- end }}
+  {{- if .vfsCache.maxAge }}
+  rclone-vfs-cache-max-age: {{ .vfsCache.maxAge | quote }}
+  {{- end }}
+  {{- if .vfsCache.maxSize }}
+  rclone-vfs-cache-max-size: {{ .vfsCache.maxSize | quote }}
+  {{- end }}
+  {{- if .vfsCache.writeBack }}
+  rclone-vfs-write-back: {{ .vfsCache.writeBack | quote }}
+  {{- end }}
+  {{- end }}
+
+  # File system and permissions
+  {{- if .fsGroup }}
+  fsGroup: {{ .fsGroup | quote }}
+  {{- end }}
+  {{- if .fsType }}
+  fsType: {{ .fsType | quote }}
+  {{- end }}
+
+reclaimPolicy: {{ .reclaimPolicy | default "Delete" }}
+allowVolumeExpansion: {{ .allowVolumeExpansion | default true }}
+volumeBindingMode: {{ .volumeBindingMode | default "WaitForFirstConsumer" }}
+{{- end }}
+
+{{- if .Values.s3StorageClasses }}
+{{- range .Values.s3StorageClasses }}
+{{- if .s3.credentialsSecret.create }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .s3.credentialsSecret.name }}
+  namespace: {{ .s3.credentialsSecret.namespace }}
+  labels:
+    {{- include "lukscryptwalker-csi.labels" $ | nindent 4 }}
+type: Opaque
+data:
+  # S3 configuration (needed for DeleteVolume)
+  s3-bucket: {{ .s3.bucket | b64enc | quote }}
+  s3-region: {{ .s3.region | b64enc | quote }}
+  {{- if .s3.endpoint }}
+  s3-endpoint: {{ .s3.endpoint | b64enc | quote }}
+  {{- end }}
+  {{- if .s3.pathPrefix }}
+  s3-path-prefix: {{ .s3.pathPrefix | b64enc | quote }}
+  {{- end }}
+  # S3 credentials
+  {{- if .s3.credentialsSecret.accessKeyId }}
+  s3-access-key-id: {{ .s3.credentialsSecret.accessKeyId | b64enc | quote }}
+  {{- end }}
+  {{- if .s3.credentialsSecret.secretAccessKey }}
+  s3-secret-access-key: {{ .s3.credentialsSecret.secretAccessKey | b64enc | quote }}
+  {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

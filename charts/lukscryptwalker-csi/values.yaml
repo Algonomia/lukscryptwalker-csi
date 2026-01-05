@@ -73,13 +73,15 @@ storage:
   defaultSize: "1Gi"
 
 # LUKS secret configuration (shared by all StorageClasses by default)
+# WARNING: Setting passphrase in values.yaml is not secure for production!
+# For production, create secrets manually and set create: false
 secret:
   name: luks-secret
   namespace: kube-system
   # Auto-create secret with random passphrase
-  create: true
-  # If create is false, provide your own passphrase (base64 encoded)
-  passphrase: ""
+  create: true  # Set to false for production and create secret manually
+  # If create is false, provide your own passphrase
+  passphrase: ""  # WARNING: Not secure - use external secret management
   # Key name within the secret that contains the passphrase
   passphraseKey: "passphrase"
 
@@ -181,3 +183,106 @@ tolerations: []
 
 # Pod annotations
 podAnnotations: {}
+
+# S3 Storage Classes configuration - rclone mount with encrypted S3 backend
+s3StorageClasses:
+  # Example S3 StorageClass with rclone mount
+  - name: lukscryptwalker-s3
+    isDefault: false
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: WaitForFirstConsumer
+    fsType: "ext4"
+    # fsGroup: null  # Auto-detect from pod
+
+    # Encryption passphrase (rclone crypt uses NaCl SecretBox)
+    secret:
+      name: luks-secret
+      namespace: kube-system
+      passphraseKey: "passphrase"
+
+    # S3 Configuration
+    s3:
+      bucket: "my-encrypted-volumes"
+      region: "us-east-1"
+      # endpoint: "https://s3.amazonaws.com"  # Optional: for S3-compatible services
+      # forcePathStyle: false  # Set to true for MinIO and similar services
+      # pathPrefix: "my-app/data"  # Optional: custom path in S3 (default: volumes/{volumeID}/files)
+                                   # When set, this is also used as salt for encryption password2
+                                   # allowing external access with just passphrase + pathPrefix
+
+      # S3 Credentials Secret
+      # WARNING: Setting credentials in values.yaml is not secure for production!
+      # For production, create secrets manually and set create: false
+      credentialsSecret:
+        name: s3-credentials
+        namespace: kube-system
+        create: true  # Set to false for production and create secret manually
+        accessKeyId: ""  # WARNING: Not secure - use external secret management
+        secretAccessKey: ""  # WARNING: Not secure - use external secret management
+
+    # VFS Cache Configuration (rclone mount caches files locally in LUKS container)
+    vfsCache:
+      mode: "full"  # Options: off, minimal, writes, full
+      maxAge: "1h"  # Max time to keep file in cache
+      maxSize: "1G"  # Max total size of cache
+      writeBack: "5s"  # Time to wait before uploading modified files
+
+  # Example S3 StorageClass with minimal caching (saves local space)
+  # - name: lukscryptwalker-s3-minimal
+  #   isDefault: false
+  #   reclaimPolicy: Delete
+  #   allowVolumeExpansion: true
+  #   volumeBindingMode: WaitForFirstConsumer
+  #   fsType: "ext4"
+  #
+  #   secret:
+  #     name: luks-secret
+  #     namespace: kube-system
+  #     passphraseKey: "passphrase"
+  #
+  #   s3:
+  #     bucket: "my-backup-volumes"
+  #     region: "us-west-2"
+  #     credentialsSecret:
+  #       name: s3-backup-credentials
+  #       namespace: kube-system
+  #       create: true  # WARNING: Not secure for production
+  #       accessKeyId: ""  # WARNING: Not secure - use external secret management
+  #       secretAccessKey: ""  # WARNING: Not secure - use external secret management
+  #
+  #   vfsCache:
+  #     mode: "minimal"  # Only cache open files
+  #     maxAge: "30m"
+  #     maxSize: "500M"
+
+  # Example S3 StorageClass for OVH S3 with custom path
+  # - name: lukscryptwalker-ovh
+  #   isDefault: false
+  #   reclaimPolicy: Delete
+  #   allowVolumeExpansion: true
+  #   volumeBindingMode: WaitForFirstConsumer
+  #
+  #   secret:
+  #     name: luks-secret
+  #     namespace: kube-system
+  #     passphraseKey: "passphrase"
+  #
+  #   s3:
+  #     bucket: "encrypted-volumes"
+  #     region: "gra"  # GRA, SBG, DE, UK, etc.
+  #     endpoint: "https://s3.gra.cloud.ovh.net"
+  #     forcePathStyle: false
+  #     pathPrefix: "my-app/data"  # Custom path - also used as encryption salt
+  #     credentialsSecret:
+  #       name: ovh-s3-credentials
+  #       namespace: kube-system
+  #       create: true  # WARNING: Not secure for production
+  #       accessKeyId: ""  # WARNING: Not secure - use external secret management
+  #       secretAccessKey: ""  # WARNING: Not secure - use external secret management
+  #
+  #   vfsCache:
+  #     mode: "full"
+  #     maxAge: "2h"
+  #     maxSize: "2G"
+  #     writeBack: "10s"

@@ -11,11 +11,12 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc"
 	"k8s.io/klog"
+
+	"github.com/lukscryptwalker-csi/pkg/version"
 )
 
 const (
-	DriverName    = "lukscryptwalker.csi.k8s.io"
-	DriverVersion = "1.0.13"
+	DriverName = "lukscryptwalker.csi.k8s.io"
 )
 
 type Driver struct {
@@ -31,15 +32,16 @@ type Driver struct {
 }
 
 func GetVersion() string {
-	return DriverVersion
+	return version.GetVersion()
 }
 
 func NewDriver(endpoint, nodeID string) *Driver {
-	klog.Infof("Driver: %v version: %v", DriverName, DriverVersion)
+	ver := version.GetVersion()
+	klog.Infof("Driver: %v version: %v", DriverName, ver)
 
 	d := &Driver{
 		name:     DriverName,
-		version:  DriverVersion,
+		version:  ver,
 		nodeID:   nodeID,
 		endpoint: endpoint,
 	}

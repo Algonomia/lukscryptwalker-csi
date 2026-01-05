@@ -1,0 +1,84 @@
+# Example: PostgreSQL deployment with encrypted storage
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-luks-secret
+  namespace: default
+type: Opaque
+data:
+  passphrase: c3VwZXItc2VjdXJlLXBhc3NwaHJhc2UtZm9yLXBvc3RncmVz  # super-secure-passphrase-for-postgres
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: postgres-encrypted
+provisioner: lukscryptwalker.csi.k8s.io
+parameters:
+  local-path: "/opt/postgres-data"
+  csi.storage.k8s.io/node-stage-secret-name: "postgres-luks-secret"
+  csi.storage.k8s.io/node-stage-secret-namespace: "default"
+  passphraseKey: "passphrase"
+  fsType: "ext4"
+  fsGroup: "999"  # PostgreSQL group
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: postgres-encrypted
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      securityContext:
+        fsGroup: 999  # PostgreSQL group
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        env:
+        - name: POSTGRES_DB
+          value: "testdb"
+        - name: POSTGRES_USER
+          value: "testuser"
+        - name: POSTGRES_PASSWORD
+          value: "testpassword"
+        - name: PGDATA
+          value: "/var/lib/postgresql/data/pgdata"
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: postgres-storage
+          mountPath: /var/lib/postgresql/data
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+      volumes:
+      - name: postgres-storage
+        persistentVolumeClaim:
+          claimName: postgres-data
