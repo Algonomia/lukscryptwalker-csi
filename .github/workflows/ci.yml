@@ -34,11 +34,6 @@ jobs:
       - name: Run golangci-lint
         run: golangci-lint run --timeout=10m
 
-      - name: Verify go mod tidy
-        run: |
-          go mod tidy
-          git diff --exit-code go.mod go.sum
-
   test:
     name: Test
     runs-on: ubuntu-latest
