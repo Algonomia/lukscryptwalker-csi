@@ -27,6 +27,7 @@ const (
 
 // NodeServer implements the CSI Node service
 type NodeServer struct {
+	csi.UnimplementedNodeServer
 	driver         *Driver
 	luksManager    *luks.LUKSManager
 	clientset      kubernetes.Interface

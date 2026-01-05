@@ -10,6 +10,7 @@ import (
 )
 
 type IdentityServer struct {
+	csi.UnimplementedIdentityServer
 	driver *Driver
 }
 

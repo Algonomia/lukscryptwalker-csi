@@ -13,6 +13,7 @@ import (
 )
 
 type ControllerServer struct {
+	csi.UnimplementedControllerServer
 	driver *Driver
 }
 
