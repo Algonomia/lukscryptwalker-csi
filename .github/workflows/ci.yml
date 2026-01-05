@@ -207,8 +207,8 @@ jobs:
 
       - name: Verify deployment
         run: |
-          kubectl wait --for=condition=ready pod -l app=lukscryptwalker-csi-controller -n kube-system --timeout=120s
-          kubectl wait --for=condition=ready pod -l app=lukscryptwalker-csi-node -n kube-system --timeout=120s
+          kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=lukscryptwalker-csi,app.kubernetes.io/component=controller -n kube-system --timeout=120s
+          kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=lukscryptwalker-csi,app.kubernetes.io/component=node -n kube-system --timeout=120s
 
       - name: Check CSI driver
         run: |
@@ -247,7 +247,7 @@ jobs:
       - name: Debug logs on failure
         if: failure()
         run: |
-          kubectl logs -n kube-system -l app=lukscryptwalker-csi-controller --tail=100
-          kubectl logs -n kube-system -l app=lukscryptwalker-csi-node --tail=100
+          kubectl logs -n kube-system -l app.kubernetes.io/name=lukscryptwalker-csi,app.kubernetes.io/component=controller --tail=100
+          kubectl logs -n kube-system -l app.kubernetes.io/name=lukscryptwalker-csi,app.kubernetes.io/component=node --tail=100
           kubectl describe pods -n kube-system -l app.kubernetes.io/name=lukscryptwalker-csi
           kubectl get events -n kube-system --sort-by='.lastTimestamp'
