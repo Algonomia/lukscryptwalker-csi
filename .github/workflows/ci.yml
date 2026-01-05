@@ -10,7 +10,7 @@ on:
 env:
   GO_VERSION: '1.24'
   ALPINE_VERSION: '3.18'
-  GOLANGCI_LINT_VERSION: 'v1.55'
+  GOLANGCI_LINT_VERSION: 'v1.62.2'
 
 jobs:
   lint:
