@@ -215,8 +215,10 @@ jobs:
 
       - name: Update values.yaml
         run: |
-          sed -i "s/tag:.*/tag: \"v${{ steps.get_version.outputs.version }}\"/" charts/lukscryptwalker-csi/values.yaml
-          sed -i "s|repository:.*|repository: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}|" charts/lukscryptwalker-csi/values.yaml
+          # Only update the main image tag (line 3), not sidecar images
+          sed -i '3s/tag:.*/tag: "v${{ steps.get_version.outputs.version }}"/' charts/lukscryptwalker-csi/values.yaml
+          # Only update the main image repository (line 2)
+          sed -i '2s|repository:.*|repository: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}|' charts/lukscryptwalker-csi/values.yaml
 
       - name: Commit and push changes
         run: |
