@@ -343,23 +343,23 @@ func (mm *MountManager) setupEncryptedCache() (string, error) {
 			return "", fmt.Errorf("failed to create cache backing file: %w", err)
 		}
 		if err := f.Truncate(cacheSize); err != nil {
-			f.Close()
-			os.Remove(backingFile)
+			_ = f.Close()
+			_ = os.Remove(backingFile)
 			return "", fmt.Errorf("failed to set cache backing file size: %w", err)
 		}
-		f.Close()
+		_ = f.Close()
 
 		// Setup loop device and format with LUKS
 		loopDevice, err := mm.setupLoopDevice(backingFile)
 		if err != nil {
-			os.Remove(backingFile)
+			_ = os.Remove(backingFile)
 			return "", fmt.Errorf("failed to setup loop device: %w", err)
 		}
 
 		// Format with LUKS
 		if err := mm.luksManager.FormatAndOpenLUKS(loopDevice, mapperName, mm.luksPassphrase); err != nil {
 			_ = mm.detachLoopDevice(loopDevice) // Best effort cleanup
-			os.Remove(backingFile)
+			_ = os.Remove(backingFile)
 			return "", fmt.Errorf("failed to format LUKS cache: %w", err)
 		}
 
@@ -368,7 +368,7 @@ func (mm *MountManager) setupEncryptedCache() (string, error) {
 		if err := mm.formatExt4(mappedDevice); err != nil {
 			_ = mm.luksManager.CloseLUKS(mapperName) // Best effort cleanup
 			_ = mm.detachLoopDevice(loopDevice)
-			os.Remove(backingFile)
+			_ = os.Remove(backingFile)
 			return "", fmt.Errorf("failed to format cache filesystem: %w", err)
 		}
 	} else {
