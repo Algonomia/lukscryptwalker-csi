@@ -124,14 +124,14 @@ func (mm *MountManager) Mount() error {
 
 	// Ensure mount point exists
 	if err := os.MkdirAll(mm.mountPoint, 0755); err != nil {
-		mm.teardownEncryptedCache()
+		_ = mm.teardownEncryptedCache() // Best effort cleanup
 		return fmt.Errorf("failed to create mount point: %w", err)
 	}
 
 	// Build the crypt remote string for librclone
 	cryptRemote, err := BuildCryptRemoteString(mm.s3Config, mm.cryptConfig, mm.s3BasePath)
 	if err != nil {
-		mm.teardownEncryptedCache()
+		_ = mm.teardownEncryptedCache() // Best effort cleanup
 		return fmt.Errorf("failed to build crypt remote: %w", err)
 	}
 
@@ -161,7 +161,7 @@ func (mm *MountManager) Mount() error {
 
 	_, err = RPC("mount/mount", params)
 	if err != nil {
-		mm.teardownEncryptedCache()
+		_ = mm.teardownEncryptedCache() // Best effort cleanup
 		return fmt.Errorf("failed to mount: %w", err)
 	}
 
@@ -358,7 +358,7 @@ func (mm *MountManager) setupEncryptedCache() (string, error) {
 
 		// Format with LUKS
 		if err := mm.luksManager.FormatAndOpenLUKS(loopDevice, mapperName, mm.luksPassphrase); err != nil {
-			mm.detachLoopDevice(loopDevice)
+			_ = mm.detachLoopDevice(loopDevice) // Best effort cleanup
 			os.Remove(backingFile)
 			return "", fmt.Errorf("failed to format LUKS cache: %w", err)
 		}
@@ -366,8 +366,8 @@ func (mm *MountManager) setupEncryptedCache() (string, error) {
 		// Format the mapped device with ext4
 		mappedDevice := mm.luksManager.GetMappedDevicePath(mapperName)
 		if err := mm.formatExt4(mappedDevice); err != nil {
-			mm.luksManager.CloseLUKS(mapperName)
-			mm.detachLoopDevice(loopDevice)
+			_ = mm.luksManager.CloseLUKS(mapperName) // Best effort cleanup
+			_ = mm.detachLoopDevice(loopDevice)
 			os.Remove(backingFile)
 			return "", fmt.Errorf("failed to format cache filesystem: %w", err)
 		}
@@ -379,7 +379,7 @@ func (mm *MountManager) setupEncryptedCache() (string, error) {
 		}
 
 		if err := mm.luksManager.OpenLUKS(loopDevice, mapperName, mm.luksPassphrase); err != nil {
-			mm.detachLoopDevice(loopDevice)
+			_ = mm.detachLoopDevice(loopDevice) // Best effort cleanup
 			return "", fmt.Errorf("failed to open LUKS cache: %w", err)
 		}
 	}
@@ -387,7 +387,7 @@ func (mm *MountManager) setupEncryptedCache() (string, error) {
 	// Mount the encrypted cache
 	mappedDevice := mm.luksManager.GetMappedDevicePath(mapperName)
 	if err := mm.mountFilesystem(mappedDevice, mountPath); err != nil {
-		mm.luksManager.CloseLUKS(mapperName)
+		_ = mm.luksManager.CloseLUKS(mapperName) // Best effort cleanup
 		return "", fmt.Errorf("failed to mount cache filesystem: %w", err)
 	}
 

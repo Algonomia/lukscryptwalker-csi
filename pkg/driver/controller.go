@@ -84,7 +84,7 @@ func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 	reqSecrets := req.GetSecrets()
 	klog.V(4).Infof("DeleteVolume secrets: %v", reqSecrets)
 
-	if reqSecrets == nil || len(reqSecrets) == 0 {
+	if len(reqSecrets) == 0 {
 		klog.Infof("No secrets provided to DeleteVolume - S3 data will not be deleted. Configure provisioner-secret-name/namespace in StorageClass for ReclaimPolicy:Delete to work with S3.")
 	} else {
 		// Use the secrets helper to extract S3 configuration

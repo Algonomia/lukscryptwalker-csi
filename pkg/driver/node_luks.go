@@ -146,7 +146,7 @@ func (ns *NodeServer) restoreLUKSDeviceAndMount(volumeID, backingFile, stagingTa
 	// Mount device
 	mappedDevice := ns.luksManager.GetMappedDevicePath(mapperName)
 	if err := ns.mountDevice(mappedDevice, stagingTargetPath, volumeCapability); err != nil {
-		ns.luksManager.CloseLUKS(mapperName) // Cleanup on failure
+		_ = ns.luksManager.CloseLUKS(mapperName) // Best effort cleanup on failure
 		return fmt.Errorf("failed to mount device: %v", err)
 	}
 
