@@ -33,7 +33,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build \
     -o lukscryptwalker-csi ./cmd/main.go
 
 # Runtime stage
-FROM alpine:3.18
+FROM alpine:3.23
 
 # Install required packages for LUKS operations and rclone mount (via librclone)
 RUN apk add --no-cache \
