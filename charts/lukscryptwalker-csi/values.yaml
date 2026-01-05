@@ -1,6 +1,6 @@
 image:
-  repository: briceguillaume/lukscryptwalker-csi
-  tag: "v1.0.27"
+  repository: ghcr.io/${GITHUB_REPOSITORY,,}
+  tag: "v1.0.0"
   pullPolicy: IfNotPresent
 
 # Image pull secrets
