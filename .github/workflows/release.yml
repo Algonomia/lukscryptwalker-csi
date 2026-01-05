@@ -178,7 +178,7 @@ jobs:
           git log $RANGE --pretty=format:"%an" | sort -u | sed 's/^/- @/' >> changelog.md || true
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           body_path: changelog.md
           files: |
