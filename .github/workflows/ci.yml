@@ -52,7 +52,7 @@ jobs:
           apk add --no-cache git gcc musl-dev cryptsetup
 
       - name: Download dependencies
-        run: go mod download
+        run: go mod tidy
 
       - name: Run tests
         run: |
