@@ -120,9 +120,9 @@ jobs:
           BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
 
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-            -ldflags="-X github.com/algonomia/lukscryptwalker-csi/pkg/version.Version=${VERSION} \
-            -X github.com/algonomia/lukscryptwalker-csi/pkg/version.GitCommit=${GIT_COMMIT} \
-            -X github.com/algonomia/lukscryptwalker-csi/pkg/version.BuildDate=${BUILD_DATE} \
+            -ldflags="-X github.com/lukscryptwalker-csi/pkg/version.Version=${VERSION} \
+            -X github.com/lukscryptwalker-csi/pkg/version.GitCommit=${GIT_COMMIT} \
+            -X github.com/lukscryptwalker-csi/pkg/version.BuildDate=${BUILD_DATE} \
             -w -s" \
             -a -installsuffix cgo -o bin/lukscryptwalker-csi ./cmd/main.go
 

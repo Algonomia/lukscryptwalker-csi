@@ -8,9 +8,9 @@ GIT_COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE ?= $(shell date -u +'%Y-%m-%dT%H:%M:%SZ')
 
 # Build flags
-LDFLAGS := -ldflags "-X github.com/algonomia/lukscryptwalker-csi/pkg/version.Version=$(VERSION) \
-	-X github.com/algonomia/lukscryptwalker-csi/pkg/version.GitCommit=$(GIT_COMMIT) \
-	-X github.com/algonomia/lukscryptwalker-csi/pkg/version.BuildDate=$(BUILD_DATE) \
+LDFLAGS := -ldflags "-X github.com/lukscryptwalker-csi/pkg/version.Version=$(VERSION) \
+	-X github.com/lukscryptwalker-csi/pkg/version.GitCommit=$(GIT_COMMIT) \
+	-X github.com/lukscryptwalker-csi/pkg/version.BuildDate=$(BUILD_DATE) \
 	-w -s"
 
 # Build the binary

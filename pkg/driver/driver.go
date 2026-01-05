@@ -12,7 +12,7 @@ import (
 	"google.golang.org/grpc"
 	"k8s.io/klog"
 
-	"github.com/algonomia/lukscryptwalker-csi/pkg/version"
+	"github.com/lukscryptwalker-csi/pkg/version"
 )
 
 const (

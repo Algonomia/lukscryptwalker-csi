@@ -26,9 +26,9 @@ COPY pkg/ pkg/
 # Build the binary with proper cross-compilation and version injection
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build \
     -ldflags="-w -s -extldflags '-static' \
-    -X github.com/algonomia/lukscryptwalker-csi/pkg/version.Version=${VERSION} \
-    -X github.com/algonomia/lukscryptwalker-csi/pkg/version.GitCommit=${GIT_COMMIT} \
-    -X github.com/algonomia/lukscryptwalker-csi/pkg/version.BuildDate=${BUILD_DATE}" \
+    -X github.com/lukscryptwalker-csi/pkg/version.Version=${VERSION} \
+    -X github.com/lukscryptwalker-csi/pkg/version.GitCommit=${GIT_COMMIT} \
+    -X github.com/lukscryptwalker-csi/pkg/version.BuildDate=${BUILD_DATE}" \
     -a -installsuffix cgo \
     -o lukscryptwalker-csi ./cmd/main.go
 
