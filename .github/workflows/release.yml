@@ -132,6 +132,16 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Get version
+        id: version
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            VERSION="${{ inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
@@ -192,6 +202,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.version.outputs.version }}
           body_path: changelog.md
           files: |
             lukscryptwalker-csi-*
@@ -199,7 +210,7 @@ jobs:
             sbom.spdx.json
           generate_release_notes: true
           draft: false
-          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
+          prerelease: ${{ contains(steps.version.outputs.version, '-rc') || contains(steps.version.outputs.version, '-beta') || contains(steps.version.outputs.version, '-alpha') }}
 
   update-helm-chart:
     name: Update Helm Chart Version
@@ -216,14 +227,18 @@ jobs:
       - name: Get version from tag
         id: get_version
         run: |
-          VERSION=${GITHUB_REF#refs/tags/}
-          VERSION=${VERSION#v}
+          if [ -n "${{ inputs.tag }}" ]; then
+            VERSION="${{ inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          VERSION="${VERSION#v}"
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
       - name: Update Chart.yaml
         run: |
-          sed -i "s/^version:.*/version: ${{ steps.get_version.outputs.version }}/" charts/lukscryptwalker-csi/Chart.yaml
-          sed -i "s/^appVersion:.*/appVersion: \"${{ steps.get_version.outputs.version }}\"/" charts/lukscryptwalker-csi/Chart.yaml
+          sed -i "s|^version:.*|version: ${{ steps.get_version.outputs.version }}|" charts/lukscryptwalker-csi/Chart.yaml
+          sed -i "s|^appVersion:.*|appVersion: \"${{ steps.get_version.outputs.version }}\"|" charts/lukscryptwalker-csi/Chart.yaml
 
       - name: Update values.yaml
         run: |
