@@ -3,7 +3,7 @@ module github.com/lukscryptwalker-csi
 go 1.25.0
 
 require (
-	github.com/container-storage-interface/spec v1.8.0
+	github.com/container-storage-interface/spec v1.12.0
 	github.com/rclone/rclone v1.72.1
 	github.com/stretchr/testify v1.11.1
 	google.golang.org/grpc v1.76.0
@@ -66,7 +66,6 @@ require (
 	github.com/go-playground/universal-translator v0.18.1 // indirect
 	github.com/go-playground/validator/v10 v10.28.0 // indirect
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
-	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/gnostic-models v0.7.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gopherjs/gopherjs v1.17.2 // indirect
