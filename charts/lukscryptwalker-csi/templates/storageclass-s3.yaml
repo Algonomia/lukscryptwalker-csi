@@ -15,24 +15,9 @@ parameters:
   # Storage backend type
   storage-backend: "s3"
 
-  # S3 Configuration
-  s3-bucket: {{ .s3.bucket | quote }}
-  s3-region: {{ .s3.region | quote }}
-  {{- if .s3.endpoint }}
-  s3-endpoint: {{ .s3.endpoint | quote }}
-  {{- end }}
-  {{- if .s3.forcePathStyle }}
-  s3-force-path-style: {{ .s3.forcePathStyle | quote }}
-  {{- end }}
-  {{- if .s3.pathPrefix }}
-  s3-path-prefix: {{ .s3.pathPrefix | quote }}
-  {{- end }}
-
-  # S3 Credentials (from secret)
-  s3-access-key-id-secret-name: {{ .s3.credentialsSecret.name | quote }}
-  s3-access-key-id-secret-namespace: {{ .s3.credentialsSecret.namespace | quote }}
-  s3-secret-access-key-secret-name: {{ .s3.credentialsSecret.name | quote }}
-  s3-secret-access-key-secret-namespace: {{ .s3.credentialsSecret.namespace | quote }}
+  # S3 Configuration (from secret)
+  s3-secret-name: {{ .s3.secret.name | quote }}
+  s3-secret-namespace: {{ .s3.secret.namespace | quote }}
 
   # LUKS encryption parameters
   csi.storage.k8s.io/node-stage-secret-name: {{ .secret.name | quote }}
@@ -40,8 +25,8 @@ parameters:
   passphraseKey: {{ .secret.passphraseKey | quote }}
 
   # Provisioner secrets for DeleteVolume (ReclaimPolicy: Delete)
-  csi.storage.k8s.io/provisioner-secret-name: {{ .s3.credentialsSecret.name | quote }}
-  csi.storage.k8s.io/provisioner-secret-namespace: {{ .s3.credentialsSecret.namespace | quote }}
+  csi.storage.k8s.io/provisioner-secret-name: {{ .s3.secret.name | quote }}
+  csi.storage.k8s.io/provisioner-secret-namespace: {{ .s3.secret.namespace | quote }}
 
   # VFS Cache Configuration (rclone mount mode)
   {{- if .vfsCache }}
@@ -74,32 +59,35 @@ volumeBindingMode: {{ .volumeBindingMode | default "WaitForFirstConsumer" }}
 
 {{- if .Values.s3StorageClasses }}
 {{- range .Values.s3StorageClasses }}
-{{- if .s3.credentialsSecret.create }}
+{{- if .s3.secret.create }}
 ---
 apiVersion: v1
 kind: Secret
 metadata:
-  name: {{ .s3.credentialsSecret.name }}
-  namespace: {{ .s3.credentialsSecret.namespace }}
+  name: {{ .s3.secret.name }}
+  namespace: {{ .s3.secret.namespace }}
   labels:
     {{- include "lukscryptwalker-csi.labels" $ | nindent 4 }}
 type: Opaque
 data:
-  # S3 configuration (needed for DeleteVolume)
-  s3-bucket: {{ .s3.bucket | b64enc | quote }}
-  s3-region: {{ .s3.region | b64enc | quote }}
-  {{- if .s3.endpoint }}
-  s3-endpoint: {{ .s3.endpoint | b64enc | quote }}
+  # S3 configuration
+  s3-bucket: {{ .s3.secret.bucket | b64enc | quote }}
+  s3-region: {{ .s3.secret.region | b64enc | quote }}
+  {{- if .s3.secret.endpoint }}
+  s3-endpoint: {{ .s3.secret.endpoint | b64enc | quote }}
   {{- end }}
-  {{- if .s3.pathPrefix }}
-  s3-path-prefix: {{ .s3.pathPrefix | b64enc | quote }}
+  {{- if .s3.secret.forcePathStyle }}
+  s3-force-path-style: {{ .s3.secret.forcePathStyle | toString | b64enc | quote }}
+  {{- end }}
+  {{- if .s3.secret.pathPrefix }}
+  s3-path-prefix: {{ .s3.secret.pathPrefix | b64enc | quote }}
   {{- end }}
   # S3 credentials
-  {{- if .s3.credentialsSecret.accessKeyId }}
-  s3-access-key-id: {{ .s3.credentialsSecret.accessKeyId | b64enc | quote }}
+  {{- if .s3.secret.accessKeyId }}
+  s3-access-key-id: {{ .s3.secret.accessKeyId | b64enc | quote }}
   {{- end }}
-  {{- if .s3.credentialsSecret.secretAccessKey }}
-  s3-secret-access-key: {{ .s3.credentialsSecret.secretAccessKey | b64enc | quote }}
+  {{- if .s3.secret.secretAccessKey }}
+  s3-secret-access-key: {{ .s3.secret.secretAccessKey | b64enc | quote }}
   {{- end }}
 {{- end }}
 {{- end }}

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"sync"
 
 	"github.com/lukscryptwalker-csi/pkg/rclone"
@@ -15,12 +14,7 @@ import (
 
 // S3 Storage Constants
 const (
-	StorageBackendParam   = "storage-backend"
-	S3BucketParam         = "s3-bucket"
-	S3RegionParam         = "s3-region"
-	S3EndpointParam       = "s3-endpoint"
-	S3ForcePathStyleParam = "s3-force-path-style"
-	S3PathPrefixParam     = "s3-path-prefix" // Custom path prefix in S3 (default: volumes/{volumeID}/files)
+	StorageBackendParam = "storage-backend"
 	// VFS Cache Parameters (for rclone mount mode)
 	VFSCacheModeParam    = "rclone-vfs-cache-mode"     // off, minimal, writes, full
 	VFSCacheMaxAgeParam  = "rclone-vfs-cache-max-age"  // e.g., "1h", "24h"
@@ -96,10 +90,10 @@ func (ns *NodeServer) setupS3Sync(volumeID, stagingPath string, volumeContext ma
 		return fmt.Errorf("failed to fetch secrets: %v", err)
 	}
 
-	// Build S3 config with credentials from secrets
-	s3Config, err := ns.getS3ConfigFromContextWithSecrets(volumeContext, volSecrets)
-	if err != nil {
-		return fmt.Errorf("failed to get S3 configuration: %v", err)
+	// Build S3 config from secrets (all S3 config is in the secret)
+	s3Config := ns.getS3ConfigFromSecrets(volSecrets)
+	if s3Config.Bucket == "" {
+		return fmt.Errorf("S3 bucket not found in secrets")
 	}
 
 	// Use passphrase from fetched secrets
@@ -111,8 +105,8 @@ func (ns *NodeServer) setupS3Sync(volumeID, stagingPath string, volumeContext ma
 	// Extract VFS cache configuration from StorageClass/volume context
 	vfsConfig := ns.getVFSCacheConfig(volumeContext)
 
-	// Extract custom S3 path prefix if provided
-	s3PathPrefix := volumeContext[S3PathPrefixParam]
+	// S3 path prefix is now stored in the secret
+	s3PathPrefix := volSecrets.S3PathPrefix
 
 	// Create rclone mount manager
 	mountMgr, err := rclone.NewMountManager(s3Config, volumeID, stagingPath, passphrase, vfsConfig, s3PathPrefix)
@@ -164,42 +158,22 @@ func (ns *NodeServer) getVFSCacheConfig(volumeContext map[string]string) *rclone
 	return config
 }
 
-// getS3ConfigFromContextWithSecrets extracts S3 configuration using VolumeSecrets
-func (ns *NodeServer) getS3ConfigFromContextWithSecrets(volumeContext map[string]string, volSecrets *secrets.VolumeSecrets) (*rclone.S3Config, error) {
-	config := &rclone.S3Config{}
-
-	// Required parameters
-	bucket, exists := volumeContext[S3BucketParam]
-	if !exists {
-		return nil, fmt.Errorf("s3-bucket parameter is required")
-	}
-	config.Bucket = bucket
-
-	region, exists := volumeContext[S3RegionParam]
-	if !exists {
-		return nil, fmt.Errorf("s3-region parameter is required")
-	}
-	config.Region = region
-
-	// Optional parameters
-	if endpoint, exists := volumeContext[S3EndpointParam]; exists {
-		config.Endpoint = endpoint
+// getS3ConfigFromSecrets extracts S3 configuration from VolumeSecrets
+// All S3 config (bucket, region, endpoint, credentials, etc.) is stored in a single secret
+func (ns *NodeServer) getS3ConfigFromSecrets(volSecrets *secrets.VolumeSecrets) *rclone.S3Config {
+	config := &rclone.S3Config{
+		Bucket:          volSecrets.S3Bucket,
+		Region:          volSecrets.S3Region,
+		Endpoint:        volSecrets.S3Endpoint,
+		ForcePathStyle:  volSecrets.S3ForcePathStyle,
+		AccessKeyID:     volSecrets.S3AccessKeyID,
+		SecretAccessKey: volSecrets.S3SecretAccessKey,
 	}
 
-	if forcePathStyle, exists := volumeContext[S3ForcePathStyleParam]; exists {
-		if parsed, err := strconv.ParseBool(forcePathStyle); err == nil {
-			config.ForcePathStyle = parsed
-		}
-	}
+	klog.V(4).Infof("S3 config from secrets: bucket=%s, region=%s, endpoint=%s, forcePathStyle=%v, hasCredentials=%v",
+		config.Bucket, config.Region, config.Endpoint, config.ForcePathStyle, config.AccessKeyID != "")
 
-	// Get credentials from VolumeSecrets
-	config.AccessKeyID = volSecrets.S3AccessKeyID
-	config.SecretAccessKey = volSecrets.S3SecretAccessKey
-
-	klog.V(4).Infof("S3 config built: bucket=%s, region=%s, endpoint=%s, hasCredentials=%v",
-		config.Bucket, config.Region, config.Endpoint, config.AccessKeyID != "")
-
-	return config, nil
+	return config
 }
 
 // cleanupS3Sync unmounts S3 volume for cleanup

@@ -1,6 +1,6 @@
 image:
-  repository: ghcr.io/${GITHUB_REPOSITORY,,}
-  tag: "v1.0.0"
+  repository: ghcr.io/algonomia/lukscryptwalker-csi
+  tag: "v1.2.0"
   pullPolicy: IfNotPresent
 
 # Image pull secrets
@@ -201,23 +201,22 @@ s3StorageClasses:
       namespace: kube-system
       passphraseKey: "passphrase"
 
-    # S3 Configuration
+    # S3 Configuration - all parameters stored in a single secret
+    # WARNING: Setting credentials in values.yaml is not secure for production!
+    # For production, create secrets manually and set create: false
     s3:
-      bucket: "my-encrypted-volumes"
-      region: "us-east-1"
-      # endpoint: "https://s3.amazonaws.com"  # Optional: for S3-compatible services
-      # forcePathStyle: false  # Set to true for MinIO and similar services
-      # pathPrefix: "my-app/data"  # Optional: custom path in S3 (default: volumes/{volumeID}/files)
-                                   # When set, this is also used as salt for encryption password2
-                                   # allowing external access with just passphrase + pathPrefix
-
-      # S3 Credentials Secret
-      # WARNING: Setting credentials in values.yaml is not secure for production!
-      # For production, create secrets manually and set create: false
-      credentialsSecret:
+      secret:
         name: s3-credentials
         namespace: kube-system
         create: true  # Set to false for production and create secret manually
+        # S3 bucket configuration
+        bucket: "my-encrypted-volumes"
+        region: "us-east-1"
+        # endpoint: "https://s3.amazonaws.com"  # Optional: for S3-compatible services
+        # forcePathStyle: false  # Set to true for MinIO and similar services
+        # pathPrefix: "my-app/data"  # Optional: custom path in S3 (default: volumes/{volumeID}/files)
+                                     # When set, this is also used as salt for encryption password2
+        # S3 credentials
         accessKeyId: ""  # WARNING: Not secure - use external secret management
         secretAccessKey: ""  # WARNING: Not secure - use external secret management
 
@@ -242,14 +241,14 @@ s3StorageClasses:
   #     passphraseKey: "passphrase"
   #
   #   s3:
-  #     bucket: "my-backup-volumes"
-  #     region: "us-west-2"
-  #     credentialsSecret:
+  #     secret:
   #       name: s3-backup-credentials
   #       namespace: kube-system
   #       create: true  # WARNING: Not secure for production
-  #       accessKeyId: ""  # WARNING: Not secure - use external secret management
-  #       secretAccessKey: ""  # WARNING: Not secure - use external secret management
+  #       bucket: "my-backup-volumes"
+  #       region: "us-west-2"
+  #       accessKeyId: ""
+  #       secretAccessKey: ""
   #
   #   vfsCache:
   #     mode: "minimal"  # Only cache open files
@@ -269,17 +268,17 @@ s3StorageClasses:
   #     passphraseKey: "passphrase"
   #
   #   s3:
-  #     bucket: "encrypted-volumes"
-  #     region: "gra"  # GRA, SBG, DE, UK, etc.
-  #     endpoint: "https://s3.gra.cloud.ovh.net"
-  #     forcePathStyle: false
-  #     pathPrefix: "my-app/data"  # Custom path - also used as encryption salt
-  #     credentialsSecret:
+  #     secret:
   #       name: ovh-s3-credentials
   #       namespace: kube-system
   #       create: true  # WARNING: Not secure for production
-  #       accessKeyId: ""  # WARNING: Not secure - use external secret management
-  #       secretAccessKey: ""  # WARNING: Not secure - use external secret management
+  #       bucket: "encrypted-volumes"
+  #       region: "gra"  # GRA, SBG, DE, UK, etc.
+  #       endpoint: "https://s3.gra.cloud.ovh.net"
+  #       forcePathStyle: false
+  #       pathPrefix: "my-app/data"  # Custom path - also used as encryption salt
+  #       accessKeyId: ""
+  #       secretAccessKey: ""
   #
   #   vfsCache:
   #     mode: "full"

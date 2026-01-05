@@ -37,14 +37,19 @@ func (sm *SecretsManager) FetchVolumeSecrets(ctx context.Context, params SecretP
 		secrets.LUKSSecretNamespace = params.LUKSSecret.Namespace
 	}
 
-	// Fetch S3 credentials if specified
+	// Fetch S3 configuration if specified (all config is in a single secret)
 	if params.S3Secret.Name != "" && params.S3Secret.Namespace != "" {
-		accessKeyID, secretAccessKey, err := sm.fetchS3Credentials(ctx, params.S3Secret)
+		s3Config, err := sm.fetchS3Config(ctx, params.S3Secret)
 		if err != nil {
-			return nil, fmt.Errorf("failed to fetch S3 credentials: %w", err)
+			return nil, fmt.Errorf("failed to fetch S3 configuration: %w", err)
 		}
-		secrets.S3AccessKeyID = accessKeyID
-		secrets.S3SecretAccessKey = secretAccessKey
+		secrets.S3Bucket = s3Config.Bucket
+		secrets.S3Region = s3Config.Region
+		secrets.S3Endpoint = s3Config.Endpoint
+		secrets.S3ForcePathStyle = s3Config.ForcePathStyle
+		secrets.S3PathPrefix = s3Config.PathPrefix
+		secrets.S3AccessKeyID = s3Config.AccessKeyID
+		secrets.S3SecretAccessKey = s3Config.SecretAccessKey
 		secrets.S3SecretName = params.S3Secret.Name
 		secrets.S3SecretNamespace = params.S3Secret.Namespace
 	}
@@ -73,24 +78,68 @@ func (sm *SecretsManager) fetchPassphrase(ctx context.Context, ref SecretReferen
 	return string(passphrase), nil
 }
 
-// fetchS3Credentials fetches S3 credentials from a Kubernetes secret
-func (sm *SecretsManager) fetchS3Credentials(ctx context.Context, ref SecretReference) (string, string, error) {
-	klog.V(4).Infof("Fetching S3 credentials from secret %s/%s", ref.Namespace, ref.Name)
+// S3Config holds all S3 configuration fetched from a secret
+type S3Config struct {
+	Bucket          string
+	Region          string
+	Endpoint        string
+	ForcePathStyle  bool
+	PathPrefix      string
+	AccessKeyID     string
+	SecretAccessKey string
+}
+
+// fetchS3Config fetches all S3 configuration from a Kubernetes secret
+func (sm *SecretsManager) fetchS3Config(ctx context.Context, ref SecretReference) (*S3Config, error) {
+	klog.V(4).Infof("Fetching S3 configuration from secret %s/%s", ref.Namespace, ref.Name)
 
 	secret, err := sm.clientset.CoreV1().Secrets(ref.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get secret %s/%s: %w", ref.Namespace, ref.Name, err)
+		return nil, fmt.Errorf("failed to get secret %s/%s: %w", ref.Namespace, ref.Name, err)
 	}
+
+	config := &S3Config{}
+
+	// Required fields
+	bucket, ok := secret.Data[S3BucketKey]
+	if !ok {
+		return nil, fmt.Errorf("key '%s' not found in secret %s/%s", S3BucketKey, ref.Namespace, ref.Name)
+	}
+	config.Bucket = string(bucket)
+
+	region, ok := secret.Data[S3RegionKey]
+	if !ok {
+		return nil, fmt.Errorf("key '%s' not found in secret %s/%s", S3RegionKey, ref.Namespace, ref.Name)
+	}
+	config.Region = string(region)
 
 	accessKeyID, ok := secret.Data[S3AccessKeyIDKey]
 	if !ok {
-		return "", "", fmt.Errorf("key '%s' not found in secret %s/%s", S3AccessKeyIDKey, ref.Namespace, ref.Name)
+		return nil, fmt.Errorf("key '%s' not found in secret %s/%s", S3AccessKeyIDKey, ref.Namespace, ref.Name)
 	}
+	config.AccessKeyID = string(accessKeyID)
 
 	secretAccessKey, ok := secret.Data[S3SecretAccessKeyKey]
 	if !ok {
-		return "", "", fmt.Errorf("key '%s' not found in secret %s/%s", S3SecretAccessKeyKey, ref.Namespace, ref.Name)
+		return nil, fmt.Errorf("key '%s' not found in secret %s/%s", S3SecretAccessKeyKey, ref.Namespace, ref.Name)
+	}
+	config.SecretAccessKey = string(secretAccessKey)
+
+	// Optional fields
+	if endpoint, ok := secret.Data[S3EndpointKey]; ok {
+		config.Endpoint = string(endpoint)
 	}
 
-	return string(accessKeyID), string(secretAccessKey), nil
+	if forcePathStyle, ok := secret.Data[S3ForcePathStyleKey]; ok {
+		config.ForcePathStyle = string(forcePathStyle) == "true"
+	}
+
+	if pathPrefix, ok := secret.Data[S3PathPrefixKey]; ok {
+		config.PathPrefix = string(pathPrefix)
+	}
+
+	klog.V(4).Infof("S3 config fetched: bucket=%s, region=%s, endpoint=%s, forcePathStyle=%v, pathPrefix=%s",
+		config.Bucket, config.Region, config.Endpoint, config.ForcePathStyle, config.PathPrefix)
+
+	return config, nil
 }

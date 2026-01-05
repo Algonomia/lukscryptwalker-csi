@@ -12,9 +12,10 @@ const (
 	PassphraseKeyParam   = "passphraseKey"
 	DefaultPassphraseKey = "passphrase"
 
-	// S3 Credentials Secret Reference (in StorageClass parameters)
-	S3CredentialsSecretName      = "s3-access-key-id-secret-name"
-	S3CredentialsSecretNamespace = "s3-access-key-id-secret-namespace"
+	// S3 Secret Reference (in StorageClass parameters)
+	// All S3 configuration is stored in a single secret
+	S3SecretName      = "s3-secret-name"
+	S3SecretNamespace = "s3-secret-namespace"
 
 	// S3 Secret Keys (within the secret data)
 	S3AccessKeyIDKey     = "s3-access-key-id"
@@ -22,6 +23,7 @@ const (
 	S3BucketKey          = "s3-bucket"
 	S3RegionKey          = "s3-region"
 	S3EndpointKey        = "s3-endpoint"
+	S3ForcePathStyleKey  = "s3-force-path-style"
 	S3PathPrefixKey      = "s3-path-prefix"
 )
 
@@ -31,7 +33,13 @@ type VolumeSecrets struct {
 	Passphrase    string
 	PassphraseKey string // The key name used to retrieve passphrase
 
-	// S3 credentials (optional, only for S3 backend)
+	// S3 configuration (optional, only for S3 backend)
+	// All S3 config is stored in a single secret
+	S3Bucket          string
+	S3Region          string
+	S3Endpoint        string
+	S3ForcePathStyle  bool
+	S3PathPrefix      string
 	S3AccessKeyID     string
 	S3SecretAccessKey string
 

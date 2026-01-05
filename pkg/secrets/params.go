@@ -35,19 +35,19 @@ func ExtractSecretParams(scParams, volumeContext map[string]string) SecretParams
 		}
 	}
 
-	// Extract S3 secret reference
-	if name, ok := volumeContext[S3CredentialsSecretName]; ok {
+	// Extract S3 secret reference (all S3 config is in a single secret)
+	if name, ok := volumeContext[S3SecretName]; ok {
 		params.S3Secret.Name = name
 	} else if scParams != nil {
-		if name, ok := scParams[S3CredentialsSecretName]; ok {
+		if name, ok := scParams[S3SecretName]; ok {
 			params.S3Secret.Name = name
 		}
 	}
 
-	if ns, ok := volumeContext[S3CredentialsSecretNamespace]; ok {
+	if ns, ok := volumeContext[S3SecretNamespace]; ok {
 		params.S3Secret.Namespace = ns
 	} else if scParams != nil {
-		if ns, ok := scParams[S3CredentialsSecretNamespace]; ok {
+		if ns, ok := scParams[S3SecretNamespace]; ok {
 			params.S3Secret.Namespace = ns
 		}
 	}
