@@ -31,7 +31,7 @@ metadata:
   labels:
     {{- include "lukscryptwalker-csi.labels" $ | nindent 4 }}
   annotations:
-    "helm.sh/resource-policy": keep
+    helm.sh/resource-policy: keep
     {{- if .isDefault }}
     storageclass.kubernetes.io/is-default-class: "true"
     {{- end }}
