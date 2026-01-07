@@ -2,8 +2,6 @@
 
 A Kubernetes CSI driver that provides encrypted storage with two backend options: **LUKS local storage** or **S3-compatible encrypted storage**.
 
-> **⚠️ BREAKING CHANGE (v1.2.1+):** The `pathPrefix` parameter has been moved from the S3 secret to the StorageClass parameters. Update your StorageClass and secrets accordingly when upgrading.
-
 ## Features
 
 ### Core Features
