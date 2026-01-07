@@ -13,8 +13,6 @@ import (
 	"github.com/lukscryptwalker-csi/pkg/secrets"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/klog"
@@ -489,12 +487,12 @@ func (ns *NodeServer) getPassphraseFromRequest(req *csi.NodeStageVolumeRequest) 
 	volumeContext := req.GetVolumeContext()
 
 	// Get StorageClass parameters - secret references are there, not in volumeContext
-	pv, err := ns.getPVByVolumeID(ctx, volumeID)
+	pv, err := getPVByVolumeID(ctx, ns.clientset, volumeID)
 	if err != nil {
 		return "", fmt.Errorf("failed to get PV for volume %s: %v", volumeID, err)
 	}
 
-	scParams, err := ns.getStorageClassParameters(ctx, pv.Spec.StorageClassName)
+	scParams, err := getStorageClassParameters(ctx, ns.clientset, pv.Spec.StorageClassName)
 	if err != nil {
 		return "", fmt.Errorf("failed to get StorageClass parameters: %v", err)
 	}
@@ -521,12 +519,12 @@ func (ns *NodeServer) getPassphraseFromRequest(req *csi.NodeStageVolumeRequest) 
 // getPassphraseForRestore retrieves passphrase for volume restore operations using SecretsManager
 func (ns *NodeServer) getPassphraseForRestore(ctx context.Context, volumeID string, volumeContext, _ map[string]string) (string, error) {
 	// Get StorageClass parameters for secret references
-	pv, err := ns.getPVByVolumeID(ctx, volumeID)
+	pv, err := getPVByVolumeID(ctx, ns.clientset, volumeID)
 	if err != nil {
 		return "", fmt.Errorf("failed to get PV for volume %s: %v", volumeID, err)
 	}
 
-	scParams, err := ns.getStorageClassParameters(ctx, pv.Spec.StorageClassName)
+	scParams, err := getStorageClassParameters(ctx, ns.clientset, pv.Spec.StorageClassName)
 	if err != nil {
 		return "", fmt.Errorf("failed to get StorageClass parameters: %v", err)
 	}
@@ -569,40 +567,3 @@ func (ns *NodeServer) getPassphraseForExpansion(ctx context.Context, scParams ma
 // Kubernetes Integration
 // =============================================================================
 
-// getPVByVolumeID finds the PV that matches the CSI volume handle
-func (ns *NodeServer) getPVByVolumeID(ctx context.Context, volumeID string) (*corev1.PersistentVolume, error) {
-	if ns.clientset == nil {
-		return nil, fmt.Errorf("kubernetes clientset not available")
-	}
-
-	pvList, err := ns.clientset.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("failed to list PVs: %v", err)
-	}
-
-	for _, pv := range pvList.Items {
-		if pv.Spec.CSI != nil && pv.Spec.CSI.VolumeHandle == volumeID {
-			return &pv, nil
-		}
-	}
-
-	return nil, fmt.Errorf("PV with volumeHandle %s not found", volumeID)
-}
-
-// getStorageClassParameters retrieves parameters from a StorageClass by name
-func (ns *NodeServer) getStorageClassParameters(ctx context.Context, name string) (map[string]string, error) {
-	if ns.clientset == nil {
-		return nil, fmt.Errorf("kubernetes clientset not available")
-	}
-
-	if name == "" {
-		return nil, fmt.Errorf("storageClassName is empty")
-	}
-
-	sc, err := ns.clientset.StorageV1().StorageClasses().Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("failed to get StorageClass %s: %v", name, err)
-	}
-
-	return sc.Parameters, nil
-}

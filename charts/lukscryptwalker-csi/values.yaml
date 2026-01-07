@@ -205,6 +205,9 @@ s3StorageClasses:
     # WARNING: Setting credentials in values.yaml is not secure for production!
     # For production, create secrets manually and set create: false
     s3:
+      # pathPrefix: "my-app/data"  # Optional: custom path in S3 (default: volumes/{volumeID}/files)
+                                   # When set, this is also used as salt for encryption password2
+                                   # Note: This is a StorageClass parameter, not stored in the secret
       secret:
         name: s3-credentials
         namespace: kube-system
@@ -214,8 +217,6 @@ s3StorageClasses:
         region: "us-east-1"
         # endpoint: "https://s3.amazonaws.com"  # Optional: for S3-compatible services
         # forcePathStyle: false  # Set to true for MinIO and similar services
-        # pathPrefix: "my-app/data"  # Optional: custom path in S3 (default: volumes/{volumeID}/files)
-                                     # When set, this is also used as salt for encryption password2
         # S3 credentials
         accessKeyId: ""  # WARNING: Not secure - use external secret management
         secretAccessKey: ""  # WARNING: Not secure - use external secret management
@@ -241,6 +242,7 @@ s3StorageClasses:
   #     passphraseKey: "passphrase"
   #
   #   s3:
+  #     # pathPrefix: "backup/data"  # Optional: custom path in S3
   #     secret:
   #       name: s3-backup-credentials
   #       namespace: kube-system
@@ -268,6 +270,7 @@ s3StorageClasses:
   #     passphraseKey: "passphrase"
   #
   #   s3:
+  #     pathPrefix: "my-app/data"  # Custom path - also used as encryption salt
   #     secret:
   #       name: ovh-s3-credentials
   #       namespace: kube-system
@@ -276,7 +279,6 @@ s3StorageClasses:
   #       region: "gra"  # GRA, SBG, DE, UK, etc.
   #       endpoint: "https://s3.gra.cloud.ovh.net"
   #       forcePathStyle: false
-  #       pathPrefix: "my-app/data"  # Custom path - also used as encryption salt
   #       accessKeyId: ""
   #       secretAccessKey: ""
   #

@@ -74,7 +74,7 @@ func RPC(method string, params interface{}) (*RPCResult, error) {
 		return nil, fmt.Errorf("failed to marshal RPC params: %w", err)
 	}
 
-	klog.V(5).Infof("RPC call: %s with params: %s", method, string(inputJSON))
+	klog.V(5).Infof("RPC call: %s", method)
 
 	output, status := librclone.RPC(method, string(inputJSON))
 
@@ -82,7 +82,7 @@ func RPC(method string, params interface{}) (*RPCResult, error) {
 	if output != "" {
 		if err := json.Unmarshal([]byte(output), &result.Output); err != nil {
 			// Some outputs may not be JSON, store as raw string in a special key
-			klog.V(5).Infof("RPC output (non-JSON): %s", output)
+			klog.V(5).Infof("RPC output: non-JSON response received")
 			result.Output = map[string]interface{}{"_raw": output}
 		}
 	}
@@ -128,15 +128,19 @@ func RPCWithRaw(method string, params interface{}) (string, int, error) {
 
 // DeleteVolumeData deletes all data for a volume from S3
 // s3PathPrefix is optional - if empty, defaults to "volumes/{volumeID}"
+// If s3PathPrefix is provided, path becomes "{s3PathPrefix}/volumes/{volumeID}"
 func DeleteVolumeData(s3Config *S3Config, volumeID string, s3PathPrefix string) error {
 	if err := Initialize(); err != nil {
 		return fmt.Errorf("failed to initialize librclone: %w", err)
 	}
 
 	// Build S3 remote path for the volume
-	volumePath := s3PathPrefix
-	if volumePath == "" {
+	// Always include volumeID to ensure each volume has its own directory
+	var volumePath string
+	if s3PathPrefix == "" {
 		volumePath = fmt.Sprintf("volumes/%s", volumeID)
+	} else {
+		volumePath = fmt.Sprintf("%s/volumes/%s", s3PathPrefix, volumeID)
 	}
 	s3Remote, err := BuildS3RemoteString(s3Config, volumePath)
 	if err != nil {

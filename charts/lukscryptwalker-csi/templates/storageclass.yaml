@@ -18,6 +18,27 @@ data:
 {{- end }}
 
 {{- range .Values.storageClasses }}
+{{- $existingStorageClass := lookup "storage.k8s.io/v1" "StorageClass" "" .name }}
+{{- if $existingStorageClass }}
+{{- if $.Values.debug }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .name }}-exists-warning
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "lukscryptwalker-csi.labels" $ | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade,pre-install
+    "helm.sh/hook-weight": "-1"
+data:
+  warning: |
+    WARNING: StorageClass '{{ .name }}' already exists and will be preserved.
+    Existing PVCs using this StorageClass will continue to work.
+    To update StorageClass parameters, you must delete it manually first.
+{{- end }}
+{{- else }}
 ---
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -34,10 +55,10 @@ parameters:
   # LUKS encryption parameters
   csi.storage.k8s.io/node-stage-secret-name: {{ .secret.name | quote }}
   csi.storage.k8s.io/node-stage-secret-namespace: {{ .secret.namespace | quote }}
-  
+
   # Key name within the secret that contains the passphrase
   passphraseKey: {{ .secret.passphraseKey | quote }}
-  
+
   {{- if .fsGroup }}
   # Manual fsGroup override for this StorageClass
   fsGroup: {{ .fsGroup | quote }}
@@ -46,4 +67,5 @@ parameters:
 reclaimPolicy: {{ .reclaimPolicy | default "Delete" }}
 allowVolumeExpansion: {{ .allowVolumeExpansion | default true }}
 volumeBindingMode: {{ .volumeBindingMode | default "WaitForFirstConsumer" }}
+{{- end }}
 {{- end }}

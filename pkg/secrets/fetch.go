@@ -47,7 +47,6 @@ func (sm *SecretsManager) FetchVolumeSecrets(ctx context.Context, params SecretP
 		secrets.S3Region = s3Config.Region
 		secrets.S3Endpoint = s3Config.Endpoint
 		secrets.S3ForcePathStyle = s3Config.ForcePathStyle
-		secrets.S3PathPrefix = s3Config.PathPrefix
 		secrets.S3AccessKeyID = s3Config.AccessKeyID
 		secrets.S3SecretAccessKey = s3Config.SecretAccessKey
 		secrets.S3SecretName = params.S3Secret.Name
@@ -84,7 +83,6 @@ type S3Config struct {
 	Region          string
 	Endpoint        string
 	ForcePathStyle  bool
-	PathPrefix      string
 	AccessKeyID     string
 	SecretAccessKey string
 }
@@ -134,12 +132,8 @@ func (sm *SecretsManager) fetchS3Config(ctx context.Context, ref SecretReference
 		config.ForcePathStyle = string(forcePathStyle) == "true"
 	}
 
-	if pathPrefix, ok := secret.Data[S3PathPrefixKey]; ok {
-		config.PathPrefix = string(pathPrefix)
-	}
-
-	klog.V(4).Infof("S3 config fetched: bucket=%s, region=%s, endpoint=%s, forcePathStyle=%v, pathPrefix=%s",
-		config.Bucket, config.Region, config.Endpoint, config.ForcePathStyle, config.PathPrefix)
+	klog.V(4).Infof("S3 config fetched: bucket=%s, region=%s, endpoint=%s, forcePathStyle=%v",
+		config.Bucket, config.Region, config.Endpoint, config.ForcePathStyle)
 
 	return config, nil
 }
