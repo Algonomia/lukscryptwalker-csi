@@ -18,27 +18,11 @@ data:
 {{- end }}
 
 {{- range .Values.storageClasses }}
-{{- $existingStorageClass := lookup "storage.k8s.io/v1" "StorageClass" "" .name }}
-{{- if $existingStorageClass }}
-{{- if $.Values.debug }}
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: {{ .name }}-exists-warning
-  namespace: {{ $.Release.Namespace }}
-  labels:
-    {{- include "lukscryptwalker-csi.labels" $ | nindent 4 }}
-  annotations:
-    "helm.sh/hook": pre-upgrade,pre-install
-    "helm.sh/hook-weight": "-1"
-data:
-  warning: |
-    WARNING: StorageClass '{{ .name }}' already exists and will be preserved.
-    Existing PVCs using this StorageClass will continue to work.
-    To update StorageClass parameters, you must delete it manually first.
+{{- $existingStorageClass := "" }}
+{{- if $.Capabilities.APIVersions.Has "storage.k8s.io/v1/StorageClass" }}
+  {{- $existingStorageClass = lookup "storage.k8s.io/v1" "StorageClass" "" .name }}
 {{- end }}
-{{- else }}
+{{- if not $existingStorageClass }}
 ---
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -46,10 +30,11 @@ metadata:
   name: {{ .name }}
   labels:
     {{- include "lukscryptwalker-csi.labels" $ | nindent 4 }}
-  {{- if .isDefault }}
   annotations:
+    "helm.sh/resource-policy": keep
+    {{- if .isDefault }}
     storageclass.kubernetes.io/is-default-class: "true"
-  {{- end }}
+    {{- end }}
 provisioner: {{ $.Values.csiDriver.name }}
 parameters:
   # LUKS encryption parameters
