@@ -282,8 +282,7 @@ jobs:
 
       - name: Package Helm chart
         run: |
-          mkdir -p .charts-package
-          helm package charts/lukscryptwalker-csi -d .charts-package
+          helm package charts/lukscryptwalker-csi
 
       - name: Checkout gh-pages branch
         run: |
@@ -292,10 +291,7 @@ jobs:
 
       - name: Update Helm repository
         run: |
-          # Copy new chart package
-          cp .charts-package/*.tgz . || true
-
-          # Update index
+          # Update index (chart package is already in current directory)
           helm repo index . --url https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
 
           # Commit and push
