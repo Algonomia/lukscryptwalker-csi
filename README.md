@@ -2,6 +2,8 @@
 
 A Kubernetes CSI driver that provides encrypted storage with two backend options: **LUKS local storage** or **S3-compatible encrypted storage**.
 
+> **⚠️ BREAKING CHANGE (v1.2.1+):** The `pathPrefix` parameter has been moved from the S3 secret to the StorageClass parameters. Update your StorageClass and secrets accordingly when upgrading.
+
 ## Features
 
 ### Core Features
@@ -74,16 +76,16 @@ parameters:
   # Storage backend selection
   storage-backend: "s3"
 
-  # S3 configuration
-  s3-bucket: "my-encrypted-volumes"
-  s3-region: "us-east-1"
-  s3-endpoint: "https://s3.amazonaws.com"  # optional
-  s3-force-path-style: "false"  # optional, set to true for MinIO
-  s3-path-prefix: "my-app/data"  # optional custom path
+  # S3 configuration (StorageClass parameter)
+  s3-path-prefix: "my-app/data"  # optional custom path in S3 (default: volumes/{volumeID}/files)
 
-  # S3 credentials secret reference
-  s3-access-key-id-secret-name: "s3-credentials"
-  s3-access-key-id-secret-namespace: "kube-system"
+  # S3 configuration and credentials (from secret)
+  s3-secret-name: "s3-credentials"
+  s3-secret-namespace: "kube-system"
+
+  # Provisioner secrets for DeleteVolume (ReclaimPolicy: Delete)
+  csi.storage.k8s.io/provisioner-secret-name: "s3-credentials"
+  csi.storage.k8s.io/provisioner-secret-namespace: "kube-system"
 
   # Encryption secret reference (required)
   csi.storage.k8s.io/node-stage-secret-name: "luks-secret"
@@ -346,16 +348,12 @@ parameters:
   # Storage backend type
   storage-backend: "s3"
 
-  # S3 Configuration
-  s3-bucket: "my-encrypted-volumes"
-  s3-region: "us-east-1"
-  # s3-endpoint: "https://s3.example.com"  # Optional: for S3-compatible services
-  # s3-force-path-style: "false"  # Set to true for MinIO
-  # s3-path-prefix: "my-app/data"  # Optional: custom path in S3 (default: volumes/{volumeID}/files)
+  # S3 Configuration (StorageClass parameter)
+  s3-path-prefix: "my-app/data"  # Optional: custom path in S3 (default: volumes/{volumeID}/files)
 
-  # S3 Credentials (from secret)
-  s3-access-key-id-secret-name: "s3-credentials"
-  s3-access-key-id-secret-namespace: "kube-system"
+  # S3 configuration and credentials (from secret)
+  s3-secret-name: "s3-credentials"
+  s3-secret-namespace: "kube-system"
 
   # Provisioner secrets for DeleteVolume (ReclaimPolicy: Delete)
   csi.storage.k8s.io/provisioner-secret-name: "s3-credentials"
@@ -408,15 +406,18 @@ s3StorageClasses:
 
     # S3 Configuration
     s3:
-      bucket: "my-encrypted-volumes"
-      region: "us-east-1"
-      # endpoint: "https://s3.example.com"  # For S3-compatible services
-      # forcePathStyle: false  # Set to true for MinIO
-      # pathPrefix: "my-app/data"  # Custom S3 path (also used as encryption salt)
+      # pathPrefix: "my-app/data"  # Optional: custom S3 path (default: volumes/{volumeID}/files)
+                                   # When set, this is also used as salt for encryption password2
+                                   # Note: This is a StorageClass parameter, not stored in the secret
 
-      # S3 Credentials Secret
-      # WARNING: Setting credentials in values.yaml is not secure for production!
-      credentialsSecret:
+      secret:
+        bucket: "my-encrypted-volumes"
+        region: "us-east-1"
+        # endpoint: "https://s3.example.com"  # For S3-compatible services
+        # forcePathStyle: false  # Set to true for MinIO
+
+        # S3 Credentials Secret
+        # WARNING: Setting credentials in values.yaml is not secure for production!
         name: s3-credentials
         namespace: kube-system
         create: true  # Set to false for production
@@ -441,9 +442,9 @@ s3StorageClasses:
       region: "gra"  # GRA, SBG, DE, UK, etc.
       endpoint: "https://s3.gra.cloud.ovh.net"
       forcePathStyle: false
-      pathPrefix: "my-app/data"  # Custom path - also used as encryption salt
+    pathPrefix: "my-app/data"  # Custom path - also used as encryption salt
 
-      credentialsSecret:
+    secret:
         name: ovh-s3-credentials
         namespace: kube-system
 ```
@@ -503,7 +504,7 @@ rclone copy myremote:path/to/file ./local/
 
 **Password derivation:**
 - `password` = LUKS passphrase
-- `password2` = `passphrase-{pathPrefix}` (if pathPrefix is set) or `passphrase-{volumeID}` (default)
+- `password2` = `passphrase-{pathPrefix}` (if pathPrefix is set in StorageClass) or `passphrase-{volumeID}` (default)
 
 ### Security Features
 

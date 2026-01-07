@@ -64,13 +64,14 @@ The following table lists the configurable parameters and their default values:
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `s3StorageClasses[].name` | StorageClass name | - |
-| `s3StorageClasses[].s3.bucket` | S3 bucket name | - |
-| `s3StorageClasses[].s3.region` | S3 region | - |
-| `s3StorageClasses[].s3.endpoint` | S3 endpoint URL | (AWS default) |
-| `s3StorageClasses[].s3.forcePathStyle` | Force path-style URLs | `false` |
-| `s3StorageClasses[].s3.pathPrefix` | Custom S3 path (also used as encryption salt) | `volumes/{volumeID}/files` |
-| `s3StorageClasses[].s3.credentialsSecret.name` | S3 credentials secret name | - |
-| `s3StorageClasses[].s3.credentialsSecret.create` | Auto-create S3 credentials secret | `false` |
+| `s3StorageClasses[].s3.pathPrefix` | Custom S3 path (StorageClass parameter) | - |
+| `s3StorageClasses[].s3.secret.name` | S3 credentials secret name | - |
+| `s3StorageClasses[].s3.secret.namespace` | S3 credentials secret namespace | `kube-system` |
+| `s3StorageClasses[].s3.secret.create` | Auto-create S3 credentials secret | `false` |
+| `s3StorageClasses[].s3.secret.bucket` | S3 bucket name (in secret) | - |
+| `s3StorageClasses[].s3.secret.region` | S3 region (in secret) | - |
+| `s3StorageClasses[].s3.secret.endpoint` | S3 endpoint URL (in secret) | (AWS default) |
+| `s3StorageClasses[].s3.secret.forcePathStyle` | Force path-style URLs (in secret) | `false` |
 
 ### VFS Cache Parameters (rclone mount)
 
@@ -126,12 +127,12 @@ s3StorageClasses:
 
     # S3 Configuration
     s3:
-      bucket: "my-encrypted-volumes"
-      region: "us-east-1"
-      # endpoint: "https://s3.example.com"  # For S3-compatible services
-      # pathPrefix: "my-app/data"  # Custom path (also used as encryption salt)
+      # pathPrefix: "my-app/data"  # Custom path (StorageClass parameter)
 
-      credentialsSecret:
+      secret:
+        bucket: "my-encrypted-volumes"
+        region: "us-east-1"
+        # endpoint: "https://s3.example.com"  # For S3-compatible services
         name: s3-credentials
         namespace: kube-system
         create: false  # Create secret manually for production
@@ -195,7 +196,7 @@ rclone config create myremote crypt \
 rclone ls myremote:
 ```
 
-Note: `password2` uses `passphrase-{pathPrefix}` if pathPrefix is set, otherwise `passphrase-{volumeID}`.
+Note: `password2` uses `passphrase-{pathPrefix}` if pathPrefix is set in the StorageClass, otherwise `passphrase-{volumeID}`.
 
 ## Troubleshooting
 
