@@ -24,7 +24,6 @@ const (
 	S3RegionKey          = "s3-region"
 	S3EndpointKey        = "s3-endpoint"
 	S3ForcePathStyleKey  = "s3-force-path-style"
-	S3PathPrefixKey      = "s3-path-prefix"
 )
 
 // VolumeSecrets holds all secrets needed for volume operations
@@ -39,7 +38,6 @@ type VolumeSecrets struct {
 	S3Region          string
 	S3Endpoint        string
 	S3ForcePathStyle  bool
-	S3PathPrefix      string
 	S3AccessKeyID     string
 	S3SecretAccessKey string
 
@@ -95,7 +93,6 @@ func S3ConfigFromSecrets(secretData map[string]string) *S3Credentials {
 		Endpoint:        secretData[S3EndpointKey],
 		AccessKeyID:     accessKeyID,
 		SecretAccessKey: secretAccessKey,
-		PathPrefix:      secretData[S3PathPrefixKey],
 	}
 }
 
@@ -106,5 +103,4 @@ type S3Credentials struct {
 	Endpoint        string
 	AccessKeyID     string
 	SecretAccessKey string
-	PathPrefix      string // Optional custom path prefix in S3
 }

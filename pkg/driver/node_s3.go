@@ -15,6 +15,7 @@ import (
 // S3 Storage Constants
 const (
 	StorageBackendParam = "storage-backend"
+	S3PathPrefixParam   = "s3-path-prefix" // Custom path prefix in S3 bucket
 	// VFS Cache Parameters (for rclone mount mode)
 	VFSCacheModeParam    = "rclone-vfs-cache-mode"     // off, minimal, writes, full
 	VFSCacheMaxAgeParam  = "rclone-vfs-cache-max-age"  // e.g., "1h", "24h"
@@ -73,12 +74,12 @@ func (ns *NodeServer) setupS3Sync(volumeID, stagingPath string, volumeContext ma
 	ctx := context.Background()
 
 	// Get StorageClass parameters for S3 credentials secret reference
-	pv, err := ns.getPVByVolumeID(ctx, volumeID)
+	pv, err := getPVByVolumeID(ctx, ns.clientset, volumeID)
 	if err != nil {
 		return fmt.Errorf("failed to get PV for volume %s: %v", volumeID, err)
 	}
 
-	scParams, err := ns.getStorageClassParameters(ctx, pv.Spec.StorageClassName)
+	scParams, err := getStorageClassParameters(ctx, ns.clientset, pv.Spec.StorageClassName)
 	if err != nil {
 		return fmt.Errorf("failed to get StorageClass parameters: %v", err)
 	}
@@ -105,8 +106,8 @@ func (ns *NodeServer) setupS3Sync(volumeID, stagingPath string, volumeContext ma
 	// Extract VFS cache configuration from StorageClass/volume context
 	vfsConfig := ns.getVFSCacheConfig(volumeContext)
 
-	// S3 path prefix is now stored in the secret
-	s3PathPrefix := volSecrets.S3PathPrefix
+	// S3 path prefix is now a StorageClass parameter
+	s3PathPrefix := volumeContext[S3PathPrefixParam]
 
 	// Create rclone mount manager
 	mountMgr, err := rclone.NewMountManager(s3Config, volumeID, stagingPath, passphrase, vfsConfig, s3PathPrefix)

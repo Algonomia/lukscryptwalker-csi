@@ -53,15 +53,18 @@ const DefaultCacheBasePath = "/var/lib/lukscrypt-cache"
 
 // NewMountManager creates a new rclone mount manager
 // s3PathPrefix is optional - if empty, defaults to "volumes/{volumeID}/files"
+// If s3PathPrefix is provided, path becomes "{s3PathPrefix}/volumes/{volumeID}/files"
 func NewMountManager(s3Config *S3Config, volumeID, mountPoint, luksPassphrase string, vfsConfig *VFSCacheConfig, s3PathPrefix string) (*MountManager, error) {
 	if vfsConfig == nil {
 		vfsConfig = DefaultVFSCacheConfig()
 	}
 
-	// Determine S3 base path - use custom prefix or default to volumeID-based path
-	s3BasePath := s3PathPrefix
-	if s3BasePath == "" {
+	// Determine S3 base path - always include volumeID to ensure each volume has its own directory
+	var s3BasePath string
+	if s3PathPrefix == "" {
 		s3BasePath = fmt.Sprintf("volumes/%s/files", volumeID)
+	} else {
+		s3BasePath = fmt.Sprintf("%s/volumes/%s/files", s3PathPrefix, volumeID)
 	}
 
 	// Use s3PathPrefix as salt for password2 if set, otherwise use volumeID

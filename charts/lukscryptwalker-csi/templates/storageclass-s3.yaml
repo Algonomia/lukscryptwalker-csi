@@ -1,4 +1,25 @@
 {{- range .Values.s3StorageClasses }}
+{{- $existingStorageClass := lookup "storage.k8s.io/v1" "StorageClass" "" .name }}
+{{- if $existingStorageClass }}
+{{- if $.Values.debug }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .name }}-exists-warning
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "lukscryptwalker-csi.labels" $ | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade,pre-install
+    "helm.sh/hook-weight": "-1"
+data:
+  warning: |
+    WARNING: StorageClass '{{ .name }}' already exists and will be preserved.
+    Existing PVCs using this StorageClass will continue to work.
+    To update StorageClass parameters, you must delete it manually first.
+{{- end }}
+{{- else }}
 ---
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -18,6 +39,9 @@ parameters:
   # S3 Configuration (from secret)
   s3-secret-name: {{ .s3.secret.name | quote }}
   s3-secret-namespace: {{ .s3.secret.namespace | quote }}
+  {{- if .s3.pathPrefix }}
+  s3-path-prefix: {{ .s3.pathPrefix | quote }}
+  {{- end }}
 
   # LUKS encryption parameters
   csi.storage.k8s.io/node-stage-secret-name: {{ .secret.name | quote }}
@@ -56,6 +80,7 @@ reclaimPolicy: {{ .reclaimPolicy | default "Delete" }}
 allowVolumeExpansion: {{ .allowVolumeExpansion | default true }}
 volumeBindingMode: {{ .volumeBindingMode | default "WaitForFirstConsumer" }}
 {{- end }}
+{{- end }}
 
 {{- if .Values.s3StorageClasses }}
 {{- range .Values.s3StorageClasses }}
@@ -78,9 +103,6 @@ data:
   {{- end }}
   {{- if .s3.secret.forcePathStyle }}
   s3-force-path-style: {{ .s3.secret.forcePathStyle | toString | b64enc | quote }}
-  {{- end }}
-  {{- if .s3.secret.pathPrefix }}
-  s3-path-prefix: {{ .s3.secret.pathPrefix | b64enc | quote }}
   {{- end }}
   # S3 credentials
   {{- if .s3.secret.accessKeyId }}

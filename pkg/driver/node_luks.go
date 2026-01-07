@@ -203,22 +203,13 @@ func (ns *NodeServer) validateAndPrepareExpansionRequest(ctx context.Context, re
 	klog.Infof("Validated basic parameters - volumeID: %s, requestedBytes: %d", volumeID, requestedBytes)
 
 	// Get StorageClass parameters for passphrase retrieval
-	klog.Infof("Retrieving PV for volumeID: %s", volumeID)
-	pv, err := ns.getPVByVolumeID(ctx, volumeID)
+	klog.Infof("Retrieving StorageClass parameters for volumeID: %s", volumeID)
+	scParams, err := ns.GetStorageClassParametersByVolumeID(ctx, volumeID)
 	if err != nil {
-		klog.Errorf("Failed to get PV for volumeID %s: %v", volumeID, err)
-		return nil, status.Errorf(codes.FailedPrecondition, "PV for volumeID %s not found: %v", volumeID, err)
+		klog.Errorf("Failed to get StorageClass parameters for volumeID %s: %v", volumeID, err)
+		return nil, status.Errorf(codes.FailedPrecondition, "StorageClass parameters for volumeID %s not found: %v", volumeID, err)
 	}
-	klog.Infof("Successfully retrieved PV for volumeID %s, StorageClass: %s", volumeID, pv.Spec.StorageClassName)
-
-	klog.Infof("Retrieving StorageClass parameters for: %s", pv.Spec.StorageClassName)
-	scParams, err := ns.getStorageClassParameters(ctx, pv.Spec.StorageClassName)
-	if err != nil {
-		klog.Errorf("Failed to get StorageClass %s parameters: %v", pv.Spec.StorageClassName, err)
-		return nil, status.Errorf(codes.FailedPrecondition, "Parameters for StorageClass %s not found: %v",
-			pv.Spec.StorageClassName, err)
-	}
-	klog.Infof("Successfully retrieved StorageClass parameters")
+	klog.Infof("Successfully retrieved StorageClass parameters for volumeID %s", volumeID)
 
 	// Prepare paths and device names
 	localPath := GetLocalPath(volumeID)

@@ -9,17 +9,25 @@ import (
 	"github.com/lukscryptwalker-csi/pkg/secrets"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog"
 )
 
 type ControllerServer struct {
 	csi.UnimplementedControllerServer
-	driver *Driver
+	driver         *Driver
+	clientset      kubernetes.Interface
+	secretsManager *secrets.SecretsManager
 }
 
 func NewControllerServer(d *Driver) *ControllerServer {
+	// Use the same initialization as NodeServer
+	clientset := initializeKubernetesClient()
+
 	return &ControllerServer{
-		driver: d,
+		driver:         d,
+		clientset:      clientset,
+		secretsManager: secrets.NewSecretsManager(clientset),
 	}
 }
 
@@ -83,7 +91,7 @@ func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 
 	// Check if this is an S3 volume by looking at secrets
 	reqSecrets := req.GetSecrets()
-	klog.V(4).Infof("DeleteVolume secrets: %v", reqSecrets)
+	klog.V(4).Infof("DeleteVolume secrets keys: %v", getSecretKeys(reqSecrets))
 
 	if len(reqSecrets) == 0 {
 		klog.Infof("No secrets provided to DeleteVolume - S3 data will not be deleted. Configure provisioner-secret-name/namespace in StorageClass for ReclaimPolicy:Delete to work with S3.")
@@ -95,6 +103,9 @@ func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 		} else {
 			klog.Infof("Deleting S3 data for volume: %s", volumeID)
 
+			// Get pathPrefix from StorageClass parameters
+			s3PathPrefix := GetS3PathPrefixByVolumeID(ctx, cs, volumeID)
+
 			s3Config := &rclone.S3Config{
 				Region:          s3Creds.Region,
 				Endpoint:        s3Creds.Endpoint,
@@ -103,7 +114,7 @@ func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 				Bucket:          s3Creds.Bucket,
 			}
 
-			if err := rclone.DeleteVolumeData(s3Config, volumeID, s3Creds.PathPrefix); err != nil {
+			if err := rclone.DeleteVolumeData(s3Config, volumeID, s3PathPrefix); err != nil {
 				klog.Errorf("Failed to delete S3 data for volume %s: %v", volumeID, err)
 				// Don't fail the deletion - the volume should still be removed from Kubernetes
 				// The S3 data might need manual cleanup if this fails
@@ -257,3 +268,4 @@ func (cs *ControllerServer) validateVolumeCapabilities(caps []*csi.VolumeCapabil
 
 	return nil
 }
+
