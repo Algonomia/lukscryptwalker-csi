@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -37,13 +38,81 @@ type NodeServer struct {
 func NewNodeServer(d *Driver) *NodeServer {
 	clientset := initializeKubernetesClient()
 
-	return &NodeServer{
+	ns := &NodeServer{
 		driver:         d,
 		luksManager:    luks.NewLUKSManager(),
 		clientset:      clientset,
 		secretsManager: secrets.NewSecretsManager(clientset),
 		s3SyncMgr:      NewS3SyncManager(),
 	}
+
+	// Clean up stale mounts from previous crashes/restarts
+	ns.cleanupStaleMounts()
+
+	return ns
+}
+
+// cleanupStaleMounts cleans up stale CSI staging directories that may remain
+// after an unclean shutdown (e.g., OOM kill). This prevents "file exists" errors
+// when kubelet tries to recreate the staging directory infrastructure.
+func (ns *NodeServer) cleanupStaleMounts() {
+	csiPluginPath := "/var/lib/kubelet/plugins/kubernetes.io/csi/" + DriverName
+	klog.Infof("Checking for stale CSI staging directories in %s", csiPluginPath)
+
+	// Check if the CSI plugin directory exists
+	if _, err := os.Stat(csiPluginPath); os.IsNotExist(err) {
+		klog.V(4).Infof("CSI plugin path %s does not exist, no cleanup needed", csiPluginPath)
+		return
+	}
+
+	// List all volume hash directories
+	entries, err := os.ReadDir(csiPluginPath)
+	if err != nil {
+		klog.Warningf("Failed to read CSI plugin directory %s: %v", csiPluginPath, err)
+		return
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		volumeDir := filepath.Join(csiPluginPath, entry.Name())
+		globalmountPath := filepath.Join(volumeDir, "globalmount")
+
+		// Check if globalmount exists
+		if _, err := os.Stat(globalmountPath); os.IsNotExist(err) {
+			continue
+		}
+
+		klog.Infof("Found stale staging directory: %s", globalmountPath)
+
+		// Try to unmount if it's a mount point
+		if ns.isMountPoint(globalmountPath) {
+			klog.Infof("Unmounting stale mount at %s", globalmountPath)
+			if err := ns.unmountPath(globalmountPath); err != nil {
+				klog.Warningf("Failed to unmount stale mount %s: %v, trying lazy unmount", globalmountPath, err)
+				// Try lazy unmount as fallback
+				cmd := exec.Command("umount", "-l", globalmountPath)
+				if err := cmd.Run(); err != nil {
+					klog.Warningf("Lazy unmount also failed for %s: %v", globalmountPath, err)
+				}
+			}
+		}
+
+		// Remove the globalmount directory so kubelet can recreate it
+		if err := os.Remove(globalmountPath); err != nil {
+			klog.Warningf("Failed to remove stale globalmount directory %s: %v", globalmountPath, err)
+			// Try RemoveAll as fallback
+			if err := os.RemoveAll(globalmountPath); err != nil {
+				klog.Errorf("Failed to remove stale globalmount directory %s even with RemoveAll: %v", globalmountPath, err)
+			}
+		} else {
+			klog.Infof("Successfully removed stale globalmount directory: %s", globalmountPath)
+		}
+	}
+
+	klog.Infof("Stale mount cleanup completed")
 }
 
 // initializeKubernetesClient sets up the Kubernetes client with proper error handling

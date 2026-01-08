@@ -48,6 +48,17 @@ func (ns *NodeServer) mountAndConfigureVolume(params *StagingParameters) error {
 func (ns *NodeServer) cleanupVolumeStaging(volumeID, stagingTargetPath string) error {
 	// Unmount the staging target (only if mounted)
 	if ns.isMountPoint(stagingTargetPath) {
+		// Sync filesystem to ensure all dirty pages are flushed before unmounting
+		// This is important because we close the LUKS device immediately after
+		klog.Infof("Syncing filesystem before unmount for volume %s", volumeID)
+		syncCmd := exec.Command("sync", "-f", stagingTargetPath)
+		if err := syncCmd.Run(); err != nil {
+			klog.Warningf("sync -f failed for %s: %v, trying global sync", stagingTargetPath, err)
+			// Fallback to global sync
+			globalSyncCmd := exec.Command("sync")
+			_ = globalSyncCmd.Run()
+		}
+
 		if err := ns.unmountPath(stagingTargetPath); err != nil {
 			klog.Errorf("Failed to unmount staging path %s: %v", stagingTargetPath, err)
 			// Continue with cleanup even if unmount fails
@@ -429,6 +440,19 @@ func (ns *NodeServer) mountDevice(devicePath, targetPath string, capability *csi
 	mount := capability.GetMount()
 	if mount == nil {
 		return fmt.Errorf("only mount access type is supported")
+	}
+
+	// Check if already mounted at target (idempotency)
+	if ns.isMountPoint(targetPath) {
+		if ns.isMountedFrom(targetPath, devicePath) {
+			klog.Infof("Device %s already mounted at %s", devicePath, targetPath)
+			return nil
+		}
+		// Mounted from different device - unmount first
+		klog.Warningf("Target %s is mounted from different device, unmounting", targetPath)
+		if err := ns.unmountPath(targetPath); err != nil {
+			return fmt.Errorf("failed to unmount stale mount at %s: %v", targetPath, err)
+		}
 	}
 
 	// Create target directory

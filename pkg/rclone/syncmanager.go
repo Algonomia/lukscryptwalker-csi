@@ -179,6 +179,7 @@ func (mm *MountManager) buildVFSOpt() map[string]interface{} {
 		"ReadChunkSize":      33554432, // 32M in bytes
 		"ReadChunkSizeLimit": -1,       // off
 		"BufferSize":         33554432, // 32M in bytes
+		"Links":              true,     // Enable symlink support
 	}
 
 	// Cache mode
@@ -237,6 +238,10 @@ func (mm *MountManager) Unmount() error {
 
 	klog.Infof("Unmounting encrypted S3 volume %s from %s", mm.volumeID, mm.mountPoint)
 
+	// CRITICAL: Wait for pending uploads to complete before unmounting
+	// This prevents data loss when there are cached writes not yet uploaded to S3
+	mm.waitForPendingUploads()
+
 	// Call mount/unmount RPC
 	params := map[string]interface{}{
 		"mountPoint": mm.mountPoint,
@@ -261,6 +266,64 @@ func (mm *MountManager) Unmount() error {
 
 	klog.Infof("Successfully unmounted encrypted S3 volume %s", mm.volumeID)
 	return nil
+}
+
+// waitForPendingUploads waits for any pending VFS cache uploads to complete
+// This is critical to prevent data loss on unmount
+func (mm *MountManager) waitForPendingUploads() {
+	klog.Infof("Waiting for pending uploads to complete for volume %s", mm.volumeID)
+
+	maxWaitTime := 300 // 5 minutes max wait
+	pollInterval := 2  // Check every 2 seconds
+
+	for i := 0; i < maxWaitTime/pollInterval; i++ {
+		// Check core/stats for active transfers
+		result, err := RPC("core/stats", map[string]interface{}{})
+		if err != nil {
+			klog.Warningf("Failed to get transfer stats: %v", err)
+			break
+		}
+
+		// Parse the stats to check for active transfers
+		if result != nil && result.Output != nil {
+			transfers := int64(0)
+			if t, ok := result.Output["transferring"]; ok {
+				if tList, ok := t.([]interface{}); ok {
+					transfers = int64(len(tList))
+				}
+			}
+
+			// Also check checks (which includes uploads)
+			checks := int64(0)
+			if c, ok := result.Output["checking"]; ok {
+				if cList, ok := c.([]interface{}); ok {
+					checks = int64(len(cList))
+				}
+			}
+
+			if transfers == 0 && checks == 0 {
+				klog.Infof("No pending transfers for volume %s", mm.volumeID)
+				break
+			}
+
+			klog.Infof("Waiting for %d transfers and %d checks to complete for volume %s", transfers, checks, mm.volumeID)
+		}
+
+		// Wait before checking again
+		sleepCmd := exec.Command("sleep", fmt.Sprintf("%d", pollInterval))
+		_ = sleepCmd.Run()
+	}
+
+	// Also try to flush the VFS cache before unmounting
+	_, err := RPC("vfs/refresh", map[string]interface{}{
+		"fs":        mm.mountPoint,
+		"recursive": true,
+	})
+	if err != nil {
+		klog.V(4).Infof("vfs/refresh returned error (may be normal if already unmounted): %v", err)
+	}
+
+	klog.Infof("Finished waiting for pending uploads for volume %s", mm.volumeID)
 }
 
 // isMountPoint checks if the path is a mount point
@@ -318,7 +381,17 @@ func (mm *MountManager) setupEncryptedCache() (string, error) {
 	mountPath := mm.getCacheMountPath()
 	mapperName := mm.getCacheMapperName()
 
-	klog.Infof("Setting up encrypted cache for volume %s: backing=%s, mount=%s", mm.volumeID, backingFile, mountPath)
+	klog.Infof("Setting up encrypted cache for volume %s: backing=%s, mount=%s, mapper=%s", mm.volumeID, backingFile, mountPath, mapperName)
+
+	// Check if cache is already mounted and working (idempotent)
+	if mm.isCacheMountActive(mountPath, mapperName) {
+		klog.Infof("Encrypted cache already active at %s for volume %s", mountPath, mm.volumeID)
+		mm.cacheMounted = true
+		return mountPath, nil
+	}
+
+	// Clean up any stale state for THIS volume only before proceeding
+	mm.cleanupStaleVolumeCache(backingFile, mountPath, mapperName)
 
 	// Create directories
 	if err := os.MkdirAll(filepath.Dir(backingFile), 0700); err != nil {
@@ -397,6 +470,107 @@ func (mm *MountManager) setupEncryptedCache() (string, error) {
 	mm.cacheMounted = true
 	klog.Infof("Successfully set up encrypted cache at %s for volume %s", mountPath, mm.volumeID)
 	return mountPath, nil
+}
+
+// isCacheMountActive checks if the encrypted cache is already mounted and working
+func (mm *MountManager) isCacheMountActive(mountPath, mapperName string) bool {
+	// Check if mount path is a mount point
+	cmd := exec.Command("mountpoint", "-q", mountPath)
+	if cmd.Run() != nil {
+		return false
+	}
+
+	// Check if LUKS mapper exists
+	mappedDevice := mm.luksManager.GetMappedDevicePath(mapperName)
+	if _, err := os.Stat(mappedDevice); os.IsNotExist(err) {
+		return false
+	}
+
+	// Verify mount is from our mapper device
+	findmntCmd := exec.Command("findmnt", "-n", "-o", "SOURCE", mountPath)
+	output, err := findmntCmd.Output()
+	if err != nil {
+		return false
+	}
+
+	return strings.TrimSpace(string(output)) == mappedDevice
+}
+
+// cleanupStaleVolumeCache cleans up stale cache state for THIS specific volume only.
+// This handles the case where the driver crashed and left orphaned resources.
+func (mm *MountManager) cleanupStaleVolumeCache(backingFile, mountPath, mapperName string) {
+	klog.Infof("Checking for stale cache state for volume %s", mm.volumeID)
+	mappedDevice := mm.luksManager.GetMappedDevicePath(mapperName)
+
+	// Step 1: Unmount if stale mount exists at expected path
+	cmd := exec.Command("mountpoint", "-q", mountPath)
+	if cmd.Run() == nil {
+		klog.Infof("Found stale cache mount at %s, unmounting", mountPath)
+		umountCmd := exec.Command("umount", "-l", mountPath)
+		if err := umountCmd.Run(); err != nil {
+			klog.Warningf("Failed to unmount stale cache mount %s: %v", mountPath, err)
+		}
+	}
+
+	// Step 2: Check if LUKS device is mounted anywhere else and unmount it
+	if _, err := os.Stat(mappedDevice); err == nil {
+		// Find where this device is mounted using findmnt
+		findmntCmd := exec.Command("findmnt", "-n", "-o", "TARGET", "-S", mappedDevice)
+		output, err := findmntCmd.Output()
+		if err == nil && len(output) > 0 {
+			mountTarget := strings.TrimSpace(string(output))
+			if mountTarget != "" {
+				klog.Infof("Found LUKS device %s mounted at %s, unmounting", mappedDevice, mountTarget)
+				umountCmd := exec.Command("umount", "-l", mountTarget)
+				if err := umountCmd.Run(); err != nil {
+					klog.Warningf("Failed to unmount %s: %v", mountTarget, err)
+				}
+			}
+		}
+	}
+
+	// Step 3: Close LUKS mapper if it exists
+	if _, err := os.Stat(mappedDevice); err == nil {
+		klog.Infof("Found stale LUKS mapper %s, closing", mapperName)
+		if err := mm.luksManager.CloseLUKS(mapperName); err != nil {
+			klog.Warningf("Failed to close stale LUKS mapper %s: %v", mapperName, err)
+			// Try force close with dmsetup as fallback
+			closeCmd := exec.Command("cryptsetup", "close", mapperName)
+			if err := closeCmd.Run(); err != nil {
+				klog.Warningf("cryptsetup close failed: %v, trying dmsetup remove", err)
+				dmCmd := exec.Command("dmsetup", "remove", "-f", mapperName)
+				if err := dmCmd.Run(); err != nil {
+					klog.Errorf("dmsetup remove also failed for %s: %v", mapperName, err)
+				}
+			}
+		}
+	}
+
+	// Step 4: Detach loop device - check both by backing file and by scanning for orphaned loops
+	// First try by backing file if it exists
+	if _, err := os.Stat(backingFile); err == nil {
+		losetupCmd := exec.Command("losetup", "-j", backingFile)
+		output, err := losetupCmd.Output()
+		if err == nil && len(output) > 0 {
+			outputStr := strings.TrimSpace(string(output))
+			if parts := strings.Split(outputStr, ":"); len(parts) >= 1 {
+				loopDevice := strings.TrimSpace(parts[0])
+				klog.Infof("Found stale loop device %s attached to %s, detaching", loopDevice, backingFile)
+				detachCmd := exec.Command("losetup", "-d", loopDevice)
+				if err := detachCmd.Run(); err != nil {
+					klog.Warningf("Failed to detach stale loop device %s: %v", loopDevice, err)
+				}
+			}
+		}
+
+		// Step 5: Remove stale backing file so we start fresh
+		klog.Infof("Removing stale backing file %s", backingFile)
+		if err := os.Remove(backingFile); err != nil {
+			klog.Warningf("Failed to remove stale backing file %s: %v", backingFile, err)
+		}
+	}
+
+	klog.Infof("Stale cache cleanup completed for volume %s", mm.volumeID)
 }
 
 // teardownEncryptedCache unmounts and closes the encrypted cache
