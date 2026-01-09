@@ -206,6 +206,24 @@ func (ns *NodeServer) cleanupS3Sync(volumeID string) error {
 	return nil
 }
 
+// restoreS3VolumeStaging restores an S3 volume's staging mount after node reboot
+func (ns *NodeServer) restoreS3VolumeStaging(volumeID, stagingTargetPath string, volumeContext, secrets map[string]string) error {
+	klog.Infof("Restoring S3 volume %s at %s", volumeID, stagingTargetPath)
+
+	// Create staging directory if it doesn't exist
+	if err := os.MkdirAll(stagingTargetPath, 0777); err != nil {
+		return fmt.Errorf("failed to create staging directory: %v", err)
+	}
+
+	// Setup S3 sync
+	if err := ns.setupS3Sync(volumeID, stagingTargetPath, volumeContext, secrets); err != nil {
+		return fmt.Errorf("failed to setup S3 sync during restore: %v", err)
+	}
+
+	klog.Infof("Successfully restored S3 volume %s", volumeID)
+	return nil
+}
+
 // cleanupCacheBackingFile removes the LUKS cache backing file for a volume
 func (ns *NodeServer) cleanupCacheBackingFile(volumeID string) {
 	cacheBasePath := rclone.DefaultCacheBasePath

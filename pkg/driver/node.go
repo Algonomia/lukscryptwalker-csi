@@ -540,10 +540,22 @@ func (ns *NodeServer) prepareVolumeStaging(req *csi.NodeStageVolumeRequest) (*St
 func (ns *NodeServer) ensureVolumeStaged(ctx context.Context, req *csi.NodePublishVolumeRequest) error {
 	volumeID := req.GetVolumeId()
 	stagingTargetPath := req.GetStagingTargetPath()
+	volumeContext := req.GetVolumeContext()
 
+	// Check if volume is already staged
+	if ns.isS3Backend(volumeContext) {
+		// S3 volumes: check if mount point exists
+		if ns.isMountPoint(stagingTargetPath) {
+			return nil
+		}
+		klog.Infof("S3 volume %s not staged at %s, attempting to restore", volumeID, stagingTargetPath)
+		return ns.restoreS3VolumeStaging(volumeID, stagingTargetPath, volumeContext, req.GetSecrets())
+	}
+
+	// LUKS volumes: use existing check
 	if !ns.isVolumeStaged(volumeID, stagingTargetPath) {
-		klog.Infof("Volume %s not staged at %s, attempting to restore after reboot", volumeID, stagingTargetPath)
-		return ns.restoreVolumeStaging(ctx, volumeID, stagingTargetPath, req.GetVolumeContext(), req.GetSecrets())
+		klog.Infof("LUKS volume %s not staged at %s, attempting to restore", volumeID, stagingTargetPath)
+		return ns.restoreLUKSVolumeStaging(ctx, volumeID, stagingTargetPath, volumeContext)
 	}
 
 	return nil
@@ -662,89 +674,3 @@ func (ns *NodeServer) applyFsGroupPermissions(targetPath string, fsGroup int64) 
 	return nil
 }
 
-// =============================================================================
-// Passphrase and Secret Management
-// =============================================================================
-
-// getPassphraseFromRequest extracts passphrase from the staging request using SecretsManager
-func (ns *NodeServer) getPassphraseFromRequest(req *csi.NodeStageVolumeRequest) (string, error) {
-	ctx := context.Background()
-	volumeID := req.GetVolumeId()
-	volumeContext := req.GetVolumeContext()
-
-	// Get StorageClass parameters - secret references are there, not in volumeContext
-	pv, err := getPVByVolumeID(ctx, ns.clientset, volumeID)
-	if err != nil {
-		return "", fmt.Errorf("failed to get PV for volume %s: %v", volumeID, err)
-	}
-
-	scParams, err := getStorageClassParameters(ctx, ns.clientset, pv.Spec.StorageClassName)
-	if err != nil {
-		return "", fmt.Errorf("failed to get StorageClass parameters: %v", err)
-	}
-
-	// Extract secret parameters from StorageClass parameters and volume context
-	secretParams := secrets.ExtractSecretParams(scParams, volumeContext)
-	klog.V(4).Infof("getPassphraseFromRequest: extracted secretParams - LUKS: %s/%s, passphraseKey: %s",
-		secretParams.LUKSSecret.Namespace, secretParams.LUKSSecret.Name,
-		secretParams.PassphraseKey)
-
-	// Fetch secrets from Kubernetes
-	volSecrets, err := ns.secretsManager.FetchVolumeSecrets(ctx, secretParams)
-	if err != nil {
-		return "", fmt.Errorf("failed to fetch secrets: %w", err)
-	}
-
-	if volSecrets.Passphrase == "" {
-		return "", fmt.Errorf("LUKS passphrase not found in secrets")
-	}
-
-	return volSecrets.Passphrase, nil
-}
-
-// getPassphraseForRestore retrieves passphrase for volume restore operations using SecretsManager
-func (ns *NodeServer) getPassphraseForRestore(ctx context.Context, volumeID string, volumeContext, _ map[string]string) (string, error) {
-	// Get StorageClass parameters for secret references
-	pv, err := getPVByVolumeID(ctx, ns.clientset, volumeID)
-	if err != nil {
-		return "", fmt.Errorf("failed to get PV for volume %s: %v", volumeID, err)
-	}
-
-	scParams, err := getStorageClassParameters(ctx, ns.clientset, pv.Spec.StorageClassName)
-	if err != nil {
-		return "", fmt.Errorf("failed to get StorageClass parameters: %v", err)
-	}
-
-	// Extract secret parameters from StorageClass and volume context
-	secretParams := secrets.ExtractSecretParams(scParams, volumeContext)
-
-	// Fetch secrets from Kubernetes
-	volSecrets, err := ns.secretsManager.FetchVolumeSecrets(ctx, secretParams)
-	if err != nil {
-		return "", fmt.Errorf("failed to fetch secrets: %w", err)
-	}
-
-	if volSecrets.Passphrase == "" {
-		return "", fmt.Errorf("LUKS passphrase not found in secrets")
-	}
-
-	return volSecrets.Passphrase, nil
-}
-
-// getPassphraseForExpansion retrieves passphrase for volume expansion using SecretsManager
-func (ns *NodeServer) getPassphraseForExpansion(ctx context.Context, scParams map[string]string) (string, error) {
-	// Extract secret parameters from StorageClass parameters
-	secretParams := secrets.ExtractSecretParams(scParams, nil)
-
-	// Fetch secrets from Kubernetes
-	volSecrets, err := ns.secretsManager.FetchVolumeSecrets(ctx, secretParams)
-	if err != nil {
-		return "", fmt.Errorf("failed to fetch secrets: %w", err)
-	}
-
-	if volSecrets.Passphrase == "" {
-		return "", fmt.Errorf("LUKS passphrase not found in secrets")
-	}
-
-	return volSecrets.Passphrase, nil
-}
