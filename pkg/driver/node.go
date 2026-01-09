@@ -48,88 +48,13 @@ func NewNodeServer(d *Driver) *NodeServer {
 		s3SyncMgr:      NewS3SyncManager(),
 	}
 
-	// Clean up stale mounts from previous crashes/restarts
-	ns.cleanupStaleMounts()
+	// Clean up and restore stale S3 mounts from previous crashes/restarts
+	ns.cleanupStaleS3Mounts()
 
 	// Clean up orphaned volume directories (from deleted PVCs)
 	ns.cleanupOrphanedVolumes()
 
 	return ns
-}
-
-// cleanupStaleMounts cleans up stale CSI staging directories that may remain
-// after an unclean shutdown (e.g., OOM kill). This prevents "file exists" errors
-// when kubelet tries to recreate the staging directory infrastructure.
-func (ns *NodeServer) cleanupStaleMounts() {
-	csiPluginPath := "/var/lib/kubelet/plugins/kubernetes.io/csi/" + DriverName
-	klog.Infof("Checking for stale CSI staging directories in %s", csiPluginPath)
-
-	// Check if the CSI plugin directory exists
-	if _, err := os.Stat(csiPluginPath); os.IsNotExist(err) {
-		klog.V(4).Infof("CSI plugin path %s does not exist, no cleanup needed", csiPluginPath)
-		return
-	}
-
-	// List all volume hash directories
-	entries, err := os.ReadDir(csiPluginPath)
-	if err != nil {
-		klog.Warningf("Failed to read CSI plugin directory %s: %v", csiPluginPath, err)
-		return
-	}
-
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-
-		volumeDir := filepath.Join(csiPluginPath, entry.Name())
-		globalmountPath := filepath.Join(volumeDir, "globalmount")
-
-		// Check if globalmount exists - use Lstat to not follow symlinks
-		_, statErr := os.Lstat(globalmountPath)
-		if os.IsNotExist(statErr) {
-			continue
-		}
-
-		klog.Infof("Found stale staging directory: %s", globalmountPath)
-
-		// Check if it's a stale FUSE mount (transport endpoint not connected)
-		// This happens when rclone dies but mount point remains
-		_, err := os.Stat(globalmountPath)
-		isStaleFUSE := err != nil && (strings.Contains(err.Error(), "transport endpoint is not connected") ||
-			strings.Contains(err.Error(), "stale file handle"))
-
-		if isStaleFUSE {
-			klog.Infof("Detected stale FUSE mount at %s, lazy unmounting", globalmountPath)
-			umountCmd := exec.Command("umount", "-l", globalmountPath)
-			if err := umountCmd.Run(); err != nil {
-				klog.Warningf("umount -l failed for stale FUSE mount %s: %v", globalmountPath, err)
-			}
-		} else if ns.isMountPoint(globalmountPath) {
-			// Regular mount point
-			klog.Infof("Unmounting stale mount at %s", globalmountPath)
-			if err := ns.unmountPath(globalmountPath); err != nil {
-				klog.Warningf("Failed to unmount stale mount %s: %v, trying lazy unmount", globalmountPath, err)
-				cmd := exec.Command("umount", "-l", globalmountPath)
-				if err := cmd.Run(); err != nil {
-					klog.Warningf("Lazy unmount also failed for %s: %v", globalmountPath, err)
-				}
-			}
-		}
-
-		// Remove the globalmount directory so kubelet can recreate it
-		if err := os.Remove(globalmountPath); err != nil {
-			klog.Warningf("Failed to remove stale globalmount directory %s: %v", globalmountPath, err)
-			// Try RemoveAll as fallback
-			if err := os.RemoveAll(globalmountPath); err != nil {
-				klog.Errorf("Failed to remove stale globalmount directory %s even with RemoveAll: %v", globalmountPath, err)
-			}
-		} else {
-			klog.Infof("Successfully removed stale globalmount directory: %s", globalmountPath)
-		}
-	}
-
-	klog.Infof("Stale mount cleanup completed")
 }
 
 // cleanupOrphanedVolumes removes volume directories for PVs that no longer exist.

@@ -2,13 +2,17 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/lukscryptwalker-csi/pkg/rclone"
 	"github.com/lukscryptwalker-csi/pkg/secrets"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog"
 )
 
@@ -222,6 +226,157 @@ func (ns *NodeServer) restoreS3VolumeStaging(volumeID, stagingTargetPath string,
 
 	klog.Infof("Successfully restored S3 volume %s", volumeID)
 	return nil
+}
+
+// cleanupStaleS3Mounts cleans up stale S3/FUSE mounts that may remain after
+// an unclean shutdown (e.g., OOM kill). For S3 volumes, it attempts to restore
+// the mount instead of just unmounting to keep existing pods working.
+func (ns *NodeServer) cleanupStaleS3Mounts() {
+	csiPluginPath := "/var/lib/kubelet/plugins/kubernetes.io/csi/" + DriverName
+	klog.Infof("Checking for stale S3 mounts in %s", csiPluginPath)
+
+	// Check if the CSI plugin directory exists
+	if _, err := os.Stat(csiPluginPath); os.IsNotExist(err) {
+		klog.V(4).Infof("CSI plugin path %s does not exist, no cleanup needed", csiPluginPath)
+		return
+	}
+
+	// List all volume hash directories
+	entries, err := os.ReadDir(csiPluginPath)
+	if err != nil {
+		klog.Warningf("Failed to read CSI plugin directory %s: %v", csiPluginPath, err)
+		return
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		volumeDir := filepath.Join(csiPluginPath, entry.Name())
+		globalmountPath := filepath.Join(volumeDir, "globalmount")
+
+		// Check if globalmount exists - use Lstat to not follow symlinks
+		_, statErr := os.Lstat(globalmountPath)
+		if os.IsNotExist(statErr) {
+			continue
+		}
+
+		// Check if it's a stale FUSE mount (transport endpoint not connected)
+		_, err := os.Stat(globalmountPath)
+		isStaleFUSE := err != nil && (strings.Contains(err.Error(), "transport endpoint is not connected") ||
+			strings.Contains(err.Error(), "stale file handle"))
+
+		if !isStaleFUSE {
+			// Not a stale mount, skip
+			continue
+		}
+
+		klog.Infof("Detected stale FUSE mount at %s", globalmountPath)
+
+		// Try to get volume ID from vol_data.json (written by kubelet)
+		volumeID := ns.getVolumeIDFromVolData(volumeDir)
+		if volumeID == "" {
+			klog.Warningf("Could not determine volume ID for %s, will unmount only", volumeDir)
+			ns.unmountStaleS3Mount(globalmountPath)
+			continue
+		}
+
+		klog.Infof("Found stale S3 mount for volume %s at %s", volumeID, globalmountPath)
+
+		// Get volume context from the PV
+		ctx := context.Background()
+		volumeContext := ns.getS3VolumeContext(ctx, volumeID)
+		if volumeContext == nil {
+			klog.Warningf("Could not get volume context for %s, will unmount only", volumeID)
+			ns.unmountStaleS3Mount(globalmountPath)
+			continue
+		}
+
+		// Try to restore the S3 mount
+		klog.Infof("Attempting to restore S3 volume %s at %s", volumeID, globalmountPath)
+
+		// First unmount the stale FUSE mount
+		umountCmd := exec.Command("umount", "-l", globalmountPath)
+		if err := umountCmd.Run(); err != nil {
+			klog.Warningf("umount -l failed for stale FUSE mount %s: %v", globalmountPath, err)
+		}
+
+		// Try to restore the S3 mount
+		if err := ns.restoreS3VolumeStaging(volumeID, globalmountPath, volumeContext, nil); err != nil {
+			klog.Errorf("Failed to restore S3 volume %s: %v - pods using this volume will need restart", volumeID, err)
+			// Clean up the directory so kubelet can recreate it later
+			os.RemoveAll(globalmountPath)
+		} else {
+			klog.Infof("Successfully restored S3 volume %s at %s", volumeID, globalmountPath)
+		}
+	}
+
+	klog.Infof("Stale S3 mount cleanup completed")
+}
+
+// getVolumeIDFromVolData reads the volume ID from kubelet's vol_data.json file
+func (ns *NodeServer) getVolumeIDFromVolData(volumeDir string) string {
+	volDataPath := filepath.Join(volumeDir, "vol_data.json")
+	data, err := os.ReadFile(volDataPath)
+	if err != nil {
+		klog.V(4).Infof("Could not read vol_data.json at %s: %v", volDataPath, err)
+		return ""
+	}
+
+	// vol_data.json contains {"volumeHandle":"pvc-xxx", ...}
+	var volData map[string]interface{}
+	if err := json.Unmarshal(data, &volData); err != nil {
+		klog.Warningf("Failed to parse vol_data.json at %s: %v", volDataPath, err)
+		return ""
+	}
+
+	if volumeHandle, ok := volData["volumeHandle"].(string); ok {
+		return volumeHandle
+	}
+
+	return ""
+}
+
+// getS3VolumeContext gets the volume context for an S3 volume from its PV
+func (ns *NodeServer) getS3VolumeContext(ctx context.Context, volumeID string) map[string]string {
+	if ns.clientset == nil {
+		return nil
+	}
+
+	pv, err := ns.clientset.CoreV1().PersistentVolumes().Get(ctx, volumeID, metav1.GetOptions{})
+	if err != nil {
+		klog.Warningf("Failed to get PV %s: %v", volumeID, err)
+		return nil
+	}
+
+	if pv.Spec.CSI == nil || pv.Spec.CSI.Driver != DriverName {
+		return nil
+	}
+
+	volumeContext := pv.Spec.CSI.VolumeAttributes
+	if volumeContext == nil {
+		return nil
+	}
+
+	// Verify it's an S3 backend
+	if !ns.isS3Backend(volumeContext) {
+		return nil
+	}
+
+	return volumeContext
+}
+
+// unmountStaleS3Mount unmounts a stale FUSE mount and cleans up the directory
+func (ns *NodeServer) unmountStaleS3Mount(mountPath string) {
+	umountCmd := exec.Command("umount", "-l", mountPath)
+	if err := umountCmd.Run(); err != nil {
+		klog.Warningf("umount -l failed for %s: %v", mountPath, err)
+	}
+
+	if err := os.RemoveAll(mountPath); err != nil {
+		klog.Warningf("Failed to remove directory %s: %v", mountPath, err)
+	}
 }
 
 // cleanupCacheBackingFile removes the LUKS cache backing file for a volume
