@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/lukscryptwalker-csi/pkg/luks"
@@ -54,7 +55,20 @@ func NewNodeServer(d *Driver) *NodeServer {
 	// Clean up orphaned volume directories (from deleted PVCs)
 	ns.cleanupOrphanedVolumes()
 
+	// Start background goroutine to periodically check for stale S3 mounts
+	go ns.runStaleS3MountChecker()
+
 	return ns
+}
+
+// runStaleS3MountChecker periodically checks for and handles stale S3 mounts
+func (ns *NodeServer) runStaleS3MountChecker() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		ns.cleanupStaleS3Mounts()
+	}
 }
 
 // cleanupOrphanedVolumes removes volume directories for PVs that no longer exist.

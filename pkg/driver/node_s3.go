@@ -300,34 +300,123 @@ func (ns *NodeServer) cleanupStaleS3Mounts() {
 
 		if isStaleFUSE {
 			klog.Infof("Detected stale FUSE mount for S3 volume %s at %s", volumeID, globalmountPath)
-		} else {
-			klog.Infof("Detected missing FUSE mount for S3 volume %s at %s", volumeID, globalmountPath)
-		}
-
-		// Try to restore the S3 mount
-		klog.Infof("Attempting to restore S3 volume %s at %s", volumeID, globalmountPath)
-
-		// First unmount the stale FUSE mount if needed
-		if isStaleFUSE {
+			// Unmount the stale FUSE mount
 			umountCmd := exec.Command("umount", "-l", globalmountPath)
 			if err := umountCmd.Run(); err != nil {
 				klog.Warningf("umount -l failed for stale FUSE mount %s: %v", globalmountPath, err)
 			}
+		} else {
+			klog.Infof("Detected missing FUSE mount for S3 volume %s at %s", volumeID, globalmountPath)
 		}
 
-		// Try to restore the S3 mount
-		if err := ns.restoreS3VolumeStaging(volumeID, globalmountPath, volumeContext, nil); err != nil {
-			klog.Errorf("Failed to restore S3 volume %s: %v - pods using this volume will need restart", volumeID, err)
-			// Clean up the directory so kubelet can recreate it later
-			if rmErr := os.RemoveAll(globalmountPath); rmErr != nil {
-				klog.Warningf("Failed to remove globalmount directory %s: %v", globalmountPath, rmErr)
-			}
-		} else {
-			klog.Infof("Successfully restored S3 volume %s at %s", volumeID, globalmountPath)
+		// Remove the globalmount directory so kubelet can recreate it on pod restart
+		if err := os.RemoveAll(globalmountPath); err != nil {
+			klog.Warningf("Failed to remove globalmount directory %s: %v", globalmountPath, err)
 		}
+
+		// Find and restart pods using this volume - they will get fresh mounts via normal CSI flow
+		ns.restartPodsWithStaleS3Mount(volumeID)
 	}
 
 	klog.Infof("Stale/missing S3 mount cleanup completed")
+}
+
+// restartPodsWithStaleS3Mount finds pods with stale mounts for this volume and restarts them
+func (ns *NodeServer) restartPodsWithStaleS3Mount(volumeID string) {
+	podsDir := "/var/lib/kubelet/pods"
+
+	entries, err := os.ReadDir(podsDir)
+	if err != nil {
+		klog.Warningf("Failed to read pods directory %s: %v", podsDir, err)
+		return
+	}
+
+	for _, podEntry := range entries {
+		if !podEntry.IsDir() {
+			continue
+		}
+
+		podUID := podEntry.Name()
+		volumesDir := filepath.Join(podsDir, podUID, "volumes", "kubernetes.io~csi")
+		volEntries, err := os.ReadDir(volumesDir)
+		if err != nil {
+			continue // Pod may not have CSI volumes
+		}
+
+		for _, volEntry := range volEntries {
+			if !volEntry.IsDir() {
+				continue
+			}
+
+			// Check if this volume matches by reading vol_data.json
+			volDataPath := filepath.Join(volumesDir, volEntry.Name(), "vol_data.json")
+			data, err := os.ReadFile(volDataPath)
+			if err != nil {
+				continue
+			}
+
+			var volData map[string]interface{}
+			if err := json.Unmarshal(data, &volData); err != nil {
+				continue
+			}
+
+			volHandle, ok := volData["volumeHandle"].(string)
+			if !ok || volHandle != volumeID {
+				continue
+			}
+
+			mountPath := filepath.Join(volumesDir, volEntry.Name(), "mount")
+
+			// Check if mount path exists
+			_, statErr := os.Lstat(mountPath)
+			if os.IsNotExist(statErr) {
+				continue
+			}
+
+			klog.Infof("Found pod %s using S3 volume %s, cleaning up mount and triggering restart", podUID, volumeID)
+
+			// Unmount the pod's bind mount (may be stale or pointing to old staging)
+			umountCmd := exec.Command("umount", "-l", mountPath)
+			if err := umountCmd.Run(); err != nil {
+				klog.V(4).Infof("umount -l for pod mount %s: %v (may already be unmounted)", mountPath, err)
+			}
+
+			// Delete the pod to trigger restart (if managed by a controller like Deployment)
+			ns.deletePodByUID(podUID)
+		}
+	}
+}
+
+// deletePodByUID finds and deletes a pod by its UID
+func (ns *NodeServer) deletePodByUID(podUID string) {
+	if ns.clientset == nil {
+		klog.Warningf("Cannot delete pod %s: no kubernetes client", podUID)
+		return
+	}
+
+	ctx := context.Background()
+
+	// List all pods to find the one with this UID
+	pods, err := ns.clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		klog.Warningf("Failed to list pods to find UID %s: %v", podUID, err)
+		return
+	}
+
+	for _, pod := range pods.Items {
+		if string(pod.UID) == podUID {
+			klog.Infof("Deleting pod %s/%s (UID: %s) to recover from stale S3 mount", pod.Namespace, pod.Name, podUID)
+			err := ns.clientset.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
+			if err != nil {
+				klog.Errorf("Failed to delete pod %s/%s: %v", pod.Namespace, pod.Name, err)
+			} else {
+				klog.Infof("Successfully deleted pod %s/%s, it will be recreated by its controller", pod.Namespace, pod.Name)
+			}
+			return
+		}
+	}
+
+	klog.Warningf("Could not find pod with UID %s to delete", podUID)
 }
 
 // isFUSEMountPoint checks if the path has a FUSE mount by reading /proc/mounts
