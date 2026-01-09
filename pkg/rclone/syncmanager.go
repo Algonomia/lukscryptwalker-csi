@@ -114,13 +114,12 @@ func (mm *MountManager) Mount() error {
 		klog.Warningf("Found stale mount at %s, attempting to unmount first", mm.mountPoint)
 		// Try to unmount via librclone
 		_, _ = RPC("mount/unmount", map[string]interface{}{"mountPoint": mm.mountPoint})
-		// Also try fusermount as fallback
+		// Use lazy unmount as fallback
 		if mm.isMountPoint() {
-			klog.Warningf("librclone unmount didn't work, trying fusermount -uz %s", mm.mountPoint)
-			// Use lazy unmount to handle busy mounts
-			cmd := exec.Command("fusermount", "-uz", mm.mountPoint)
+			klog.Warningf("librclone unmount didn't work, trying umount -l %s", mm.mountPoint)
+			cmd := exec.Command("umount", "-l", mm.mountPoint)
 			if err := cmd.Run(); err != nil {
-				klog.Warningf("fusermount failed: %v, will try mounting anyway with AllowNonEmpty", err)
+				klog.Warningf("umount -l failed: %v, will try mounting anyway with AllowNonEmpty", err)
 			}
 		}
 	}

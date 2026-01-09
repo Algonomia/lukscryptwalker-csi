@@ -487,11 +487,26 @@ type StagingParameters struct {
 }
 
 // prepareVolumeStaging prepares parameters for volume staging
+// For S3 volumes, backing file and LUKS-related fields are not populated
 func (ns *NodeServer) prepareVolumeStaging(req *csi.NodeStageVolumeRequest) (*StagingParameters, error) {
 	volumeID := req.GetVolumeId()
+	fsGroup := ns.extractFsGroup(req.GetVolumeContext())
+
+	params := &StagingParameters{
+		volumeID:          volumeID,
+		stagingTargetPath: req.GetStagingTargetPath(),
+		fsGroup:           fsGroup,
+		volumeCapability:  req.GetVolumeCapability(),
+	}
+
+	// S3 volumes don't use local LUKS backing files
+	if ns.isS3Backend(req.GetVolumeContext()) {
+		return params, nil
+	}
+
+	// LUKS volumes: setup local path and backing file
 	localPath := GetLocalPath(volumeID)
 	backingFile := GenerateBackingFilePath(localPath, volumeID)
-	fsGroup := ns.extractFsGroup(req.GetVolumeContext())
 
 	// Ensure local path directory exists
 	if err := os.MkdirAll(localPath, 0755); err != nil {
@@ -512,17 +527,13 @@ func (ns *NodeServer) prepareVolumeStaging(req *csi.NodeStageVolumeRequest) (*St
 	mapperName := ns.luksManager.GenerateMapperName(volumeID)
 	mappedDevice := ns.luksManager.GetMappedDevicePath(mapperName)
 
-	return &StagingParameters{
-		volumeID:          volumeID,
-		stagingTargetPath: req.GetStagingTargetPath(),
-		localPath:         localPath,
-		backingFile:       backingFile,
-		passphrase:        passphrase,
-		mapperName:        mapperName,
-		mappedDevice:      mappedDevice,
-		fsGroup:           fsGroup,
-		volumeCapability:  req.GetVolumeCapability(),
-	}, nil
+	params.localPath = localPath
+	params.backingFile = backingFile
+	params.passphrase = passphrase
+	params.mapperName = mapperName
+	params.mappedDevice = mappedDevice
+
+	return params, nil
 }
 
 // ensureVolumeStaged ensures the volume is staged, restoring if needed after reboot
