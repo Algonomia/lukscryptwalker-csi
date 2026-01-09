@@ -80,19 +80,31 @@ func (ns *NodeServer) cleanupStaleMounts() {
 		volumeDir := filepath.Join(csiPluginPath, entry.Name())
 		globalmountPath := filepath.Join(volumeDir, "globalmount")
 
-		// Check if globalmount exists
-		if _, err := os.Stat(globalmountPath); os.IsNotExist(err) {
+		// Check if globalmount exists - use Lstat to not follow symlinks
+		_, statErr := os.Lstat(globalmountPath)
+		if os.IsNotExist(statErr) {
 			continue
 		}
 
 		klog.Infof("Found stale staging directory: %s", globalmountPath)
 
-		// Try to unmount if it's a mount point
-		if ns.isMountPoint(globalmountPath) {
+		// Check if it's a stale FUSE mount (transport endpoint not connected)
+		// This happens when rclone dies but mount point remains
+		_, err := os.Stat(globalmountPath)
+		isStaleFUSE := err != nil && (strings.Contains(err.Error(), "transport endpoint is not connected") ||
+			strings.Contains(err.Error(), "stale file handle"))
+
+		if isStaleFUSE {
+			klog.Infof("Detected stale FUSE mount at %s, lazy unmounting", globalmountPath)
+			umountCmd := exec.Command("umount", "-l", globalmountPath)
+			if err := umountCmd.Run(); err != nil {
+				klog.Warningf("umount -l failed for stale FUSE mount %s: %v", globalmountPath, err)
+			}
+		} else if ns.isMountPoint(globalmountPath) {
+			// Regular mount point
 			klog.Infof("Unmounting stale mount at %s", globalmountPath)
 			if err := ns.unmountPath(globalmountPath); err != nil {
 				klog.Warningf("Failed to unmount stale mount %s: %v, trying lazy unmount", globalmountPath, err)
-				// Try lazy unmount as fallback
 				cmd := exec.Command("umount", "-l", globalmountPath)
 				if err := cmd.Run(); err != nil {
 					klog.Warningf("Lazy unmount also failed for %s: %v", globalmountPath, err)

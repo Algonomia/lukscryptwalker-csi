@@ -73,15 +73,6 @@ func (ns *NodeServer) cleanupVolumeStaging(volumeID, stagingTargetPath string) e
 		return fmt.Errorf("failed to close LUKS device: %v", err)
 	}
 
-	// Clean up backing files and directories
-	localPath := GetLocalPath(volumeID)
-	if err := os.RemoveAll(localPath); err != nil && !os.IsNotExist(err) {
-		klog.Warningf("Failed to clean up volume directory %s: %v", localPath, err)
-		// Don't fail the unstage operation due to cleanup issues
-	} else if !os.IsNotExist(err) {
-		klog.Infof("Successfully cleaned up volume directory: %s", localPath)
-	}
-
 	// Clean up staging target directory (kubelet expects this to be removed)
 	// Use RemoveAll for S3 volumes which may have files inside
 	if err := os.RemoveAll(stagingTargetPath); err != nil && !os.IsNotExist(err) {
