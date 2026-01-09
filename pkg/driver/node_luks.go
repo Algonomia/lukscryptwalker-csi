@@ -44,27 +44,30 @@ func (ns *NodeServer) mountAndConfigureVolume(params *StagingParameters) error {
 	return nil
 }
 
-// cleanupVolumeStaging cleans up volume staging resources
+// cleanupVolumeStaging cleans up volume staging resources.
+// If stagingTargetPath is empty, only LUKS device cleanup is performed (used for orphan cleanup).
 func (ns *NodeServer) cleanupVolumeStaging(volumeID, stagingTargetPath string) error {
-	// Unmount the staging target (only if mounted)
-	if ns.isMountPoint(stagingTargetPath) {
-		// Sync filesystem to ensure all dirty pages are flushed before unmounting
-		// This is important because we close the LUKS device immediately after
-		klog.Infof("Syncing filesystem before unmount for volume %s", volumeID)
-		syncCmd := exec.Command("sync", "-f", stagingTargetPath)
-		if err := syncCmd.Run(); err != nil {
-			klog.Warningf("sync -f failed for %s: %v, trying global sync", stagingTargetPath, err)
-			// Fallback to global sync
-			globalSyncCmd := exec.Command("sync")
-			_ = globalSyncCmd.Run()
-		}
+	// Unmount the staging target (only if path provided and mounted)
+	if stagingTargetPath != "" {
+		if ns.isMountPoint(stagingTargetPath) {
+			// Sync filesystem to ensure all dirty pages are flushed before unmounting
+			// This is important because we close the LUKS device immediately after
+			klog.Infof("Syncing filesystem before unmount for volume %s", volumeID)
+			syncCmd := exec.Command("sync", "-f", stagingTargetPath)
+			if err := syncCmd.Run(); err != nil {
+				klog.Warningf("sync -f failed for %s: %v, trying global sync", stagingTargetPath, err)
+				// Fallback to global sync
+				globalSyncCmd := exec.Command("sync")
+				_ = globalSyncCmd.Run()
+			}
 
-		if err := ns.unmountPath(stagingTargetPath); err != nil {
-			klog.Errorf("Failed to unmount staging path %s: %v", stagingTargetPath, err)
-			// Continue with cleanup even if unmount fails
+			if err := ns.unmountPath(stagingTargetPath); err != nil {
+				klog.Errorf("Failed to unmount staging path %s: %v", stagingTargetPath, err)
+				// Continue with cleanup even if unmount fails
+			}
+		} else {
+			klog.V(4).Infof("Staging path %s is not mounted, skipping unmount", stagingTargetPath)
 		}
-	} else {
-		klog.V(4).Infof("Staging path %s is not mounted, skipping unmount", stagingTargetPath)
 	}
 
 	// Close LUKS device
@@ -74,11 +77,12 @@ func (ns *NodeServer) cleanupVolumeStaging(volumeID, stagingTargetPath string) e
 	}
 
 	// Clean up staging target directory (kubelet expects this to be removed)
-	// Use RemoveAll for S3 volumes which may have files inside
-	if err := os.RemoveAll(stagingTargetPath); err != nil && !os.IsNotExist(err) {
-		klog.V(4).Infof("Could not remove staging directory %s: %v (may be handled by kubelet)", stagingTargetPath, err)
-	} else if err == nil {
-		klog.Infof("Removed staging directory: %s", stagingTargetPath)
+	if stagingTargetPath != "" {
+		if err := os.RemoveAll(stagingTargetPath); err != nil && !os.IsNotExist(err) {
+			klog.V(4).Infof("Could not remove staging directory %s: %v (may be handled by kubelet)", stagingTargetPath, err)
+		} else if err == nil {
+			klog.Infof("Removed staging directory: %s", stagingTargetPath)
+		}
 	}
 
 	return nil
@@ -513,17 +517,39 @@ func (ns *NodeServer) resizeFilesystem(devicePath, volumePath string) error {
 // Backing File Operations
 // =============================================================================
 
-// ensureBackingFileExists creates the backing file if it doesn't exist
+// ensureBackingFileExists creates the backing file if it doesn't exist or is too small
 func (ns *NodeServer) ensureBackingFileExists(req *csi.NodeStageVolumeRequest, backingFile string) error {
-	if _, err := os.Stat(backingFile); os.IsNotExist(err) {
-		capacityStr := req.GetVolumeContext()["capacity"]
-		if capacityStr == "" {
-			capacityStr = "1073741824" // Default 1GB in bytes
-		}
+	capacityStr := req.GetVolumeContext()["capacity"]
+	if capacityStr == "" {
+		capacityStr = "1073741824" // Default 1GB in bytes
+	}
 
+	// LUKS2 requires at least 16MB for headers
+	minSize := int64(16 * 1024 * 1024)
+
+	fileInfo, err := os.Stat(backingFile)
+	if os.IsNotExist(err) {
+		// File doesn't exist - create it
+		klog.Infof("Creating backing file %s with capacity %s", backingFile, capacityStr)
 		if err := CreateBackingFile(backingFile, capacityStr); err != nil {
 			return fmt.Errorf("failed to create backing file: %v", err)
 		}
+	} else if err != nil {
+		return fmt.Errorf("failed to stat backing file: %v", err)
+	} else if fileInfo.Size() < minSize {
+		// File exists but is too small (possibly from failed creation)
+		klog.Warningf("Backing file %s exists but is too small (%d bytes), recreating with capacity %s",
+			backingFile, fileInfo.Size(), capacityStr)
+		// Remove the undersized file
+		if err := os.Remove(backingFile); err != nil {
+			return fmt.Errorf("failed to remove undersized backing file: %v", err)
+		}
+		// Create with proper size
+		if err := CreateBackingFile(backingFile, capacityStr); err != nil {
+			return fmt.Errorf("failed to recreate backing file: %v", err)
+		}
+	} else {
+		klog.V(4).Infof("Backing file %s exists with size %d bytes", backingFile, fileInfo.Size())
 	}
 
 	return nil

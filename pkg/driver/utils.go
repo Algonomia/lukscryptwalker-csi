@@ -29,14 +29,29 @@ func ExpandBackingFile(filePath string, newSizeBytes int64) error {
 
 // CreateBackingFile creates a backing file with the specified size
 func CreateBackingFile(filePath, size string) error {
+	klog.Infof("Creating backing file %s with size %s", filePath, size)
+
+	// Try fallocate first (works on ext4, xfs)
 	cmd := exec.Command("fallocate", "-l", size, filePath)
-	if err := cmd.Run(); err != nil {
-		// Fallback to dd if fallocate is not available
-		cmd = exec.Command("dd", "if=/dev/zero", "of="+filePath, "bs=1G", "count=1", "seek=0")
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("failed to create backing file with dd: %v", err)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		klog.Warningf("fallocate failed for %s: %v, output: %s, trying truncate", filePath, err, string(output))
+
+		// Fallback to truncate (works on all filesystems, creates sparse file)
+		cmd = exec.Command("truncate", "-s", size, filePath)
+		output, err = cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to create backing file with truncate: %v, output: %s", err, string(output))
 		}
 	}
+
+	// Verify the file was created with correct size
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to stat created backing file: %v", err)
+	}
+
+	klog.Infof("Successfully created backing file %s with size %d bytes", filePath, fileInfo.Size())
 	return nil
 }
 

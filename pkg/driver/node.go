@@ -14,6 +14,8 @@ import (
 	"github.com/lukscryptwalker-csi/pkg/secrets"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/klog"
@@ -48,6 +50,9 @@ func NewNodeServer(d *Driver) *NodeServer {
 
 	// Clean up stale mounts from previous crashes/restarts
 	ns.cleanupStaleMounts()
+
+	// Clean up orphaned volume directories (from deleted PVCs)
+	ns.cleanupOrphanedVolumes()
 
 	return ns
 }
@@ -125,6 +130,95 @@ func (ns *NodeServer) cleanupStaleMounts() {
 	}
 
 	klog.Infof("Stale mount cleanup completed")
+}
+
+// cleanupOrphanedVolumes removes volume directories for PVs that no longer exist.
+// This is needed because we preserve backing files across pod restarts, but they
+// should be cleaned up when the PV is actually deleted.
+func (ns *NodeServer) cleanupOrphanedVolumes() {
+	if ns.clientset == nil {
+		klog.Warning("Kubernetes client not available, skipping orphaned volume cleanup")
+		return
+	}
+
+	localPath := os.Getenv("CSI_LOCAL_PATH")
+	if localPath == "" {
+		localPath = DefaultLocalPath
+	}
+
+	klog.Infof("Checking for orphaned volume directories in %s", localPath)
+
+	entries, err := os.ReadDir(localPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			klog.V(4).Infof("Local path %s does not exist, no cleanup needed", localPath)
+			return
+		}
+		klog.Warningf("Failed to read local path directory %s: %v", localPath, err)
+		return
+	}
+
+	ctx := context.Background()
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		volumeID := entry.Name()
+		// Skip directories that don't look like PVC IDs
+		if !strings.HasPrefix(volumeID, "pvc-") {
+			continue
+		}
+
+		volumeDir := filepath.Join(localPath, volumeID)
+
+		// Check if this directory belongs to our driver by looking for our backing file
+		backingFile := GenerateBackingFilePath(volumeDir, volumeID)
+		if _, err := os.Stat(backingFile); os.IsNotExist(err) {
+			// No backing file with our naming convention - not our volume
+			klog.V(4).Infof("Directory %s has no LUKS backing file, skipping (belongs to another driver)", volumeDir)
+			continue
+		}
+
+		// Check if PV exists for this volume ID
+		pv, err := ns.clientset.CoreV1().PersistentVolumes().Get(ctx, volumeID, metav1.GetOptions{})
+		if err == nil {
+			// PV exists - verify it's our driver before keeping
+			if pv.Spec.CSI != nil && pv.Spec.CSI.Driver == DriverName {
+				klog.V(4).Infof("PV %s exists and belongs to our driver, keeping volume directory", volumeID)
+			}
+			continue
+		}
+
+		if !k8serrors.IsNotFound(err) {
+			// API error, skip this volume to be safe
+			klog.Warningf("Error checking PV %s: %v, skipping cleanup", volumeID, err)
+			continue
+		}
+
+		// PV not found and backing file exists - this is an orphaned volume from our driver
+		klog.Infof("Found orphaned volume directory (PV deleted): %s", volumeDir)
+
+		// Clean up S3 sync if present (safe to call even if not S3 volume)
+		if err := ns.cleanupS3Sync(volumeID); err != nil {
+			klog.Warningf("Failed to cleanup S3 sync for orphaned volume %s: %v", volumeID, err)
+		}
+
+		// Clean up LUKS device (pass empty staging path for orphan cleanup)
+		if err := ns.cleanupVolumeStaging(volumeID, ""); err != nil {
+			klog.Warningf("Failed to cleanup LUKS for orphaned volume %s: %v, skipping removal", volumeID, err)
+			continue
+		}
+
+		// Remove the orphaned directory
+		if err := os.RemoveAll(volumeDir); err != nil {
+			klog.Warningf("Failed to remove orphaned volume directory %s: %v", volumeDir, err)
+		} else {
+			klog.Infof("Successfully removed orphaned volume directory: %s", volumeDir)
+		}
+	}
+
+	klog.Infof("Orphaned volume cleanup completed")
 }
 
 // initializeKubernetesClient sets up the Kubernetes client with proper error handling
@@ -643,8 +737,3 @@ func (ns *NodeServer) getPassphraseForExpansion(ctx context.Context, scParams ma
 
 	return volSecrets.Passphrase, nil
 }
-
-// =============================================================================
-// Kubernetes Integration
-// =============================================================================
-
