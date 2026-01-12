@@ -522,11 +522,44 @@ func (ns *NodeServer) isMountedFrom(path, device string) bool {
 	return mountedFrom == device
 }
 
-// unmountPath unmounts a filesystem path
+// unmountPath unmounts a filesystem path (idempotent - succeeds if already unmounted)
 func (ns *NodeServer) unmountPath(targetPath string) error {
+	// Check if target path exists
+	_, statErr := os.Stat(targetPath)
+	if os.IsNotExist(statErr) {
+		klog.Infof("Target path %s does not exist, nothing to unmount", targetPath)
+		return nil
+	}
+
+	// Check for stale FUSE mount (transport endpoint not connected)
+	isStale := statErr != nil && (strings.Contains(statErr.Error(), "transport endpoint is not connected") ||
+		strings.Contains(statErr.Error(), "stale file handle"))
+
+	if isStale {
+		klog.Warningf("Detected stale mount at %s, using lazy unmount", targetPath)
+		cmd := exec.Command("umount", "-l", targetPath)
+		if err := cmd.Run(); err != nil {
+			klog.Warningf("Lazy unmount of stale mount %s failed: %v", targetPath, err)
+		}
+		return nil
+	}
+
+	// Check if it's actually a mount point
+	if !ns.isMountPoint(targetPath) {
+		klog.Infof("Target path %s is not a mount point, nothing to unmount", targetPath)
+		return nil
+	}
+
+	// Try normal unmount
 	cmd := exec.Command("umount", targetPath)
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to unmount %s: %v", targetPath, err)
+		klog.Warningf("Normal unmount of %s failed: %v, trying lazy unmount", targetPath, err)
+		// Fallback to lazy unmount
+		lazyCmd := exec.Command("umount", "-l", targetPath)
+		if lazyErr := lazyCmd.Run(); lazyErr != nil {
+			return fmt.Errorf("failed to unmount %s (lazy also failed: %v): %v", targetPath, lazyErr, err)
+		}
+		klog.Infof("Lazy unmount of %s succeeded", targetPath)
 	}
 	return nil
 }
