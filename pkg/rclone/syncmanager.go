@@ -168,10 +168,89 @@ func (mm *MountManager) Mount() error {
 		return fmt.Errorf("failed to mount: %w", err)
 	}
 
-	mm.cryptRemote = cryptRemote // Store for VFS operations
+	// Resolve the actual VFS name that rclone assigned (may have suffix like [0], [1] for multiple mounts)
+	vfsName := mm.resolveVFSName(cryptRemote)
+	mm.cryptRemote = vfsName
 	mm.mounted = true
-	klog.Infof("Successfully mounted encrypted S3 volume %s at %s", mm.volumeID, mm.mountPoint)
+	klog.Infof("Successfully mounted encrypted S3 volume %s at %s (vfs: %s)", mm.volumeID, mm.mountPoint, vfsName)
 	return nil
+}
+
+// resolveVFSName finds the actual VFS name assigned by rclone for our mount.
+// When multiple VFS instances exist for similar remotes, rclone assigns suffixes like [0], [1].
+// This function queries vfs/list to find the correct VFS name for our mount.
+func (mm *MountManager) resolveVFSName(cryptRemote string) string {
+	result, err := RPC("vfs/list", map[string]interface{}{})
+	if err != nil {
+		klog.V(4).Infof("vfs/list failed, using original remote: %v", err)
+		return cryptRemote
+	}
+
+	if result == nil || result.Output == nil {
+		return cryptRemote
+	}
+
+	// vfs/list returns {"vfses": ["remote1:", "remote2:[0]", "remote2:[1]", ...]}
+	vfses, ok := result.Output["vfses"]
+	if !ok {
+		return cryptRemote
+	}
+
+	vfsList, ok := vfses.([]interface{})
+	if !ok {
+		return cryptRemote
+	}
+
+	// Look for exact match first
+	for _, v := range vfsList {
+		vfsName, ok := v.(string)
+		if !ok {
+			continue
+		}
+		if vfsName == cryptRemote {
+			klog.V(4).Infof("Found exact VFS match: %s", vfsName)
+			return vfsName
+		}
+	}
+
+	// Look for suffixed version (e.g., cryptRemote + "[0]", "[1]", etc.)
+	// Find the highest suffix to get the most recently created one
+	var bestMatch string
+	highestSuffix := -1
+	for _, v := range vfsList {
+		vfsName, ok := v.(string)
+		if !ok {
+			continue
+		}
+		// Check if this VFS name starts with our remote (accounting for potential suffix)
+		if len(vfsName) >= len(cryptRemote) && vfsName[:len(cryptRemote)] == cryptRemote {
+			// Extract suffix number if present
+			suffix := vfsName[len(cryptRemote):]
+			if suffix == "" {
+				if highestSuffix < 0 {
+					bestMatch = vfsName
+					highestSuffix = 0
+				}
+			} else if len(suffix) >= 3 && suffix[0] == '[' && suffix[len(suffix)-1] == ']' {
+				// Parse [N] suffix
+				var num int
+				if _, err := fmt.Sscanf(suffix, "[%d]", &num); err == nil {
+					if num > highestSuffix {
+						bestMatch = vfsName
+						highestSuffix = num
+					}
+				}
+			}
+		}
+	}
+
+	if bestMatch != "" {
+		klog.V(4).Infof("Found VFS match with suffix: %s (for volume %s)", bestMatch, mm.volumeID)
+		return bestMatch
+	}
+
+	klog.V(4).Infof("No VFS match found, using original remote for volume %s", mm.volumeID)
+	return cryptRemote
 }
 
 // buildVFSOpt builds VFS options for the mount
