@@ -182,7 +182,7 @@ func (mm *MountManager) Mount() error {
 	vfsName := mm.resolveVFSName(cryptRemote)
 	mm.cryptRemote = vfsName
 	mm.mounted = true
-	klog.Infof("Successfully mounted encrypted S3 volume %s at %s (vfs: %s)", mm.volumeID, mm.mountPoint, vfsName)
+	klog.Infof("Successfully mounted encrypted S3 volume %s at %s", mm.volumeID, mm.mountPoint)
 	return nil
 }
 
@@ -218,7 +218,7 @@ func (mm *MountManager) resolveVFSName(cryptRemote string) string {
 			continue
 		}
 		if vfsName == cryptRemote {
-			klog.V(4).Infof("Found exact VFS match: %s", vfsName)
+			klog.V(4).Infof("Found exact VFS match for volume %s", mm.volumeID)
 			return vfsName
 		}
 	}
