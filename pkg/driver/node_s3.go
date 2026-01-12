@@ -30,15 +30,42 @@ const (
 
 // S3SyncManager holds mount managers for active S3 volumes
 type S3SyncManager struct {
-	mountManagers map[string]*rclone.MountManager // volumeID -> mount manager
-	mutex         sync.RWMutex
+	mountManagers  map[string]*rclone.MountManager // volumeID -> mount manager
+	volumesInSetup map[string]bool                 // volumes currently being set up (to prevent stale detection race)
+	mutex          sync.RWMutex
+	setupMutex     sync.RWMutex // protects volumesInSetup
 }
 
 // NewS3SyncManager creates a new S3 sync manager
 func NewS3SyncManager() *S3SyncManager {
 	return &S3SyncManager{
-		mountManagers: make(map[string]*rclone.MountManager),
+		mountManagers:  make(map[string]*rclone.MountManager),
+		volumesInSetup: make(map[string]bool),
 	}
+}
+
+// markVolumeSetupInProgress marks a volume as currently being set up
+// This prevents the stale mount detector from interfering with setup
+func (sm *S3SyncManager) markVolumeSetupInProgress(volumeID string) {
+	sm.setupMutex.Lock()
+	defer sm.setupMutex.Unlock()
+	sm.volumesInSetup[volumeID] = true
+	klog.V(4).Infof("Marked volume %s as setup in progress", volumeID)
+}
+
+// markVolumeSetupComplete removes the volume from the setup-in-progress set
+func (sm *S3SyncManager) markVolumeSetupComplete(volumeID string) {
+	sm.setupMutex.Lock()
+	defer sm.setupMutex.Unlock()
+	delete(sm.volumesInSetup, volumeID)
+	klog.V(4).Infof("Marked volume %s setup as complete", volumeID)
+}
+
+// isVolumeSetupInProgress checks if a volume is currently being set up
+func (sm *S3SyncManager) isVolumeSetupInProgress(volumeID string) bool {
+	sm.setupMutex.RLock()
+	defer sm.setupMutex.RUnlock()
+	return sm.volumesInSetup[volumeID]
 }
 
 // isS3Backend checks if the volume is configured for S3 backend
@@ -75,6 +102,11 @@ func (ns *NodeServer) setupS3Volume(params *StagingParameters, volumeContext, se
 // setupS3Sync initializes S3 mount for a volume using rclone mount mode
 func (ns *NodeServer) setupS3Sync(volumeID, stagingPath string, volumeContext map[string]string, _ map[string]string) error {
 	klog.Infof("Setting up S3 mount for volume %s", volumeID)
+
+	// Mark volume as setup in progress to prevent stale mount detection from interfering
+	ns.s3SyncMgr.markVolumeSetupInProgress(volumeID)
+	defer ns.s3SyncMgr.markVolumeSetupComplete(volumeID)
+
 	ctx := context.Background()
 
 	// Get StorageClass parameters for S3 credentials secret reference
@@ -283,6 +315,12 @@ func (ns *NodeServer) cleanupStaleS3Mounts() {
 				klog.Warningf("Could not determine volume ID for %s, will unmount only", volumeDir)
 				ns.unmountStaleS3Mount(globalmountPath)
 			}
+			continue
+		}
+
+		// Skip if this volume is currently being set up (prevents race condition)
+		if ns.s3SyncMgr.isVolumeSetupInProgress(volumeID) {
+			klog.V(4).Infof("Volume %s is currently being set up, skipping stale detection", volumeID)
 			continue
 		}
 
