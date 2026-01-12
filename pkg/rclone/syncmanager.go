@@ -40,6 +40,7 @@ type MountManager struct {
 	volumeID       string
 	mountPoint     string
 	s3BasePath     string
+	cryptRemote    string // The crypt remote string (e.g., :crypt{...}:) used for VFS operations
 	mounted        bool
 	mutex          sync.RWMutex
 	luksPassphrase string
@@ -167,6 +168,7 @@ func (mm *MountManager) Mount() error {
 		return fmt.Errorf("failed to mount: %w", err)
 	}
 
+	mm.cryptRemote = cryptRemote // Store for VFS operations
 	mm.mounted = true
 	klog.Infof("Successfully mounted encrypted S3 volume %s at %s", mm.volumeID, mm.mountPoint)
 	return nil
@@ -314,12 +316,14 @@ func (mm *MountManager) waitForPendingUploads() {
 	}
 
 	// Also try to flush the VFS cache before unmounting
-	_, err := RPC("vfs/refresh", map[string]interface{}{
-		"fs":        mm.mountPoint,
-		"recursive": true,
-	})
-	if err != nil {
-		klog.V(4).Infof("vfs/refresh returned error (may be normal if already unmounted): %v", err)
+	if mm.cryptRemote != "" {
+		_, err := RPC("vfs/refresh", map[string]interface{}{
+			"fs":        mm.cryptRemote,
+			"recursive": true,
+		})
+		if err != nil {
+			klog.V(4).Infof("vfs/refresh returned error (may be normal if already unmounted): %v", err)
+		}
 	}
 
 	klog.Infof("Finished waiting for pending uploads for volume %s", mm.volumeID)
@@ -679,9 +683,16 @@ func (mm *MountManager) unmountFilesystem(mountPath string) error {
 
 // ForceSync flushes any cached writes
 func (mm *MountManager) ForceSync() error {
+	// Skip if we don't have the cryptRemote stored (mount didn't complete)
+	if mm.cryptRemote == "" {
+		klog.V(4).Infof("No cryptRemote stored for volume %s, skipping vfs/refresh", mm.volumeID)
+		return nil
+	}
+
 	// With rclone mount via librclone, we can use vfs/refresh to ensure cache is flushed
+	// Note: VFS operations require the remote string (e.g., :crypt{...}:), not the mount path
 	params := map[string]interface{}{
-		"fs":        mm.mountPoint,
+		"fs":        mm.cryptRemote,
 		"recursive": true,
 	}
 
