@@ -353,6 +353,20 @@ func (mm *MountManager) Unmount() error {
 func (mm *MountManager) waitForPendingUploads() {
 	klog.Infof("Waiting for pending uploads to complete for volume %s", mm.volumeID)
 
+	// First, wait for the write-back duration to ensure cached writes are flushed
+	// The write-back delay means files may not start uploading until this time elapses
+	writeBackWait := 5 // Default 5 seconds
+	if mm.vfsConfig.WriteBack != "" {
+		if ns, err := parseDurationToNs(mm.vfsConfig.WriteBack); err == nil {
+			writeBackWait = int(ns / 1e9) // Convert nanoseconds to seconds
+		}
+	}
+	// Add a small buffer to ensure write-back has completed
+	writeBackWait += 2
+	klog.Infof("Waiting %d seconds for write-back to complete for volume %s", writeBackWait, mm.volumeID)
+	sleepCmd := exec.Command("sleep", fmt.Sprintf("%d", writeBackWait))
+	_ = sleepCmd.Run()
+
 	maxWaitTime := 300 // 5 minutes max wait
 	pollInterval := 2  // Check every 2 seconds
 
