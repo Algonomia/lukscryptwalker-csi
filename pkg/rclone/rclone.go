@@ -23,6 +23,7 @@ var (
 	initOnce sync.Once
 	initDone bool
 	initMu   sync.Mutex
+	MountMu  sync.Mutex // Mutex to serialize mounts for setting per-volume cache directory
 )
 
 // Initialize initializes librclone (call once at startup)
@@ -173,4 +174,28 @@ func DeleteVolumeData(s3Config *S3Config, volumeID string, s3PathPrefix string) 
 // contains checks if a string contains a substring
 func contains(s, substr string) bool {
 	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
+}
+
+// SetCacheDir sets the global rclone cache directory
+// This must be called before mounting to ensure the VFS uses the correct cache location
+// Note: CacheDir is a global config option, not a per-VFS option, so mounts must be serialized
+func SetCacheDir(cacheDir string) error {
+	if err := Initialize(); err != nil {
+		return fmt.Errorf("failed to initialize librclone: %w", err)
+	}
+
+	// Use options/set to set the main CacheDir option
+	params := map[string]interface{}{
+		"main": map[string]interface{}{
+			"CacheDir": cacheDir,
+		},
+	}
+
+	_, err := RPC("options/set", params)
+	if err != nil {
+		return fmt.Errorf("failed to set CacheDir: %w", err)
+	}
+
+	klog.Infof("Set global rclone CacheDir to: %s", cacheDir)
+	return nil
 }

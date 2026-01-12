@@ -145,12 +145,8 @@ func (mm *MountManager) Mount() error {
 		"DirCacheTime":  300000000000, // 5 minutes in nanoseconds
 	}
 
-	// Build VFS options, using encrypted cache path if available
+	// Build VFS options
 	vfsOpt := mm.buildVFSOpt()
-	if encryptedCachePath != "" {
-		vfsOpt["CacheDir"] = encryptedCachePath
-		klog.Infof("Using encrypted cache directory: %s", encryptedCachePath)
-	}
 
 	// Call mount/mount RPC
 	params := map[string]interface{}{
@@ -161,6 +157,20 @@ func (mm *MountManager) Mount() error {
 	}
 
 	klog.V(4).Infof("Calling mount/mount RPC for volume %s", mm.volumeID)
+
+	// CacheDir is a global rclone option, not a per-VFS option.
+	// We must serialize mounts and set the global CacheDir before each mount
+	// to ensure each VFS uses its own encrypted cache directory.
+	MountMu.Lock()
+	defer MountMu.Unlock()
+
+	if encryptedCachePath != "" {
+		if err := SetCacheDir(encryptedCachePath); err != nil {
+			_ = mm.teardownEncryptedCache() // Best effort cleanup
+			return fmt.Errorf("failed to set cache directory: %w", err)
+		}
+		klog.Infof("Set encrypted cache directory for volume %s: %s", mm.volumeID, encryptedCachePath)
+	}
 
 	_, err = RPC("mount/mount", params)
 	if err != nil {
