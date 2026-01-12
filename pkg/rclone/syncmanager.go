@@ -398,7 +398,7 @@ func (mm *MountManager) waitForPendingUploads() {
 	if mm.cryptRemote != "" {
 		_, err := RPC("vfs/refresh", map[string]interface{}{
 			"fs":        mm.cryptRemote,
-			"recursive": true,
+			"recursive": "true",
 		})
 		if err != nil {
 			klog.V(4).Infof("vfs/refresh returned error (may be normal if already unmounted): %v", err)
@@ -772,7 +772,7 @@ func (mm *MountManager) ForceSync() error {
 	// Note: VFS operations require the remote string (e.g., :crypt{...}:), not the mount path
 	params := map[string]interface{}{
 		"fs":        mm.cryptRemote,
-		"recursive": true,
+		"recursive": "true",
 	}
 
 	_, err := RPC("vfs/refresh", params)
