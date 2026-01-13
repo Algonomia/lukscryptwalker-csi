@@ -46,12 +46,6 @@ func main() {
 		klog.Fatal("NodeID cannot be empty")
 	}
 
-	// Initialize rclone for S3 sync functionality
-	if err := rclone.Initialize(); err != nil {
-		klog.Fatalf("Failed to initialize rclone: %v", err)
-	}
-	defer rclone.Finalize()
-
 	// Set up encrypted VFS cache volume (only for nodes, skip for controller)
 	if !isControllerMode(*endpoint) {
 		// Create Kubernetes client to fetch secrets
@@ -97,14 +91,20 @@ func main() {
 			}
 		}()
 
-		// Set the cache directory in rclone's global configuration via RC API
+		// Create rclone config file with cache directory BEFORE initializing
 		if err := rclone.SetGlobalCacheDir(vfsCachePath); err != nil {
-			klog.Fatalf("Failed to set rclone cache directory: %v", err)
+			klog.Fatalf("Failed to create rclone config with cache directory: %v", err)
 		}
-		klog.Infof("Set rclone cache directory to encrypted volume: %s", vfsCachePath)
+		klog.Infof("Created rclone config with cache directory: %s", vfsCachePath)
 	} else {
 		klog.Info("Skipping VFS cache setup (controller mode)")
 	}
+
+    // Initialize rclone for S3 sync functionality
+    if err := rclone.Initialize(); err != nil {
+        klog.Fatalf("Failed to initialize rclone: %v", err)
+    }
+    defer rclone.Finalize()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
