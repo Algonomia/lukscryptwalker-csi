@@ -169,19 +169,25 @@ func (mm *MountManager) resolveVFSName(cryptRemote string) string {
 	}
 
 	if result == nil || result.Output == nil {
+		klog.Infof("vfs/list returned nil result for volume %s", mm.volumeID)
 		return cryptRemote
 	}
 
 	// vfs/list returns {"vfses": ["remote1:", "remote2:[0]", "remote2:[1]", ...]}
 	vfses, ok := result.Output["vfses"]
 	if !ok {
+		klog.Infof("vfs/list output missing 'vfses' key for volume %s", mm.volumeID)
 		return cryptRemote
 	}
 
 	vfsList, ok := vfses.([]interface{})
 	if !ok {
+		klog.Infof("vfs/list 'vfses' is not a list for volume %s", mm.volumeID)
 		return cryptRemote
 	}
+
+	// Debug: log all VFS instances
+	klog.Infof("Available VFS instances for volume %s: %+v (looking for: %s)", mm.volumeID, vfsList, cryptRemote)
 
 	// Look for exact match first
 	for _, v := range vfsList {
