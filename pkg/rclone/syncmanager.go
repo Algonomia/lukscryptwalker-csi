@@ -11,6 +11,10 @@ import (
 	"k8s.io/klog"
 )
 
+// Global mount mutex to ensure mount operations are sequential
+// This prevents race conditions when multiple volumes are mounted simultaneously
+var globalMountMu sync.Mutex
+
 // VFSCacheConfig holds VFS cache configuration options
 type VFSCacheConfig struct {
 	CacheMode    string // off, minimal, writes, full
@@ -88,8 +92,8 @@ func NewMountManager(s3Config *S3Config, volumeID, mountPoint, luksPassphrase st
 
 // Mount mounts the encrypted S3 remote at the mount point using librclone
 func (mm *MountManager) Mount() error {
-	mm.mutex.Lock()
-	defer mm.mutex.Unlock()
+	globalMountMu.Unlock()
+	defer globalMountMu.Unlock()
 
 	if mm.mounted && mm.isMountPoint() {
 		klog.Infof("Volume %s already mounted at %s", mm.volumeID, mm.mountPoint)
@@ -143,10 +147,6 @@ func (mm *MountManager) Mount() error {
 	}
 
 	klog.V(4).Infof("Calling mount/mount RPC for volume %s", mm.volumeID)
-
-	// Note: VFS cache directory is now set globally at startup via RCLONE_CACHE_DIR
-	// Each mount will automatically use subdirectories within that encrypted volume
-	// based on their crypt remote identifier (e.g., :crypt{xxxxx})
 
 	_, err = RPC("mount/mount", params)
 	if err != nil {

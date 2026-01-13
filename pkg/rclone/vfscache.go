@@ -13,7 +13,8 @@ import (
 
 const (
 	// VFSCacheBasePath is the base path for the encrypted VFS cache
-	VFSCacheBasePath = "/var/lib/lukscrypt-vfs-cache"
+	// Mount directly at rclone's default cache location
+	VFSCacheBasePath = "/root/.cache/rclone"
 	// VFSCacheMapperName is the LUKS mapper name for VFS cache
 	VFSCacheMapperName = "luks-vfs-cache"
 	// VFSCacheBackingFile is the backing file for VFS cache LUKS volume
@@ -23,7 +24,8 @@ const (
 // SetupVFSCache creates and mounts an encrypted LUKS volume for VFS cache
 // Returns the mount path or empty string if setup fails
 func SetupVFSCache(sizeStr string, passphrase string) (string, error) {
-	mountPath := filepath.Join(VFSCacheBasePath, "mount")
+	// Mount directly at the rclone cache base path
+	mountPath := VFSCacheBasePath
 
 	// Parse size string to bytes (default to 20GB if parsing fails)
 	cacheSize := int64(20 * 1024 * 1024 * 1024) // 20GB default
@@ -121,7 +123,7 @@ func SetupVFSCache(sizeStr string, passphrase string) (string, error) {
 
 // TeardownVFSCache unmounts and closes the encrypted VFS cache
 func TeardownVFSCache() error {
-	mountPath := filepath.Join(VFSCacheBasePath, "mount")
+	mountPath := VFSCacheBasePath
 	luksManager := luks.NewLUKSManager()
 
 	klog.Infof("Tearing down encrypted VFS cache")

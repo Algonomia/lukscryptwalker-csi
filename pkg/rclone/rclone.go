@@ -3,8 +3,6 @@ package rclone
 import (
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 
@@ -45,30 +43,6 @@ func Initialize() error {
 	return nil
 }
 
-// SetGlobalCacheDir creates a config file with the cache directory setting
-func SetGlobalCacheDir(cacheDir string) error {
-	// Create config directory if it doesn't exist
-	configDir := "/root/.config/rclone"
-	if err := os.MkdirAll(configDir, 0700); err != nil {
-		return fmt.Errorf("failed to create config directory: %w", err)
-	}
-
-	// Create config file path
-	configPath := filepath.Join(configDir, "rclone.conf")
-
-	// Create config content with cache directory
-	// Using the format rclone expects for global settings
-	// Note: rclone uses underscores in config file (cache_dir not cache-dir)
-	configContent := fmt.Sprintf("# Global settings\ncache_dir = %s\n", cacheDir)
-
-	// Write the config file
-	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
-		return fmt.Errorf("failed to write rclone config: %w", err)
-	}
-
-	klog.Infof("Successfully created rclone config at %s with cache directory: %s", configPath, cacheDir)
-	return nil
-}
 
 // Finalize cleans up librclone resources
 func Finalize() {

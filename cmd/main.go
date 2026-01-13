@@ -91,11 +91,9 @@ func main() {
 			}
 		}()
 
-		// Create rclone config file with cache directory BEFORE initializing
-		if err := rclone.SetGlobalCacheDir(vfsCachePath); err != nil {
-			klog.Fatalf("Failed to create rclone config with cache directory: %v", err)
-		}
-		klog.Infof("Created rclone config with cache directory: %s", vfsCachePath)
+		// The encrypted VFS cache is now mounted directly at /root/.cache/rclone
+		// so rclone will automatically use it without any configuration
+		klog.Infof("Encrypted VFS cache mounted at rclone's default location: %s", vfsCachePath)
 	} else {
 		klog.Info("Skipping VFS cache setup (controller mode)")
 	}
