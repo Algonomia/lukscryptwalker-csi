@@ -83,7 +83,9 @@ func main() {
 	}()
 
 	// Set environment variable before initialization
-	os.Setenv("RCLONE_CACHE_DIR", vfsCachePath)
+	if err := os.Setenv("RCLONE_CACHE_DIR", vfsCachePath); err != nil {
+		klog.Fatalf("Failed to set RCLONE_CACHE_DIR environment variable: %v", err)
+	}
 	klog.Infof("Set RCLONE_CACHE_DIR to encrypted volume: %s", vfsCachePath)
 
 	// Initialize rclone for S3 sync functionality
