@@ -43,6 +43,23 @@ func Initialize() error {
 	return nil
 }
 
+// SetGlobalCacheDir sets the global cache directory for rclone via RC API
+func SetGlobalCacheDir(cacheDir string) error {
+	params := map[string]interface{}{
+		"main": map[string]interface{}{
+			"CacheDir": cacheDir,
+		},
+	}
+
+	_, err := RPC("options/set", params)
+	if err != nil {
+		return fmt.Errorf("failed to set global cache directory: %w", err)
+	}
+
+	klog.Infof("Successfully set global cache directory to: %s", cacheDir)
+	return nil
+}
+
 // Finalize cleans up librclone resources
 func Finalize() {
 	initMu.Lock()
