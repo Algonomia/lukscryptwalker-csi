@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/lukscryptwalker-csi/pkg/driver"
@@ -25,6 +26,13 @@ var (
 	luksSecretNamespace = flag.String("luks-secret-namespace", "kube-system", "Namespace of the LUKS secret")
 	luksSecretKey = flag.String("luks-secret-key", "passphrase", "Key within the secret containing the passphrase")
 )
+
+// isControllerMode detects if we're running in controller mode based on the endpoint path
+func isControllerMode(endpoint string) bool {
+	// Controller uses: unix:///var/lib/csi/sockets/pluginproxy/csi.sock
+	// Node uses: unix:///csi/csi.sock
+	return strings.Contains(endpoint, "/var/lib/csi/sockets/pluginproxy/")
+}
 
 func main() {
 	flag.Parse()
@@ -69,24 +77,28 @@ func main() {
 		klog.Fatal("LUKS passphrase is empty in secret")
 	}
 
-	// Set up encrypted VFS cache volume using the passphrase from secret
-	// Combine with node ID to ensure uniqueness per node
-	vfsCachePassphrase := fmt.Sprintf("%s-%s", volSecrets.Passphrase, *nodeID)
-	vfsCachePath, err := rclone.SetupVFSCache(*vfsCacheSize, vfsCachePassphrase)
-	if err != nil {
-		klog.Fatalf("Failed to set up encrypted VFS cache: %v", err)
-	}
-	defer func() {
-		if err := rclone.TeardownVFSCache(); err != nil {
-			klog.Errorf("Failed to teardown VFS cache: %v", err)
+	// Set up encrypted VFS cache volume (only for nodes, skip for controller)
+	if !isControllerMode(*endpoint) {
+		// Combine with node ID to ensure uniqueness per node
+		vfsCachePassphrase := fmt.Sprintf("%s-%s", volSecrets.Passphrase, *nodeID)
+		vfsCachePath, err := rclone.SetupVFSCache(*vfsCacheSize, vfsCachePassphrase)
+		if err != nil {
+			klog.Fatalf("Failed to set up encrypted VFS cache: %v", err)
 		}
-	}()
+		defer func() {
+			if err := rclone.TeardownVFSCache(); err != nil {
+				klog.Errorf("Failed to teardown VFS cache: %v", err)
+			}
+		}()
 
-	// Set environment variable before initialization
-	if err := os.Setenv("RCLONE_CACHE_DIR", vfsCachePath); err != nil {
-		klog.Fatalf("Failed to set RCLONE_CACHE_DIR environment variable: %v", err)
+		// Set environment variable before initialization
+		if err := os.Setenv("RCLONE_CACHE_DIR", vfsCachePath); err != nil {
+			klog.Fatalf("Failed to set RCLONE_CACHE_DIR environment variable: %v", err)
+		}
+		klog.Infof("Set RCLONE_CACHE_DIR to encrypted volume: %s", vfsCachePath)
+	} else {
+		klog.Info("Skipping VFS cache setup (controller mode)")
 	}
-	klog.Infof("Set RCLONE_CACHE_DIR to encrypted volume: %s", vfsCachePath)
 
 	// Initialize rclone for S3 sync functionality
 	if err := rclone.Initialize(); err != nil {

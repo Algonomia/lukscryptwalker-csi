@@ -60,9 +60,6 @@ spec:
         - "--endpoint=$(CSI_ENDPOINT)"
         - "--nodeid=$(KUBE_NODE_NAME)"
         - "--vfs-cache-size={{ .Values.node.vfsCacheSize }}"
-        - "--luks-secret-name={{ .Values.secret.name }}"
-        - "--luks-secret-namespace={{ .Values.secret.namespace }}"
-        - "--luks-secret-key={{ .Values.secret.passphraseKey }}"
         env:
         - name: CSI_ENDPOINT
           value: unix:///var/lib/csi/sockets/pluginproxy/csi.sock
