@@ -43,6 +43,9 @@ controller:
 
 # Node configuration
 node:
+  # VFS cache configuration
+  vfsCacheSize: "20G"  # Size of the encrypted LUKS volume for VFS cache
+
   # Sidecar images
   sidecars:
     nodeDriverRegistrar:

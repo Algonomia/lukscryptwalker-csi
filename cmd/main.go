@@ -10,6 +10,9 @@ import (
 
 	"github.com/lukscryptwalker-csi/pkg/driver"
 	"github.com/lukscryptwalker-csi/pkg/rclone"
+	"github.com/lukscryptwalker-csi/pkg/secrets"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/klog"
 )
 
@@ -17,6 +20,10 @@ var (
 	endpoint = flag.String("endpoint", "unix:///tmp/csi.sock", "CSI endpoint")
 	nodeID   = flag.String("nodeid", "", "node id")
 	version  = flag.Bool("version", false, "Print the version and exit.")
+	vfsCacheSize = flag.String("vfs-cache-size", "20G", "Size of the encrypted LUKS volume for VFS cache")
+	luksSecretName = flag.String("luks-secret-name", "luks-secret", "Name of the Kubernetes secret containing LUKS passphrase")
+	luksSecretNamespace = flag.String("luks-secret-namespace", "kube-system", "Namespace of the LUKS secret")
+	luksSecretKey = flag.String("luks-secret-key", "passphrase", "Key within the secret containing the passphrase")
 )
 
 func main() {
@@ -30,6 +37,54 @@ func main() {
 	if *nodeID == "" {
 		klog.Fatal("NodeID cannot be empty")
 	}
+
+	// Create Kubernetes client to fetch secrets
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		klog.Fatalf("Failed to get in-cluster config: %v", err)
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		klog.Fatalf("Failed to create kubernetes client: %v", err)
+	}
+
+	// Fetch LUKS passphrase from Kubernetes secret
+	secretsManager := secrets.NewSecretsManager(clientset)
+
+	secretParams := secrets.SecretParams{
+		LUKSSecret: secrets.SecretReference{
+			Name:      *luksSecretName,
+			Namespace: *luksSecretNamespace,
+		},
+		PassphraseKey: *luksSecretKey,
+	}
+
+	volSecrets, err := secretsManager.FetchVolumeSecrets(context.Background(), secretParams)
+	if err != nil {
+		klog.Fatalf("Failed to fetch LUKS passphrase from secret: %v", err)
+	}
+
+	if volSecrets.Passphrase == "" {
+		klog.Fatal("LUKS passphrase is empty in secret")
+	}
+
+	// Set up encrypted VFS cache volume using the passphrase from secret
+	// Combine with node ID to ensure uniqueness per node
+	vfsCachePassphrase := fmt.Sprintf("%s-%s", volSecrets.Passphrase, *nodeID)
+	vfsCachePath, err := rclone.SetupVFSCache(*vfsCacheSize, vfsCachePassphrase)
+	if err != nil {
+		klog.Fatalf("Failed to set up encrypted VFS cache: %v", err)
+	}
+	defer func() {
+		if err := rclone.TeardownVFSCache(); err != nil {
+			klog.Errorf("Failed to teardown VFS cache: %v", err)
+		}
+	}()
+
+	// Set environment variable before initialization
+	os.Setenv("RCLONE_CACHE_DIR", vfsCachePath)
+	klog.Infof("Set RCLONE_CACHE_DIR to encrypted volume: %s", vfsCachePath)
 
 	// Initialize rclone for S3 sync functionality
 	if err := rclone.Initialize(); err != nil {

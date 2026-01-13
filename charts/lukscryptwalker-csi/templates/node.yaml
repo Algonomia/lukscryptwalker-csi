@@ -58,6 +58,10 @@ spec:
         args:
         - "--endpoint=$(CSI_ENDPOINT)"
         - "--nodeid=$(KUBE_NODE_NAME)"
+        - "--vfs-cache-size={{ .Values.node.vfsCacheSize }}"
+        - "--luks-secret-name={{ .Values.secret.name }}"
+        - "--luks-secret-namespace={{ .Values.secret.namespace }}"
+        - "--luks-secret-key={{ .Values.secret.passphraseKey }}"
         env:
         - name: CSI_ENDPOINT
           value: unix:///csi/csi.sock
@@ -80,6 +84,9 @@ spec:
           mountPropagation: "Bidirectional"
         - name: cache-dir
           mountPath: /var/lib/lukscrypt-cache
+          mountPropagation: "Bidirectional"
+        - name: vfs-cache-dir
+          mountPath: /var/lib/lukscrypt-vfs-cache
           mountPropagation: "Bidirectional"
         {{- with .Values.node.resources }}
         resources:
@@ -108,6 +115,10 @@ spec:
       - name: cache-dir
         hostPath:
           path: /var/lib/lukscrypt-cache
+          type: DirectoryOrCreate
+      - name: vfs-cache-dir
+        hostPath:
+          path: /var/lib/lukscrypt-vfs-cache
           type: DirectoryOrCreate
       {{- with .Values.node.nodeSelector }}
       nodeSelector:

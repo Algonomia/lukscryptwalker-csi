@@ -158,19 +158,9 @@ func (mm *MountManager) Mount() error {
 
 	klog.V(4).Infof("Calling mount/mount RPC for volume %s", mm.volumeID)
 
-	// CacheDir is a global rclone option, not a per-VFS option.
-	// We must serialize mounts and set the global CacheDir before each mount
-	// to ensure each VFS uses its own encrypted cache directory.
-	MountMu.Lock()
-	defer MountMu.Unlock()
-
-	if encryptedCachePath != "" {
-		if err := SetCacheDir(encryptedCachePath); err != nil {
-			_ = mm.teardownEncryptedCache() // Best effort cleanup
-			return fmt.Errorf("failed to set cache directory: %w", err)
-		}
-		klog.Infof("Set encrypted cache directory for volume %s: %s", mm.volumeID, encryptedCachePath)
-	}
+	// Note: VFS cache directory is now set globally at startup via RCLONE_CACHE_DIR
+	// Each mount will automatically use subdirectories within that encrypted volume
+	// based on their crypt remote identifier (e.g., :crypt{xxxxx})
 
 	_, err = RPC("mount/mount", params)
 	if err != nil {
@@ -306,11 +296,6 @@ func (mm *MountManager) buildVFSOpt() map[string]interface{} {
 		if ns, err := parseDurationToNs(mm.vfsConfig.WriteBack); err == nil {
 			vfsOpt["WriteBack"] = ns
 		}
-	}
-
-	// Cache directory
-	if mm.vfsConfig.CacheDir != "" {
-		vfsOpt["CacheDir"] = mm.vfsConfig.CacheDir
 	}
 
 	return vfsOpt
