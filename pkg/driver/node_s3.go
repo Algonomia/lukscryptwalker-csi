@@ -145,7 +145,7 @@ func (ns *NodeServer) setupS3Sync(volumeID, stagingPath string, volumeContext ma
 	s3PathPrefix := volumeContext[S3PathPrefixParam]
 
 	// Create rclone mount manager
-	mountMgr, err := rclone.NewMountManager(s3Config, volumeID, stagingPath, passphrase, vfsConfig, s3PathPrefix)
+	mountMgr, err := rclone.NewMountManager(s3Config, volumeID, stagingPath, vfsConfig, s3PathPrefix, passphrase)
 	if err != nil {
 		return fmt.Errorf("failed to create rclone mount manager: %v", err)
 	}
@@ -229,9 +229,6 @@ func (ns *NodeServer) cleanupS3Sync(volumeID string) error {
 		}
 		delete(ns.s3SyncMgr.mountManagers, volumeID)
 	}
-
-	// Delete cache backing file to free up disk space
-	ns.cleanupCacheBackingFile(volumeID)
 
 	klog.Infof("S3 mount cleanup completed for volume %s", volumeID)
 	return nil
@@ -536,27 +533,3 @@ func (ns *NodeServer) unmountStaleS3Mount(mountPath string) {
 	}
 }
 
-// cleanupCacheBackingFile removes the LUKS cache backing file for a volume
-func (ns *NodeServer) cleanupCacheBackingFile(volumeID string) {
-	cacheBasePath := rclone.DefaultCacheBasePath
-	backingFile := filepath.Join(cacheBasePath, "backing", fmt.Sprintf("%s.luks", volumeID))
-	mountPath := filepath.Join(cacheBasePath, "mounts", volumeID)
-
-	// Remove backing file
-	if err := os.Remove(backingFile); err != nil {
-		if !os.IsNotExist(err) {
-			klog.Warningf("Failed to remove cache backing file %s: %v", backingFile, err)
-		}
-	} else {
-		klog.Infof("Removed cache backing file: %s", backingFile)
-	}
-
-	// Remove mount directory
-	if err := os.RemoveAll(mountPath); err != nil {
-		if !os.IsNotExist(err) {
-			klog.Warningf("Failed to remove cache mount directory %s: %v", mountPath, err)
-		}
-	} else {
-		klog.V(4).Infof("Removed cache mount directory: %s", mountPath)
-	}
-}

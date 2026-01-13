@@ -44,17 +44,12 @@ type MountManager struct {
 	cryptRemote    string // The crypt remote string (e.g., :crypt{...}:) used for VFS operations
 	mounted        bool
 	mutex          sync.RWMutex
-	luksPassphrase string
-	luksManager    *luks.LUKSManager
 }
-
-// DefaultCacheBasePath is the default base path for encrypted cache storage
-const DefaultCacheBasePath = "/var/lib/lukscrypt-cache"
 
 // NewMountManager creates a new rclone mount manager
 // s3PathPrefix is optional - if empty, defaults to "volumes/{volumeID}/files"
 // If s3PathPrefix is provided, path becomes "{s3PathPrefix}/volumes/{volumeID}/files"
-func NewMountManager(s3Config *S3Config, volumeID, mountPoint, luksPassphrase string, vfsConfig *VFSCacheConfig, s3PathPrefix string) (*MountManager, error) {
+func NewMountManager(s3Config *S3Config, volumeID, mountPoint string, vfsConfig *VFSCacheConfig, s3PathPrefix string, luksPassphrase string) (*MountManager, error) {
 	if vfsConfig == nil {
 		vfsConfig = DefaultVFSCacheConfig()
 	}
@@ -82,8 +77,6 @@ func NewMountManager(s3Config *S3Config, volumeID, mountPoint, luksPassphrase st
 		volumeID:       volumeID,
 		mountPoint:     mountPoint,
 		s3BasePath:     s3BasePath,
-		luksPassphrase: luksPassphrase,
-		luksManager:    luks.NewLUKSManager(),
 	}
 
 	klog.Infof("Created rclone mount manager for volume %s at %s (s3Path: %s)", volumeID, mountPoint, s3BasePath)
@@ -151,7 +144,7 @@ func (mm *MountManager) Mount() error {
 		"vfsOpt":     vfsOpt,
 	}
 
-	klog.V(4).Infof("Calling mount/mount RPC for volume %s", mm.volumeID)
+	klog.Infof("Calling mount/mount RPC for volume %s", mm.volumeID)
 
 	_, err = RPC("mount/mount", params)
 	if err != nil {
@@ -172,7 +165,7 @@ func (mm *MountManager) Mount() error {
 func (mm *MountManager) resolveVFSName(cryptRemote string) string {
 	result, err := RPC("vfs/list", map[string]interface{}{})
 	if err != nil {
-		klog.V(4).Infof("vfs/list failed, using original remote: %v", err)
+		klog.Infof("vfs/list failed, using original remote: %v", err)
 		return cryptRemote
 	}
 
@@ -198,7 +191,7 @@ func (mm *MountManager) resolveVFSName(cryptRemote string) string {
 			continue
 		}
 		if vfsName == cryptRemote {
-			klog.V(4).Infof("Found exact VFS match for volume %s", mm.volumeID)
+			klog.Infof("Found exact VFS match for volume %s", mm.volumeID)
 			return vfsName
 		}
 	}
@@ -235,11 +228,11 @@ func (mm *MountManager) resolveVFSName(cryptRemote string) string {
 	}
 
 	if bestMatch != "" {
-		klog.V(4).Infof("Found VFS match with suffix: %s (for volume %s)", bestMatch, mm.volumeID)
+		klog.Infof("Found VFS match with suffix: %s (for volume %s)", bestMatch, mm.volumeID)
 		return bestMatch
 	}
 
-	klog.V(4).Infof("No VFS match found, using original remote for volume %s", mm.volumeID)
+	klog.Infof("No VFS match found, using original remote for volume %s", mm.volumeID)
 	return cryptRemote
 }
 
@@ -395,7 +388,7 @@ func (mm *MountManager) waitForPendingUploads() {
 			"recursive": "true",
 		})
 		if err != nil {
-			klog.V(4).Infof("vfs/refresh returned error (may be normal if already unmounted): %v", err)
+			klog.Infof("vfs/refresh returned error (may be normal if already unmounted): %v", err)
 		}
 	}
 
@@ -434,7 +427,7 @@ func (mm *MountManager) IsMounted() bool {
 func (mm *MountManager) ForceSync() error {
 	// Skip if we don't have the cryptRemote stored (mount didn't complete)
 	if mm.cryptRemote == "" {
-		klog.V(4).Infof("No cryptRemote stored for volume %s, skipping vfs/refresh", mm.volumeID)
+		klog.Infof("No cryptRemote stored for volume %s, skipping vfs/refresh", mm.volumeID)
 		return nil
 	}
 
@@ -447,7 +440,7 @@ func (mm *MountManager) ForceSync() error {
 
 	_, err := RPC("vfs/refresh", params)
 	if err != nil {
-		klog.V(4).Infof("vfs/refresh returned error (may be normal): %v", err)
+		klog.Infof("vfs/refresh returned error (may be normal): %v", err)
 	}
 	return nil
 }

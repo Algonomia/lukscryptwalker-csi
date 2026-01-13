@@ -86,7 +86,7 @@ jobs:
             GIT_COMMIT=${{ github.sha }}
             BUILD_DATE=${{ steps.date.outputs.date }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=min
           provenance: true
           sbom: true
 
