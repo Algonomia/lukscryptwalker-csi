@@ -7,7 +7,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/lukscryptwalker-csi/pkg/luks"
 	"k8s.io/klog"
 )
 
