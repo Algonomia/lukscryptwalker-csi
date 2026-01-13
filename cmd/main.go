@@ -46,39 +46,39 @@ func main() {
 		klog.Fatal("NodeID cannot be empty")
 	}
 
-	// Create Kubernetes client to fetch secrets
-	config, err := rest.InClusterConfig()
-	if err != nil {
-		klog.Fatalf("Failed to get in-cluster config: %v", err)
-	}
-
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		klog.Fatalf("Failed to create kubernetes client: %v", err)
-	}
-
-	// Fetch LUKS passphrase from Kubernetes secret
-	secretsManager := secrets.NewSecretsManager(clientset)
-
-	secretParams := secrets.SecretParams{
-		LUKSSecret: secrets.SecretReference{
-			Name:      *luksSecretName,
-			Namespace: *luksSecretNamespace,
-		},
-		PassphraseKey: *luksSecretKey,
-	}
-
-	volSecrets, err := secretsManager.FetchVolumeSecrets(context.Background(), secretParams)
-	if err != nil {
-		klog.Fatalf("Failed to fetch LUKS passphrase from secret: %v", err)
-	}
-
-	if volSecrets.Passphrase == "" {
-		klog.Fatal("LUKS passphrase is empty in secret")
-	}
-
 	// Set up encrypted VFS cache volume (only for nodes, skip for controller)
 	if !isControllerMode(*endpoint) {
+		// Create Kubernetes client to fetch secrets
+		config, err := rest.InClusterConfig()
+		if err != nil {
+			klog.Fatalf("Failed to get in-cluster config: %v", err)
+		}
+
+		clientset, err := kubernetes.NewForConfig(config)
+		if err != nil {
+			klog.Fatalf("Failed to create kubernetes client: %v", err)
+		}
+
+		// Fetch LUKS passphrase from Kubernetes secret
+		secretsManager := secrets.NewSecretsManager(clientset)
+
+		secretParams := secrets.SecretParams{
+			LUKSSecret: secrets.SecretReference{
+				Name:      *luksSecretName,
+				Namespace: *luksSecretNamespace,
+			},
+			PassphraseKey: *luksSecretKey,
+		}
+
+		volSecrets, err := secretsManager.FetchVolumeSecrets(context.Background(), secretParams)
+		if err != nil {
+			klog.Fatalf("Failed to fetch LUKS passphrase from secret: %v", err)
+		}
+
+		if volSecrets.Passphrase == "" {
+			klog.Fatal("LUKS passphrase is empty in secret")
+		}
+
 		// Combine with node ID to ensure uniqueness per node
 		vfsCachePassphrase := fmt.Sprintf("%s-%s", volSecrets.Passphrase, *nodeID)
 		vfsCachePath, err := rclone.SetupVFSCache(*vfsCacheSize, vfsCachePassphrase)
