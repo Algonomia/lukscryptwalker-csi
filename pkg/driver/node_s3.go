@@ -25,7 +25,6 @@ const (
 	VFSCacheMaxAgeParam  = "rclone-vfs-cache-max-age"  // e.g., "1h", "24h"
 	VFSCacheMaxSizeParam = "rclone-vfs-cache-max-size" // e.g., "10G", "100M"
 	VFSWriteBackParam    = "rclone-vfs-write-back"     // e.g., "5s", "0"
-	VFSCacheDirParam     = "rclone-cache-dir"          // directory for cache files
 )
 
 // S3SyncManager holds mount managers for active S3 volumes
@@ -183,10 +182,6 @@ func (ns *NodeServer) getVFSCacheConfig(volumeContext map[string]string) *rclone
 
 	if writeBack, exists := volumeContext[VFSWriteBackParam]; exists && writeBack != "" {
 		config.WriteBack = writeBack
-	}
-
-	if cacheDir, exists := volumeContext[VFSCacheDirParam]; exists && cacheDir != "" {
-		config.CacheDir = cacheDir
 	}
 
 	klog.V(4).Infof("VFS cache config: mode=%s, maxAge=%s, maxSize=%s, writeBack=%s",
