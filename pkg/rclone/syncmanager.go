@@ -92,8 +92,13 @@ func NewMountManager(s3Config *S3Config, volumeID, mountPoint, luksPassphrase st
 
 // Mount mounts the encrypted S3 remote at the mount point using librclone
 func (mm *MountManager) Mount() error {
-	globalMountMu.Unlock()
+	// First acquire the global mount mutex to serialize mount operations
+	globalMountMu.Lock()
 	defer globalMountMu.Unlock()
+
+	// Then acquire the instance mutex
+	mm.mutex.Lock()
+	defer mm.mutex.Unlock()
 
 	if mm.mounted && mm.isMountPoint() {
 		klog.Infof("Volume %s already mounted at %s", mm.volumeID, mm.mountPoint)
