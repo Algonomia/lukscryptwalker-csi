@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 
@@ -18,7 +17,6 @@ type VFSCacheConfig struct {
 	CacheMaxAge  string // e.g., "1h", "24h"
 	CacheMaxSize string // e.g., "10G", "100M"
 	WriteBack    string // e.g., "5s", "0" for immediate
-	CacheDir     string // directory for cache files
 }
 
 // DefaultVFSCacheConfig returns sensible defaults for VFS caching
@@ -28,7 +26,6 @@ func DefaultVFSCacheConfig() *VFSCacheConfig {
 		CacheMaxAge:  "1h",
 		CacheMaxSize: "10G",
 		WriteBack:    "5s",
-		CacheDir:     "",
 	}
 }
 
@@ -45,8 +42,6 @@ type MountManager struct {
 	mutex          sync.RWMutex
 	luksPassphrase string
 	luksManager    *luks.LUKSManager
-	cacheBasePath  string // Base path for cache storage (e.g., /var/lib/lukscrypt-cache)
-	cacheMounted   bool   // Whether the encrypted cache is mounted
 }
 
 // DefaultCacheBasePath is the default base path for encrypted cache storage
@@ -85,7 +80,6 @@ func NewMountManager(s3Config *S3Config, volumeID, mountPoint, luksPassphrase st
 		s3BasePath:     s3BasePath,
 		luksPassphrase: luksPassphrase,
 		luksManager:    luks.NewLUKSManager(),
-		cacheBasePath:  DefaultCacheBasePath,
 	}
 
 	klog.Infof("Created rclone mount manager for volume %s at %s (s3Path: %s)", volumeID, mountPoint, s3BasePath)
@@ -104,12 +98,6 @@ func (mm *MountManager) Mount() error {
 
 	klog.Infof("Mounting encrypted S3 volume %s at %s", mm.volumeID, mm.mountPoint)
 
-	// Setup encrypted cache first (if caching is enabled)
-	encryptedCachePath, err := mm.setupEncryptedCache()
-	if err != nil {
-		return fmt.Errorf("failed to setup encrypted cache: %w", err)
-	}
-
 	// Check for stale mount and try to clean it up
 	if mm.isMountPoint() {
 		klog.Warningf("Found stale mount at %s, attempting to unmount first", mm.mountPoint)
@@ -127,14 +115,12 @@ func (mm *MountManager) Mount() error {
 
 	// Ensure mount point exists
 	if err := os.MkdirAll(mm.mountPoint, 0755); err != nil {
-		_ = mm.teardownEncryptedCache() // Best effort cleanup
 		return fmt.Errorf("failed to create mount point: %w", err)
 	}
 
 	// Build the crypt remote string for librclone
 	cryptRemote, err := BuildCryptRemoteString(mm.s3Config, mm.cryptConfig, mm.s3BasePath)
 	if err != nil {
-		_ = mm.teardownEncryptedCache() // Best effort cleanup
 		return fmt.Errorf("failed to build crypt remote: %w", err)
 	}
 
@@ -164,7 +150,6 @@ func (mm *MountManager) Mount() error {
 
 	_, err = RPC("mount/mount", params)
 	if err != nil {
-		_ = mm.teardownEncryptedCache() // Best effort cleanup
 		return fmt.Errorf("failed to mount: %w", err)
 	}
 
@@ -306,7 +291,7 @@ func (mm *MountManager) Unmount() error {
 	mm.mutex.Lock()
 	defer mm.mutex.Unlock()
 
-	if !mm.mounted && !mm.isMountPoint() && !mm.cacheMounted {
+	if !mm.mounted && !mm.isMountPoint() {
 		klog.Infof("Volume %s not mounted, skipping unmount", mm.volumeID)
 		return nil
 	}
@@ -333,11 +318,6 @@ func (mm *MountManager) Unmount() error {
 	}
 
 	mm.mounted = false
-
-	// Teardown encrypted cache after unmounting rclone
-	if err := mm.teardownEncryptedCache(); err != nil {
-		klog.Warningf("Failed to teardown encrypted cache: %v", err)
-	}
 
 	klog.Infof("Successfully unmounted encrypted S3 volume %s", mm.volumeID)
 	return nil
@@ -445,330 +425,6 @@ func (mm *MountManager) IsMounted() bool {
 	return mm.mounted && mm.isMountPoint()
 }
 
-// getCacheBackingFile returns the path to the LUKS backing file for cache
-func (mm *MountManager) getCacheBackingFile() string {
-	return filepath.Join(mm.cacheBasePath, "backing", fmt.Sprintf("%s.luks", mm.volumeID))
-}
-
-// getCacheMountPath returns the mount path for the encrypted cache
-func (mm *MountManager) getCacheMountPath() string {
-	return filepath.Join(mm.cacheBasePath, "mounts", mm.volumeID)
-}
-
-// getCacheMapperName returns the LUKS mapper name for the cache
-func (mm *MountManager) getCacheMapperName() string {
-	return fmt.Sprintf("luks-cache-%s", mm.volumeID)
-}
-
-// setupEncryptedCache creates and mounts a LUKS-encrypted cache directory
-func (mm *MountManager) setupEncryptedCache() (string, error) {
-	// If cache mode is off, no need for encrypted cache
-	if mm.vfsConfig.CacheMode == "off" {
-		klog.Infof("VFS cache mode is off, skipping encrypted cache setup for volume %s", mm.volumeID)
-		return "", nil
-	}
-
-	backingFile := mm.getCacheBackingFile()
-	mountPath := mm.getCacheMountPath()
-	mapperName := mm.getCacheMapperName()
-
-	klog.Infof("Setting up encrypted cache for volume %s: backing=%s, mount=%s, mapper=%s", mm.volumeID, backingFile, mountPath, mapperName)
-
-	// Check if cache is already mounted and working (idempotent)
-	if mm.isCacheMountActive(mountPath, mapperName) {
-		klog.Infof("Encrypted cache already active at %s for volume %s", mountPath, mm.volumeID)
-		mm.cacheMounted = true
-		return mountPath, nil
-	}
-
-	// Clean up any stale state for THIS volume only before proceeding
-	mm.cleanupStaleVolumeCache(backingFile, mountPath, mapperName)
-
-	// Create directories
-	if err := os.MkdirAll(filepath.Dir(backingFile), 0700); err != nil {
-		return "", fmt.Errorf("failed to create cache backing directory: %w", err)
-	}
-	if err := os.MkdirAll(mountPath, 0700); err != nil {
-		return "", fmt.Errorf("failed to create cache mount directory: %w", err)
-	}
-
-	// Parse cache size for backing file (default to 1GB if not specified or on error)
-	cacheSize := int64(1 * 1024 * 1024 * 1024) // 1GB default
-	if mm.vfsConfig.CacheMaxSize != "" {
-		if parsed, err := parseSizeToBytes(mm.vfsConfig.CacheMaxSize); err == nil && parsed > 0 {
-			cacheSize = parsed
-		}
-	}
-
-	// Create backing file if it doesn't exist
-	if _, err := os.Stat(backingFile); os.IsNotExist(err) {
-		klog.Infof("Creating cache backing file %s with size %d bytes", backingFile, cacheSize)
-
-		// Create sparse file
-		f, err := os.Create(backingFile)
-		if err != nil {
-			return "", fmt.Errorf("failed to create cache backing file: %w", err)
-		}
-		if err := f.Truncate(cacheSize); err != nil {
-			_ = f.Close()
-			_ = os.Remove(backingFile)
-			return "", fmt.Errorf("failed to set cache backing file size: %w", err)
-		}
-		_ = f.Close()
-
-		// Setup loop device and format with LUKS
-		loopDevice, err := mm.setupLoopDevice(backingFile)
-		if err != nil {
-			_ = os.Remove(backingFile)
-			return "", fmt.Errorf("failed to setup loop device: %w", err)
-		}
-
-		// Format with LUKS
-		if err := mm.luksManager.FormatAndOpenLUKS(loopDevice, mapperName, mm.luksPassphrase); err != nil {
-			_ = mm.detachLoopDevice(loopDevice) // Best effort cleanup
-			_ = os.Remove(backingFile)
-			return "", fmt.Errorf("failed to format LUKS cache: %w", err)
-		}
-
-		// Format the mapped device with ext4
-		mappedDevice := mm.luksManager.GetMappedDevicePath(mapperName)
-		if err := mm.formatExt4(mappedDevice); err != nil {
-			_ = mm.luksManager.CloseLUKS(mapperName) // Best effort cleanup
-			_ = mm.detachLoopDevice(loopDevice)
-			_ = os.Remove(backingFile)
-			return "", fmt.Errorf("failed to format cache filesystem: %w", err)
-		}
-	} else {
-		// Backing file exists, just open it
-		loopDevice, err := mm.setupLoopDevice(backingFile)
-		if err != nil {
-			return "", fmt.Errorf("failed to setup loop device: %w", err)
-		}
-
-		if err := mm.luksManager.OpenLUKS(loopDevice, mapperName, mm.luksPassphrase); err != nil {
-			_ = mm.detachLoopDevice(loopDevice) // Best effort cleanup
-			return "", fmt.Errorf("failed to open LUKS cache: %w", err)
-		}
-	}
-
-	// Mount the encrypted cache
-	mappedDevice := mm.luksManager.GetMappedDevicePath(mapperName)
-	if err := mm.mountFilesystem(mappedDevice, mountPath); err != nil {
-		_ = mm.luksManager.CloseLUKS(mapperName) // Best effort cleanup
-		return "", fmt.Errorf("failed to mount cache filesystem: %w", err)
-	}
-
-	mm.cacheMounted = true
-	klog.Infof("Successfully set up encrypted cache at %s for volume %s", mountPath, mm.volumeID)
-	return mountPath, nil
-}
-
-// isCacheMountActive checks if the encrypted cache is already mounted and working
-func (mm *MountManager) isCacheMountActive(mountPath, mapperName string) bool {
-	// Check if mount path is a mount point
-	cmd := exec.Command("mountpoint", "-q", mountPath)
-	if cmd.Run() != nil {
-		return false
-	}
-
-	// Check if LUKS mapper exists
-	mappedDevice := mm.luksManager.GetMappedDevicePath(mapperName)
-	if _, err := os.Stat(mappedDevice); os.IsNotExist(err) {
-		return false
-	}
-
-	// Verify mount is from our mapper device
-	findmntCmd := exec.Command("findmnt", "-n", "-o", "SOURCE", mountPath)
-	output, err := findmntCmd.Output()
-	if err != nil {
-		return false
-	}
-
-	return strings.TrimSpace(string(output)) == mappedDevice
-}
-
-// cleanupStaleVolumeCache cleans up stale cache state for THIS specific volume only.
-// This handles the case where the driver crashed and left orphaned resources.
-func (mm *MountManager) cleanupStaleVolumeCache(backingFile, mountPath, mapperName string) {
-	klog.Infof("Checking for stale cache state for volume %s", mm.volumeID)
-	mappedDevice := mm.luksManager.GetMappedDevicePath(mapperName)
-
-	// Step 1: Unmount if stale mount exists at expected path
-	cmd := exec.Command("mountpoint", "-q", mountPath)
-	if cmd.Run() == nil {
-		klog.Infof("Found stale cache mount at %s, unmounting", mountPath)
-		umountCmd := exec.Command("umount", "-l", mountPath)
-		if err := umountCmd.Run(); err != nil {
-			klog.Warningf("Failed to unmount stale cache mount %s: %v", mountPath, err)
-		}
-	}
-
-	// Step 2: Check if LUKS device is mounted anywhere else and unmount it
-	if _, err := os.Stat(mappedDevice); err == nil {
-		// Find where this device is mounted using findmnt
-		findmntCmd := exec.Command("findmnt", "-n", "-o", "TARGET", "-S", mappedDevice)
-		output, err := findmntCmd.Output()
-		if err == nil && len(output) > 0 {
-			mountTarget := strings.TrimSpace(string(output))
-			if mountTarget != "" {
-				klog.Infof("Found LUKS device %s mounted at %s, unmounting", mappedDevice, mountTarget)
-				umountCmd := exec.Command("umount", "-l", mountTarget)
-				if err := umountCmd.Run(); err != nil {
-					klog.Warningf("Failed to unmount %s: %v", mountTarget, err)
-				}
-			}
-		}
-	}
-
-	// Step 3: Close LUKS mapper if it exists
-	if _, err := os.Stat(mappedDevice); err == nil {
-		klog.Infof("Found stale LUKS mapper %s, closing", mapperName)
-		if err := mm.luksManager.CloseLUKS(mapperName); err != nil {
-			klog.Warningf("Failed to close stale LUKS mapper %s: %v", mapperName, err)
-			// Try force close with dmsetup as fallback
-			closeCmd := exec.Command("cryptsetup", "close", mapperName)
-			if err := closeCmd.Run(); err != nil {
-				klog.Warningf("cryptsetup close failed: %v, trying dmsetup remove", err)
-				dmCmd := exec.Command("dmsetup", "remove", "-f", mapperName)
-				if err := dmCmd.Run(); err != nil {
-					klog.Errorf("dmsetup remove also failed for %s: %v", mapperName, err)
-				}
-			}
-		}
-	}
-
-	// Step 4: Detach loop device - check both by backing file and by scanning for orphaned loops
-	// First try by backing file if it exists
-	if _, err := os.Stat(backingFile); err == nil {
-		losetupCmd := exec.Command("losetup", "-j", backingFile)
-		output, err := losetupCmd.Output()
-		if err == nil && len(output) > 0 {
-			outputStr := strings.TrimSpace(string(output))
-			if parts := strings.Split(outputStr, ":"); len(parts) >= 1 {
-				loopDevice := strings.TrimSpace(parts[0])
-				klog.Infof("Found stale loop device %s attached to %s, detaching", loopDevice, backingFile)
-				detachCmd := exec.Command("losetup", "-d", loopDevice)
-				if err := detachCmd.Run(); err != nil {
-					klog.Warningf("Failed to detach stale loop device %s: %v", loopDevice, err)
-				}
-			}
-		}
-
-		// Step 5: Remove stale backing file so we start fresh
-		klog.Infof("Removing stale backing file %s", backingFile)
-		if err := os.Remove(backingFile); err != nil {
-			klog.Warningf("Failed to remove stale backing file %s: %v", backingFile, err)
-		}
-	}
-
-	klog.Infof("Stale cache cleanup completed for volume %s", mm.volumeID)
-}
-
-// teardownEncryptedCache unmounts and closes the encrypted cache
-func (mm *MountManager) teardownEncryptedCache() error {
-	if !mm.cacheMounted {
-		return nil
-	}
-
-	mountPath := mm.getCacheMountPath()
-	mapperName := mm.getCacheMapperName()
-	backingFile := mm.getCacheBackingFile()
-
-	klog.Infof("Tearing down encrypted cache for volume %s", mm.volumeID)
-
-	// Unmount the filesystem
-	if err := mm.unmountFilesystem(mountPath); err != nil {
-		klog.Warningf("Failed to unmount cache filesystem: %v", err)
-	}
-
-	// Close LUKS
-	if err := mm.luksManager.CloseLUKS(mapperName); err != nil {
-		klog.Warningf("Failed to close LUKS cache: %v", err)
-	}
-
-	// Find and detach loop device
-	loopDevice, err := mm.findLoopDevice(backingFile)
-	if err == nil && loopDevice != "" {
-		_ = mm.detachLoopDevice(loopDevice) // Best effort cleanup
-	}
-
-	mm.cacheMounted = false
-	klog.Infof("Successfully tore down encrypted cache for volume %s", mm.volumeID)
-	return nil
-}
-
-// setupLoopDevice creates a loop device for the backing file
-func (mm *MountManager) setupLoopDevice(backingFile string) (string, error) {
-	// First check if already attached
-	existing, err := mm.findLoopDevice(backingFile)
-	if err == nil && existing != "" {
-		klog.Infof("Loop device %s already attached for %s", existing, backingFile)
-		return existing, nil
-	}
-
-	cmd := exec.Command("losetup", "-f", "--show", backingFile)
-	output, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("losetup failed: %w", err)
-	}
-	return strings.TrimSpace(string(output)), nil
-}
-
-// findLoopDevice finds the loop device for a backing file
-func (mm *MountManager) findLoopDevice(backingFile string) (string, error) {
-	cmd := exec.Command("losetup", "-j", backingFile)
-	output, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	line := strings.TrimSpace(string(output))
-	if line == "" {
-		return "", fmt.Errorf("no loop device found")
-	}
-	// Output format: /dev/loop0: [64769]:123456 (/path/to/file)
-	parts := strings.Split(line, ":")
-	if len(parts) > 0 {
-		return parts[0], nil
-	}
-	return "", fmt.Errorf("could not parse losetup output")
-}
-
-// detachLoopDevice detaches a loop device
-func (mm *MountManager) detachLoopDevice(loopDevice string) error {
-	cmd := exec.Command("losetup", "-d", loopDevice)
-	return cmd.Run()
-}
-
-// formatExt4 formats a device with ext4
-func (mm *MountManager) formatExt4(device string) error {
-	cmd := exec.Command("mkfs.ext4", "-F", device)
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
-// mountFilesystem mounts a device at a mount point
-func (mm *MountManager) mountFilesystem(device, mountPath string) error {
-	// Check if already mounted
-	data, _ := os.ReadFile("/proc/mounts")
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 2 && fields[1] == mountPath {
-			klog.Infof("Filesystem already mounted at %s", mountPath)
-			return nil
-		}
-	}
-
-	cmd := exec.Command("mount", device, mountPath)
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
-// unmountFilesystem unmounts a mount point
-func (mm *MountManager) unmountFilesystem(mountPath string) error {
-	cmd := exec.Command("umount", mountPath)
-	return cmd.Run()
-}
-
 // ForceSync flushes any cached writes
 func (mm *MountManager) ForceSync() error {
 	// Skip if we don't have the cryptRemote stored (mount didn't complete)
@@ -852,44 +508,3 @@ func parseSizeToBytes(s string) (int64, error) {
 	}
 }
 
-// ============================================================================
-// Legacy SyncManager interface for backward compatibility
-// ============================================================================
-
-// SyncManager is an alias for MountManager
-type SyncManager = MountManager
-
-// NewSyncManager creates a new mount manager (backward compatible name)
-func NewSyncManager(s3Config *S3Config, volumeID, mountPoint, luksPassphrase string) (*MountManager, error) {
-	return NewMountManager(s3Config, volumeID, mountPoint, luksPassphrase, nil, "")
-}
-
-// SyncToS3 triggers a cache flush
-func (mm *MountManager) SyncToS3() error {
-	return mm.ForceSync()
-}
-
-// SyncFromS3 is a no-op for mount mode
-func (mm *MountManager) SyncFromS3() error {
-	return nil
-}
-
-// SyncToRemote is an alias for ForceSync
-func (mm *MountManager) SyncToRemote() error {
-	return mm.ForceSync()
-}
-
-// SyncFromRemote is a no-op for mount mode
-func (mm *MountManager) SyncFromRemote() error {
-	return nil
-}
-
-// SyncSingleFile is a no-op for mount mode
-func (mm *MountManager) SyncSingleFile(relativePath string) error {
-	return nil
-}
-
-// SyncDeletedFile is a no-op for mount mode
-func (mm *MountManager) SyncDeletedFile(relativePath string) error {
-	return nil
-}
