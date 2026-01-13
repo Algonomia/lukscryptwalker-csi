@@ -58,7 +58,8 @@ func SetGlobalCacheDir(cacheDir string) error {
 
 	// Create config content with cache directory
 	// Using the format rclone expects for global settings
-	configContent := fmt.Sprintf("# Global settings\n[main]\ncache-dir = %s\n", cacheDir)
+	// Note: rclone uses underscores in config file (cache_dir not cache-dir)
+	configContent := fmt.Sprintf("# Global settings\ncache_dir = %s\n", cacheDir)
 
 	// Write the config file
 	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
