@@ -29,14 +29,13 @@ func DefaultVFSCacheConfig() *VFSCacheConfig {
 
 // MountManager handles rclone mount operations for encrypted S3 volumes
 type MountManager struct {
-	s3Config       *S3Config
-	cryptConfig    *CryptConfig
-	vfsConfig      *VFSCacheConfig
-	volumeID       string
-	mountPoint     string
-	s3BasePath     string
-	cryptRemote    string // The crypt remote string (e.g., :crypt{...}:) used for VFS operations
-	mounted        bool
+	s3Config    *S3Config
+	cryptConfig *CryptConfig
+	vfsConfig   *VFSCacheConfig
+	volumeID    string
+	mountPoint  string
+	s3BasePath  string
+	mounted     bool
 }
 
 // NewMountManager creates a new rclone mount manager
