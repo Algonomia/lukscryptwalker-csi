@@ -5,14 +5,9 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"sync"
 
 	"k8s.io/klog"
 )
-
-// Global mount mutex to ensure mount operations are sequential
-// This prevents race conditions when multiple volumes are mounted simultaneously
-var globalMountMu sync.Mutex
 
 // VFSCacheConfig holds VFS cache configuration options
 type VFSCacheConfig struct {
@@ -42,7 +37,6 @@ type MountManager struct {
 	s3BasePath     string
 	cryptRemote    string // The crypt remote string (e.g., :crypt{...}:) used for VFS operations
 	mounted        bool
-	mutex          sync.RWMutex
 }
 
 // NewMountManager creates a new rclone mount manager
@@ -84,13 +78,6 @@ func NewMountManager(s3Config *S3Config, volumeID, mountPoint string, vfsConfig 
 
 // Mount mounts the encrypted S3 remote at the mount point using librclone
 func (mm *MountManager) Mount() error {
-	// First acquire the global mount mutex to serialize mount operations
-	globalMountMu.Lock()
-	defer globalMountMu.Unlock()
-
-	// Then acquire the instance mutex
-	mm.mutex.Lock()
-	defer mm.mutex.Unlock()
 
 	if mm.mounted && mm.isMountPoint() {
 		klog.Infof("Volume %s already mounted at %s", mm.volumeID, mm.mountPoint)
@@ -102,15 +89,8 @@ func (mm *MountManager) Mount() error {
 	// Check for stale mount and try to clean it up
 	if mm.isMountPoint() {
 		klog.Warningf("Found stale mount at %s, attempting to unmount first", mm.mountPoint)
-		// Try to unmount via librclone
-		_, _ = RPC("mount/unmount", map[string]interface{}{"mountPoint": mm.mountPoint})
-		// Use lazy unmount as fallback
-		if mm.isMountPoint() {
-			klog.Warningf("librclone unmount didn't work, trying umount -l %s", mm.mountPoint)
-			cmd := exec.Command("umount", "-l", mm.mountPoint)
-			if err := cmd.Run(); err != nil {
-				klog.Warningf("umount -l failed: %v, will try mounting anyway with AllowNonEmpty", err)
-			}
+		if err := mm.Unmount(); err != nil {
+			klog.Warningf("Unmount failed: %v, will try mounting anyway with AllowNonEmpty", err)
 		}
 	}
 
@@ -150,95 +130,9 @@ func (mm *MountManager) Mount() error {
 		return fmt.Errorf("failed to mount: %w", err)
 	}
 
-	// Resolve the actual VFS name that rclone assigned (may have suffix like [0], [1] for multiple mounts)
-	vfsName := mm.resolveVFSName(cryptRemote)
-	mm.cryptRemote = vfsName
 	mm.mounted = true
 	klog.Infof("Successfully mounted encrypted S3 volume %s at %s", mm.volumeID, mm.mountPoint)
 	return nil
-}
-
-// resolveVFSName finds the actual VFS name assigned by rclone for our mount.
-// When multiple VFS instances exist for similar remotes, rclone assigns suffixes like [0], [1].
-// This function queries vfs/list to find the correct VFS name for our mount.
-func (mm *MountManager) resolveVFSName(cryptRemote string) string {
-	result, err := RPC("vfs/list", map[string]interface{}{})
-	if err != nil {
-		klog.Infof("vfs/list failed, using original remote: %v", err)
-		return cryptRemote
-	}
-
-	if result == nil || result.Output == nil {
-		klog.Infof("vfs/list returned nil result for volume %s", mm.volumeID)
-		return cryptRemote
-	}
-
-	// vfs/list returns {"vfses": ["remote1:", "remote2:[0]", "remote2:[1]", ...]}
-	vfses, ok := result.Output["vfses"]
-	if !ok {
-		klog.Infof("vfs/list output missing 'vfses' key for volume %s", mm.volumeID)
-		return cryptRemote
-	}
-
-	vfsList, ok := vfses.([]interface{})
-	if !ok {
-		klog.Infof("vfs/list 'vfses' is not a list for volume %s", mm.volumeID)
-		return cryptRemote
-	}
-
-	// Debug: log all VFS instances
-	klog.Infof("Available VFS instances for volume %s: %+v (looking for: %s)", mm.volumeID, vfsList, cryptRemote)
-
-	// Look for exact match first
-	for _, v := range vfsList {
-		vfsName, ok := v.(string)
-		if !ok {
-			continue
-		}
-		if vfsName == cryptRemote {
-			klog.Infof("Found exact VFS match for volume %s", mm.volumeID)
-			return vfsName
-		}
-	}
-
-	// Look for suffixed version (e.g., cryptRemote + "[0]", "[1]", etc.)
-	// Find the highest suffix to get the most recently created one
-	var bestMatch string
-	highestSuffix := -1
-	for _, v := range vfsList {
-		vfsName, ok := v.(string)
-		if !ok {
-			continue
-		}
-		// Check if this VFS name starts with our remote (accounting for potential suffix)
-		if len(vfsName) >= len(cryptRemote) && vfsName[:len(cryptRemote)] == cryptRemote {
-			// Extract suffix number if present
-			suffix := vfsName[len(cryptRemote):]
-			if suffix == "" {
-				if highestSuffix < 0 {
-					bestMatch = vfsName
-					highestSuffix = 0
-				}
-			} else if len(suffix) >= 3 && suffix[0] == '[' && suffix[len(suffix)-1] == ']' {
-				// Parse [N] suffix
-				var num int
-				if _, err := fmt.Sscanf(suffix, "[%d]", &num); err == nil {
-					if num > highestSuffix {
-						bestMatch = vfsName
-						highestSuffix = num
-					}
-				}
-			}
-		}
-	}
-
-	if bestMatch != "" {
-		klog.Infof("Found VFS match with suffix: %s (for volume %s)", bestMatch, mm.volumeID)
-		return bestMatch
-	}
-
-	klog.Infof("No VFS match found, using original remote for volume %s", mm.volumeID)
-	return cryptRemote
 }
 
 // buildVFSOpt builds VFS options for the mount
@@ -291,8 +185,6 @@ func (mm *MountManager) buildVFSOpt() map[string]interface{} {
 
 // Unmount unmounts the S3 volume using librclone
 func (mm *MountManager) Unmount() error {
-	mm.mutex.Lock()
-	defer mm.mutex.Unlock()
 
 	if !mm.mounted && !mm.isMountPoint() {
 		klog.Infof("Volume %s not mounted, skipping unmount", mm.volumeID)
@@ -386,17 +278,6 @@ func (mm *MountManager) waitForPendingUploads() {
 		_ = sleepCmd.Run()
 	}
 
-	// Also try to flush the VFS cache before unmounting
-	if mm.cryptRemote != "" {
-		_, err := RPC("vfs/refresh", map[string]interface{}{
-			"fs":        mm.cryptRemote,
-			"recursive": "true",
-		})
-		if err != nil {
-			klog.Infof("vfs/refresh returned error (may be normal if already unmounted): %v", err)
-		}
-	}
-
 	klog.Infof("Finished waiting for pending uploads for volume %s", mm.volumeID)
 }
 
@@ -423,31 +304,7 @@ func (mm *MountManager) isMountPoint() bool {
 
 // IsMounted returns whether the volume is currently mounted
 func (mm *MountManager) IsMounted() bool {
-	mm.mutex.RLock()
-	defer mm.mutex.RUnlock()
 	return mm.mounted && mm.isMountPoint()
-}
-
-// ForceSync flushes any cached writes
-func (mm *MountManager) ForceSync() error {
-	// Skip if we don't have the cryptRemote stored (mount didn't complete)
-	if mm.cryptRemote == "" {
-		klog.Infof("No cryptRemote stored for volume %s, skipping vfs/refresh", mm.volumeID)
-		return nil
-	}
-
-	// With rclone mount via librclone, we can use vfs/refresh to ensure cache is flushed
-	// Note: VFS operations require the remote string (e.g., :crypt{...}:), not the mount path
-	params := map[string]interface{}{
-		"fs":        mm.cryptRemote,
-		"recursive": "true",
-	}
-
-	_, err := RPC("vfs/refresh", params)
-	if err != nil {
-		klog.Infof("vfs/refresh returned error (may be normal): %v", err)
-	}
-	return nil
 }
 
 // parseDurationToNs parses a duration string like "1h" or "5s" to nanoseconds

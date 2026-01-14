@@ -217,10 +217,6 @@ func (ns *NodeServer) cleanupS3Sync(volumeID string) error {
 
 	// Unmount the S3 volume
 	if mountMgr, exists := ns.s3SyncMgr.mountManagers[volumeID]; exists {
-		// Force sync any cached writes before unmount
-		if err := mountMgr.ForceSync(); err != nil {
-			klog.Warningf("Failed to force sync before unmount for volume %s: %v", volumeID, err)
-		}
 
 		// Unmount the volume (this also tears down the encrypted cache mount)
 		if err := mountMgr.Unmount(); err != nil {
