@@ -97,8 +97,8 @@ func RPC(method string, params interface{}) (*RPCResult, error) {
 				errMsg = fmt.Sprintf("%v", result.Output)
 			}
 		}
-		result.Error = fmt.Errorf("RPC %s failed with status %d: %s", method, status, errMsg)
-		klog.Errorf("RPC %s failed: status=%d, error=%s", method, status, errMsg)
+		result.Error = fmt.Errorf("RPC %s failed with status %d: %s", method, status, sanitizeErrorMessage(errMsg))
+		klog.Errorf("RPC %s failed: status=%d, error=%s", method, status, sanitizeErrorMessage(errMsg))
 		return result, result.Error
 	}
 
@@ -121,7 +121,7 @@ func RPCWithRaw(method string, params interface{}) (string, int, error) {
 	output, status := librclone.RPC(method, string(inputJSON))
 
 	if status >= 400 {
-		return output, status, fmt.Errorf("RPC %s failed with status %d: %s", method, status, output)
+		return sanitizeErrorMessage(output), status, fmt.Errorf("RPC %s failed with status %d: %s", method, status, sanitizeErrorMessage(output))
 	}
 
 	return output, status, nil
@@ -174,4 +174,62 @@ func DeleteVolumeData(s3Config *S3Config, volumeID string, s3PathPrefix string) 
 // contains checks if a string contains a substring
 func contains(s, substr string) bool {
 	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
+}
+
+// sanitizeErrorMessage removes sensitive information from error messages
+// This prevents credentials from being logged
+func sanitizeErrorMessage(msg string) string {
+	// Patterns to redact (case-insensitive matching, but preserve structure)
+	patterns := []struct {
+		prefix string
+		suffix string
+	}{
+		{"access_key_id=", ","},
+		{"access_key_id=", ":"},
+		{"secret_access_key=", ","},
+		{"secret_access_key=", ":"},
+		{"password=", ","},
+		{"password=", ":"},
+		{"password2=", ","},
+		{"password2=", ":"},
+	}
+
+	result := msg
+	for _, p := range patterns {
+		result = redactBetween(result, p.prefix, p.suffix)
+	}
+
+	return result
+}
+
+// redactBetween redacts content between a prefix and suffix
+func redactBetween(s, prefix, suffix string) string {
+	result := s
+	lowerResult := strings.ToLower(result)
+	lowerPrefix := strings.ToLower(prefix)
+
+	for {
+		startIdx := strings.Index(lowerResult, lowerPrefix)
+		if startIdx == -1 {
+			break
+		}
+
+		valueStart := startIdx + len(prefix)
+		remaining := result[valueStart:]
+		lowerRemaining := strings.ToLower(remaining)
+
+		// Find the end of the value
+		endIdx := strings.Index(lowerRemaining, suffix)
+		if endIdx == -1 {
+			// No suffix found, redact to end of string
+			result = result[:valueStart] + "[REDACTED]"
+			break
+		}
+
+		// Replace the value with [REDACTED]
+		result = result[:valueStart] + "[REDACTED]" + result[valueStart+endIdx:]
+		lowerResult = strings.ToLower(result)
+	}
+
+	return result
 }

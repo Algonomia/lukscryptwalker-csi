@@ -22,7 +22,7 @@ func DefaultVFSCacheConfig() *VFSCacheConfig {
 	return &VFSCacheConfig{
 		CacheMode:    "full",
 		CacheMaxAge:  "1h",
-		CacheMaxSize: "10G",
+		CacheMaxSize: "2G",
 		WriteBack:    "5s",
 	}
 }
