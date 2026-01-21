@@ -22,6 +22,7 @@ A Kubernetes CSI driver that provides encrypted storage with two backend options
 - **rclone Integration**: Uses rclone for transparent S3 access via FUSE mount
 - **Client-Side Encryption**: Data encrypted before upload using rclone crypt
 - **Encrypted VFS Caching**: Configurable local encrypted caching (LUKS) for performance optimization
+- **Automatic Cache Cleanup**: Background process removes stale cache entries and empty directories
 
 ## Architecture
 
@@ -94,6 +95,7 @@ parameters:
   rclone-vfs-cache-mode: "full"  # off, minimal, writes, full
   rclone-vfs-cache-max-age: "1h"
   rclone-vfs-cache-max-size: "10G"
+  rclone-vfs-cache-poll-interval: "1m"  # How often to check for stale cache
 reclaimPolicy: Delete
 allowVolumeExpansion: true
 volumeBindingMode: WaitForFirstConsumer
@@ -366,6 +368,7 @@ parameters:
   # rclone-vfs-cache-mode: "full"  # off, minimal, writes, full
   # rclone-vfs-cache-max-age: "1h"
   # rclone-vfs-cache-max-size: "10G"
+  # rclone-vfs-cache-poll-interval: "1m"  # How often to check for stale cache
   # rclone-vfs-write-back: "5s"
 
 reclaimPolicy: Delete
@@ -436,15 +439,21 @@ s3StorageClasses:
       passphraseKey: "passphrase"
 
     s3:
-      bucket: "encrypted-volumes"
-      region: "gra"  # GRA, SBG, DE, UK, etc.
-      endpoint: "https://s3.gra.cloud.ovh.net"
-      forcePathStyle: false
-    pathPrefix: "my-app/data"  # Custom path - also used as encryption salt
-
-    secret:
+      pathPrefix: "my-app/data"  # Custom path - also used as encryption salt
+      secret:
         name: ovh-s3-credentials
         namespace: kube-system
+        create: false  # Create secret manually for production
+        bucket: "encrypted-volumes"
+        region: "gra"  # GRA, SBG, DE, UK, etc.
+        endpoint: "https://s3.gra.cloud.ovh.net"
+        forcePathStyle: false
+
+    vfsCache:
+      mode: "full"
+      maxAge: "1h"
+      maxSize: "2G"
+      pollInterval: "1m"
 ```
 
 ### How rclone Mount Works
@@ -479,6 +488,18 @@ s3://bucket/
 | `minimal` | Minimal caching for open files only |
 | `writes` | Cache writes, direct reads |
 | `full` | Full read/write caching (recommended) |
+
+### VFS Cache Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `rclone-vfs-cache-mode` | Cache mode (off, minimal, writes, full) | `full` |
+| `rclone-vfs-cache-max-age` | Max time to keep files in cache | `1h` |
+| `rclone-vfs-cache-max-size` | Max total size of cache | `2G` |
+| `rclone-vfs-cache-poll-interval` | How often rclone checks for stale entries | `1m` |
+| `rclone-vfs-write-back` | Delay before uploading modified files | `5s` |
+
+**Note**: The VFS cache is stored in a LUKS-encrypted volume. A background cleanup process periodically removes empty directories (which rclone doesn't clean up automatically) and performs aggressive cleanup when disk usage exceeds 85%.
 
 ### External Access with rclone CLI
 

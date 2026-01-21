@@ -21,10 +21,11 @@ const (
 	StorageBackendParam = "storage-backend"
 	S3PathPrefixParam   = "s3-path-prefix" // Custom path prefix in S3 bucket
 	// VFS Cache Parameters (for rclone mount mode)
-	VFSCacheModeParam    = "rclone-vfs-cache-mode"     // off, minimal, writes, full
-	VFSCacheMaxAgeParam  = "rclone-vfs-cache-max-age"  // e.g., "1h", "24h"
-	VFSCacheMaxSizeParam = "rclone-vfs-cache-max-size" // e.g., "10G", "100M"
-	VFSWriteBackParam    = "rclone-vfs-write-back"     // e.g., "5s", "0"
+	VFSCacheModeParam         = "rclone-vfs-cache-mode"          // off, minimal, writes, full
+	VFSCacheMaxAgeParam       = "rclone-vfs-cache-max-age"       // e.g., "1h", "24h"
+	VFSCacheMaxSizeParam      = "rclone-vfs-cache-max-size"      // e.g., "10G", "100M"
+	VFSCachePollIntervalParam = "rclone-vfs-cache-poll-interval" // e.g., "1m", "5m"
+	VFSWriteBackParam         = "rclone-vfs-write-back"          // e.g., "5s", "0"
 )
 
 // S3SyncManager holds mount managers for active S3 volumes
@@ -180,12 +181,16 @@ func (ns *NodeServer) getVFSCacheConfig(volumeContext map[string]string) *rclone
 		config.CacheMaxSize = cacheMaxSize
 	}
 
+	if cachePollInterval, exists := volumeContext[VFSCachePollIntervalParam]; exists && cachePollInterval != "" {
+		config.CachePollInterval = cachePollInterval
+	}
+
 	if writeBack, exists := volumeContext[VFSWriteBackParam]; exists && writeBack != "" {
 		config.WriteBack = writeBack
 	}
 
-	klog.V(4).Infof("VFS cache config: mode=%s, maxAge=%s, maxSize=%s, writeBack=%s",
-		config.CacheMode, config.CacheMaxAge, config.CacheMaxSize, config.WriteBack)
+	klog.V(4).Infof("VFS cache config: mode=%s, maxAge=%s, maxSize=%s, pollInterval=%s, writeBack=%s",
+		config.CacheMode, config.CacheMaxAge, config.CacheMaxSize, config.CachePollInterval, config.WriteBack)
 
 	return config
 }

@@ -48,6 +48,9 @@ parameters:
   {{- if .vfsCache.maxSize }}
   rclone-vfs-cache-max-size: {{ .vfsCache.maxSize | quote }}
   {{- end }}
+  {{- if .vfsCache.pollInterval }}
+  rclone-vfs-cache-poll-interval: {{ .vfsCache.pollInterval | quote }}
+  {{- end }}
   {{- if .vfsCache.writeBack }}
   rclone-vfs-write-back: {{ .vfsCache.writeBack | quote }}
   {{- end }}

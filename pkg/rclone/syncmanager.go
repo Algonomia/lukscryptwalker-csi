@@ -11,19 +11,21 @@ import (
 
 // VFSCacheConfig holds VFS cache configuration options
 type VFSCacheConfig struct {
-	CacheMode    string // off, minimal, writes, full
-	CacheMaxAge  string // e.g., "1h", "24h"
-	CacheMaxSize string // e.g., "10G", "100M"
-	WriteBack    string // e.g., "5s", "0" for immediate
+	CacheMode         string // off, minimal, writes, full
+	CacheMaxAge       string // e.g., "1h", "24h"
+	CacheMaxSize      string // e.g., "10G", "100M"
+	CachePollInterval string // e.g., "1m", "5m" - how often to poll for stale cache entries
+	WriteBack         string // e.g., "5s", "0" for immediate
 }
 
 // DefaultVFSCacheConfig returns sensible defaults for VFS caching
 func DefaultVFSCacheConfig() *VFSCacheConfig {
 	return &VFSCacheConfig{
-		CacheMode:    "full",
-		CacheMaxAge:  "1h",
-		CacheMaxSize: "2G",
-		WriteBack:    "5s",
+		CacheMode:         "full",
+		CacheMaxAge:       "1h",
+		CacheMaxSize:      "2G",
+		CachePollInterval: "1m", // Poll every minute for stale cache entries
+		WriteBack:         "5s",
 	}
 }
 
@@ -176,6 +178,13 @@ func (mm *MountManager) buildVFSOpt() map[string]interface{} {
 	if mm.vfsConfig.WriteBack != "" {
 		if ns, err := parseDurationToNs(mm.vfsConfig.WriteBack); err == nil {
 			vfsOpt["WriteBack"] = ns
+		}
+	}
+
+	// Cache poll interval - how often to check for stale cache entries
+	if mm.vfsConfig.CachePollInterval != "" {
+		if ns, err := parseDurationToNs(mm.vfsConfig.CachePollInterval); err == nil {
+			vfsOpt["CachePollInterval"] = ns
 		}
 	}
 

@@ -6,9 +6,19 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
+	"time"
 
 	"github.com/lukscryptwalker-csi/pkg/luks"
 	"k8s.io/klog"
+)
+
+var (
+	// vfsCacheCleanupStop is used to signal the cleanup goroutine to stop
+	vfsCacheCleanupStop chan struct{}
+	vfsCacheCleanupOnce sync.Once
+	vfsCacheCleanupMu   sync.Mutex
 )
 
 const (
@@ -238,4 +248,214 @@ func mountFilesystem(device, mountPath string) error {
 func unmountFilesystem(mountPath string) error {
 	cmd := exec.Command("umount", mountPath)
 	return cmd.Run()
+}
+
+// StartVFSCacheCleanup starts the background VFS cache cleanup goroutine
+// This should be called after SetupVFSCache succeeds
+func StartVFSCacheCleanup(cleanupInterval time.Duration, diskUsageThreshold float64) {
+	vfsCacheCleanupMu.Lock()
+	defer vfsCacheCleanupMu.Unlock()
+
+	if vfsCacheCleanupStop != nil {
+		klog.Infof("VFS cache cleanup already running")
+		return
+	}
+
+	vfsCacheCleanupStop = make(chan struct{})
+
+	go vfsCacheCleanupLoop(cleanupInterval, diskUsageThreshold, vfsCacheCleanupStop)
+	klog.Infof("Started VFS cache cleanup goroutine with interval=%v, diskUsageThreshold=%.0f%%",
+		cleanupInterval, diskUsageThreshold*100)
+}
+
+// StopVFSCacheCleanup stops the background VFS cache cleanup goroutine
+func StopVFSCacheCleanup() {
+	vfsCacheCleanupMu.Lock()
+	defer vfsCacheCleanupMu.Unlock()
+
+	if vfsCacheCleanupStop != nil {
+		close(vfsCacheCleanupStop)
+		vfsCacheCleanupStop = nil
+		klog.Infof("Stopped VFS cache cleanup goroutine")
+	}
+}
+
+// vfsCacheCleanupLoop is the main cleanup loop that runs in the background
+func vfsCacheCleanupLoop(interval time.Duration, diskUsageThreshold float64, stop chan struct{}) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	// Run cleanup immediately on start
+	runVFSCacheCleanup(diskUsageThreshold)
+
+	for {
+		select {
+		case <-ticker.C:
+			runVFSCacheCleanup(diskUsageThreshold)
+		case <-stop:
+			klog.Infof("VFS cache cleanup goroutine stopping")
+			return
+		}
+	}
+}
+
+// runVFSCacheCleanup performs a single cleanup pass
+func runVFSCacheCleanup(diskUsageThreshold float64) {
+	mountPath := VFSCacheBasePath
+
+	// Check if the VFS cache is mounted
+	if !isVFSCacheMounted(mountPath) {
+		klog.V(5).Infof("VFS cache not mounted, skipping cleanup")
+		return
+	}
+
+	// Check disk usage and perform aggressive cleanup if needed
+	usagePercent, err := getVFSCacheDiskUsage(mountPath)
+	if err != nil {
+		klog.V(4).Infof("Failed to get VFS cache disk usage: %v", err)
+	} else {
+		klog.V(5).Infof("VFS cache disk usage: %.1f%%", usagePercent*100)
+
+		if usagePercent >= diskUsageThreshold {
+			klog.Warningf("VFS cache disk usage (%.1f%%) exceeds threshold (%.0f%%), performing aggressive cleanup",
+				usagePercent*100, diskUsageThreshold*100)
+			aggressiveVFSCacheCleanup(mountPath)
+		}
+	}
+
+	// Always clean up empty directories
+	removedDirs := cleanupEmptyDirectories(mountPath)
+	if removedDirs > 0 {
+		klog.Infof("Cleaned up %d empty directories from VFS cache", removedDirs)
+	}
+}
+
+// getVFSCacheDiskUsage returns the disk usage percentage (0.0-1.0) of the VFS cache mount
+func getVFSCacheDiskUsage(mountPath string) (float64, error) {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(mountPath, &stat); err != nil {
+		return 0, fmt.Errorf("statfs failed: %w", err)
+	}
+
+	total := stat.Blocks * uint64(stat.Bsize)
+	free := stat.Bfree * uint64(stat.Bsize)
+	used := total - free
+
+	if total == 0 {
+		return 0, fmt.Errorf("total size is zero")
+	}
+
+	return float64(used) / float64(total), nil
+}
+
+// cleanupEmptyDirectories removes empty directories from the VFS cache
+// Returns the number of directories removed
+func cleanupEmptyDirectories(basePath string) int {
+	removedCount := 0
+
+	// Walk the directory tree from bottom up to remove empty directories
+	// We need multiple passes since removing a directory may make its parent empty
+	for {
+		removed := 0
+		err := filepath.Walk(basePath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil // Skip paths we can't access
+			}
+
+			// Skip the base path itself
+			if path == basePath {
+				return nil
+			}
+
+			// Only process directories
+			if !info.IsDir() {
+				return nil
+			}
+
+			// Check if directory is empty
+			entries, err := os.ReadDir(path)
+			if err != nil {
+				return nil // Skip if we can't read
+			}
+
+			if len(entries) == 0 {
+				if err := os.Remove(path); err != nil {
+					klog.V(5).Infof("Failed to remove empty directory %s: %v", path, err)
+				} else {
+					klog.V(4).Infof("Removed empty VFS cache directory: %s", path)
+					removed++
+				}
+			}
+
+			return nil
+		})
+
+		if err != nil {
+			klog.V(4).Infof("Error walking VFS cache directory: %v", err)
+			break
+		}
+
+		if removed == 0 {
+			break // No more empty directories
+		}
+		removedCount += removed
+	}
+
+	return removedCount
+}
+
+// aggressiveVFSCacheCleanup performs aggressive cleanup when disk usage is high
+// This removes old cached files to free up space
+func aggressiveVFSCacheCleanup(basePath string) {
+	klog.Infof("Starting aggressive VFS cache cleanup at %s", basePath)
+
+	// Find and remove old cache files (files not accessed recently)
+	// rclone stores cache in vfs/<remote>/... structure
+	vfsDir := filepath.Join(basePath, "vfs")
+	if _, err := os.Stat(vfsDir); os.IsNotExist(err) {
+		klog.V(4).Infof("VFS directory %s does not exist, skipping aggressive cleanup", vfsDir)
+		return
+	}
+
+	// Calculate cutoff time - remove files older than 30 minutes when under pressure
+	cutoffTime := time.Now().Add(-30 * time.Minute)
+	removedFiles := 0
+	freedBytes := int64(0)
+
+	err := filepath.Walk(vfsDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // Skip inaccessible paths
+		}
+
+		// Skip directories
+		if info.IsDir() {
+			return nil
+		}
+
+		// Check if file is old enough to remove
+		if info.ModTime().Before(cutoffTime) {
+			size := info.Size()
+			if err := os.Remove(path); err != nil {
+				klog.V(5).Infof("Failed to remove old cache file %s: %v", path, err)
+			} else {
+				removedFiles++
+				freedBytes += size
+				klog.V(4).Infof("Removed old cache file: %s (age: %v)", path, time.Since(info.ModTime()))
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		klog.Warningf("Error during aggressive VFS cache cleanup: %v", err)
+	}
+
+	if removedFiles > 0 {
+		klog.Infof("Aggressive cleanup removed %d files, freed %.2f MB",
+			removedFiles, float64(freedBytes)/(1024*1024))
+	}
+
+	// Also clean up empty directories after removing files
+	cleanupEmptyDirectories(basePath)
 }

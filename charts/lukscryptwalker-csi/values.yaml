@@ -45,6 +45,8 @@ controller:
 node:
   # VFS cache configuration
   vfsCacheSize: "20G"  # Size of the encrypted LUKS volume for VFS cache
+  vfsCacheCleanupInterval: "5m"  # How often to run VFS cache directory cleanup
+  vfsCacheDiskThreshold: 0.85  # Disk usage threshold (0.0-1.0) to trigger aggressive cleanup
 
   # Sidecar images
   sidecars:
@@ -229,6 +231,7 @@ s3StorageClasses:
       mode: "full"  # Options: off, minimal, writes, full
       maxAge: "1h"  # Max time to keep file in cache
       maxSize: "1G"  # Max total size of cache
+      pollInterval: "1m"  # How often rclone checks for stale cache entries
       writeBack: "5s"  # Time to wait before uploading modified files
 
   # Example S3 StorageClass with minimal caching (saves local space)

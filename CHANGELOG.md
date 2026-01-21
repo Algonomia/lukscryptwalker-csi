@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- VFS cache directory cleanup mechanism to prevent I/O errors from full LUKS volume
+- Background goroutine for periodic empty directory cleanup in VFS cache
+- Disk usage monitoring with configurable threshold for aggressive cache cleanup
+- `CachePollInterval` configuration for rclone VFS cache (ensures stale file cleanup)
+- New Helm chart parameters: `node.vfsCacheCleanupInterval`, `node.vfsCacheDiskThreshold`
+- New StorageClass parameter: `rclone-vfs-cache-poll-interval`
+
+### Fixed
+- VFS cache directories not being cleaned up after cache expiration (rclone limitation workaround)
+- I/O errors when VFS cache fills up the LUKS-encrypted volume
+
+### Added
 - Enterprise-grade CI/CD pipeline with GitHub Actions
 - Multi-architecture Docker builds (amd64, arm64)
 - Container image signing with cosign and SBOM generation

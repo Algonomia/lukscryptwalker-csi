@@ -73,6 +73,14 @@ The following table lists the configurable parameters and their default values:
 | `s3StorageClasses[].s3.secret.endpoint` | S3 endpoint URL (in secret) | (AWS default) |
 | `s3StorageClasses[].s3.secret.forcePathStyle` | Force path-style URLs (in secret) | `false` |
 
+### Node Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `node.vfsCacheSize` | Size of encrypted LUKS volume for VFS cache | `20G` |
+| `node.vfsCacheCleanupInterval` | Interval for VFS cache directory cleanup | `5m` |
+| `node.vfsCacheDiskThreshold` | Disk usage threshold (0.0-1.0) for aggressive cleanup | `0.85` |
+
 ### VFS Cache Parameters (rclone mount)
 
 | Parameter | Description | Default |
@@ -80,6 +88,7 @@ The following table lists the configurable parameters and their default values:
 | `s3StorageClasses[].vfsCache.mode` | Cache mode: off, minimal, writes, full | `full` |
 | `s3StorageClasses[].vfsCache.maxAge` | Max time to keep files in cache | `1h` |
 | `s3StorageClasses[].vfsCache.maxSize` | Max total size of cache | `1G` |
+| `s3StorageClasses[].vfsCache.pollInterval` | How often rclone checks for stale cache entries | `1m` |
 | `s3StorageClasses[].vfsCache.writeBack` | Time to wait before uploading modified files | `5s` |
 
 ## Example Values
@@ -139,10 +148,17 @@ s3StorageClasses:
 
     # VFS Cache Configuration
     vfsCache:
-      mode: "full"      # off, minimal, writes, full
-      maxAge: "1h"      # Max time to keep files in cache
-      maxSize: "1G"     # Max total cache size
-      writeBack: "5s"   # Time before uploading modified files
+      mode: "full"        # off, minimal, writes, full
+      maxAge: "1h"        # Max time to keep files in cache
+      maxSize: "1G"       # Max total cache size
+      pollInterval: "1m"  # How often rclone checks for stale entries
+      writeBack: "5s"     # Time before uploading modified files
+
+# Node configuration
+node:
+  vfsCacheSize: "20G"              # Size of LUKS-encrypted VFS cache volume
+  vfsCacheCleanupInterval: "5m"    # How often to cleanup empty directories
+  vfsCacheDiskThreshold: 0.85      # Trigger aggressive cleanup at 85% usage
 
 # Resource limits
 controller:

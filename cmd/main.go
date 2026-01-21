@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/lukscryptwalker-csi/pkg/driver"
 	"github.com/lukscryptwalker-csi/pkg/rclone"
@@ -18,13 +19,16 @@ import (
 )
 
 var (
-	endpoint = flag.String("endpoint", "unix:///tmp/csi.sock", "CSI endpoint")
-	nodeID   = flag.String("nodeid", "", "node id")
-	version  = flag.Bool("version", false, "Print the version and exit.")
-	vfsCacheSize = flag.String("vfs-cache-size", "20G", "Size of the encrypted LUKS volume for VFS cache")
-	luksSecretName = flag.String("luks-secret-name", "luks-secret", "Name of the Kubernetes secret containing LUKS passphrase")
+	endpoint            = flag.String("endpoint", "unix:///tmp/csi.sock", "CSI endpoint")
+	nodeID              = flag.String("nodeid", "", "node id")
+	version             = flag.Bool("version", false, "Print the version and exit.")
+	vfsCacheSize        = flag.String("vfs-cache-size", "20G", "Size of the encrypted LUKS volume for VFS cache")
+	luksSecretName      = flag.String("luks-secret-name", "luks-secret", "Name of the Kubernetes secret containing LUKS passphrase")
 	luksSecretNamespace = flag.String("luks-secret-namespace", "kube-system", "Namespace of the LUKS secret")
-	luksSecretKey = flag.String("luks-secret-key", "passphrase", "Key within the secret containing the passphrase")
+	luksSecretKey       = flag.String("luks-secret-key", "passphrase", "Key within the secret containing the passphrase")
+	// VFS cache cleanup settings
+	vfsCacheCleanupInterval    = flag.Duration("vfs-cache-cleanup-interval", 5*time.Minute, "Interval for VFS cache directory cleanup")
+	vfsCacheDiskUsageThreshold = flag.Float64("vfs-cache-disk-threshold", 0.85, "Disk usage threshold (0.0-1.0) to trigger aggressive cache cleanup")
 )
 
 // isControllerMode detects if we're running in controller mode based on the endpoint path
@@ -85,7 +89,13 @@ func main() {
 		if err != nil {
 			klog.Fatalf("Failed to set up encrypted VFS cache: %v", err)
 		}
+
+		// Start background VFS cache cleanup to remove empty directories and manage disk usage
+		rclone.StartVFSCacheCleanup(*vfsCacheCleanupInterval, *vfsCacheDiskUsageThreshold)
+
 		defer func() {
+			// Stop cleanup before teardown
+			rclone.StopVFSCacheCleanup()
 			if err := rclone.TeardownVFSCache(); err != nil {
 				klog.Errorf("Failed to teardown VFS cache: %v", err)
 			}
