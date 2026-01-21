@@ -17,7 +17,6 @@ import (
 var (
 	// vfsCacheCleanupStop is used to signal the cleanup goroutine to stop
 	vfsCacheCleanupStop chan struct{}
-	vfsCacheCleanupOnce sync.Once
 	vfsCacheCleanupMu   sync.Mutex
 )
 
