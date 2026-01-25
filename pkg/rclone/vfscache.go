@@ -18,6 +18,8 @@ var (
 	// vfsCacheCleanupStop is used to signal the cleanup goroutine to stop
 	vfsCacheCleanupStop chan struct{}
 	vfsCacheCleanupMu   sync.Mutex
+	// vfsCacheSize stores the configured VFS cache size in bytes
+	vfsCacheSize int64 = 20 * 1024 * 1024 * 1024 // 20GB default
 )
 
 const (
@@ -45,6 +47,9 @@ func SetupVFSCache(sizeStr string, passphrase string) (string, error) {
 			klog.Warningf("Failed to parse VFS cache size '%s', using default 20GB: %v", sizeStr, err)
 		}
 	}
+
+	// Store the cache size globally for later use
+	vfsCacheSize = cacheSize
 
 	klog.Infof("Setting up encrypted VFS cache: size=%d bytes, backing=%s, mount=%s",
 		cacheSize, VFSCacheBackingFile, mountPath)
@@ -457,4 +462,9 @@ func aggressiveVFSCacheCleanup(basePath string) {
 
 	// Also clean up empty directories after removing files
 	cleanupEmptyDirectories(basePath)
+}
+
+// GetVFSCacheSize returns the configured VFS cache size in bytes
+func GetVFSCacheSize() int64 {
+	return vfsCacheSize
 }

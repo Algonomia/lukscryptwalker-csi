@@ -145,6 +145,10 @@ func (mm *MountManager) buildVFSOpt() map[string]interface{} {
 		"Links":              true,     // Enable symlink support
 	}
 
+	// Set VFS disk space total size to match the LUKS VFS cache volume size
+	// This helps rclone manage disk space within the allocated encrypted volume
+	vfsOpt["DiskSpaceTotalSize"] = GetVFSCacheSize()
+
 	// Cache mode
 	if mm.vfsConfig.CacheMode != "" {
 		// Map string to CacheMode value
@@ -221,6 +225,9 @@ func (mm *MountManager) Unmount() error {
 	}
 
 	mm.mounted = false
+
+	// Clean up VFS cache directory for this volume after successful unmount
+	mm.cleanupVFSCacheDir()
 
 	klog.Infof("Successfully unmounted encrypted S3 volume %s", mm.volumeID)
 	return nil
@@ -308,6 +315,30 @@ func (mm *MountManager) isMountPoint() bool {
 	}
 
 	return false
+}
+
+// cleanupVFSCacheDir removes VFS cache entries for this specific volume's mount
+func (mm *MountManager) cleanupVFSCacheDir() {
+	klog.Infof("Cleaning up VFS directory cache for volume %s", mm.volumeID)
+
+	// Build the crypt remote string to identify the VFS
+	cryptRemote, err := BuildCryptRemoteString(mm.s3Config, mm.cryptConfig, mm.s3BasePath)
+	if err != nil {
+		klog.Warningf("Failed to build crypt remote for VFS cache cleanup: %v", err)
+		return
+	}
+
+	// Use vfs/forget to clear the directory cache for this specific VFS
+	params := map[string]interface{}{
+		"fs": cryptRemote,
+	}
+
+	_, err = RPC("vfs/forget", params)
+	if err != nil {
+		klog.Warningf("vfs/forget failed for volume %s", mm.volumeID)
+	} else {
+		klog.Infof("Successfully cleared VFS directory cache for volume %s", mm.volumeID)
+	}
 }
 
 // IsMounted returns whether the volume is currently mounted
