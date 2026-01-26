@@ -5,8 +5,14 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 
 	"k8s.io/klog"
+)
+
+var (
+	// vfsMountMu protects vfs/list operations during mount to correctly identify new VFS entries
+	vfsMountMu sync.Mutex
 )
 
 // VFSCacheConfig holds VFS cache configuration options
@@ -38,6 +44,7 @@ type MountManager struct {
 	mountPoint  string
 	s3BasePath  string
 	mounted     bool
+	vfsName     string // VFS name from vfs/list, used for vfs/forget on unmount
 }
 
 // NewMountManager creates a new rclone mount manager
@@ -75,6 +82,28 @@ func NewMountManager(s3Config *S3Config, volumeID, mountPoint string, vfsConfig 
 
 	klog.Infof("Created rclone mount manager for volume %s at %s (s3Path: %s)", volumeID, mountPoint, s3BasePath)
 	return manager, nil
+}
+
+// getVFSNames returns a set of VFS names from vfs/list RPC
+func getVFSNames() (map[string]bool, error) {
+	result, err := RPC("vfs/list", map[string]interface{}{})
+	if err != nil {
+		return nil, fmt.Errorf("vfs/list failed: %w", err)
+	}
+
+	names := make(map[string]bool)
+	if result != nil && result.Output != nil {
+		if vfses, ok := result.Output["vfses"].([]interface{}); ok {
+			for _, v := range vfses {
+				if vfs, ok := v.(map[string]interface{}); ok {
+					if name, ok := vfs["Name"].(string); ok && name != "" {
+						names[name] = true
+					}
+				}
+			}
+		}
+	}
+	return names, nil
 }
 
 // Mount mounts the encrypted S3 remote at the mount point using librclone
@@ -124,11 +153,40 @@ func (mm *MountManager) Mount() error {
 		"vfsOpt":     vfsOpt,
 	}
 
+	// Lock to safely identify the new VFS entry by comparing before/after
+	vfsMountMu.Lock()
+	defer vfsMountMu.Unlock()
+
+	// Get VFS names before mounting
+	vfsNamesBefore, err := getVFSNames()
+	if err != nil {
+		klog.Warningf("Failed to get VFS names before mount: %v", err)
+		vfsNamesBefore = make(map[string]bool)
+	}
+
 	klog.Infof("Calling mount/mount RPC for volume %s", mm.volumeID)
 
 	_, err = RPC("mount/mount", params)
 	if err != nil {
 		return fmt.Errorf("failed to mount: %w", err)
+	}
+
+	// Get VFS names after mounting and find the new entry
+	vfsNamesAfter, err := getVFSNames()
+	if err != nil {
+		klog.Warningf("Failed to get VFS names after mount: %v", err)
+	} else {
+		// Find the new VFS name (present in after but not in before)
+		for name := range vfsNamesAfter {
+			if !vfsNamesBefore[name] {
+				mm.vfsName = name
+				klog.Infof("Identified VFS name for volume %s: %s", mm.volumeID, mm.vfsName)
+				break
+			}
+		}
+		if mm.vfsName == "" {
+			klog.Warningf("Could not identify VFS name for volume %s", mm.volumeID)
+		}
 	}
 
 	mm.mounted = true
@@ -224,6 +282,9 @@ func (mm *MountManager) Unmount() error {
 		}
 	}
 
+	// Clean up the on-disk VFS cache directory after unmount
+	mm.cleanupVFSCacheDir()
+
 	mm.mounted = false
 
 	klog.Infof("Successfully unmounted encrypted S3 volume %s", mm.volumeID)
@@ -314,27 +375,23 @@ func (mm *MountManager) isMountPoint() bool {
 	return false
 }
 
-// cleanupVFSCacheDir removes VFS cache entries for this specific volume's mount
+// cleanupVFSCacheDir removes the on-disk VFS cache directory after unmount
 func (mm *MountManager) cleanupVFSCacheDir() {
-	klog.Infof("Cleaning up VFS directory cache for volume %s", mm.volumeID)
-
-	// Build the crypt remote string to identify the VFS
-	cryptRemote, err := BuildCryptRemoteString(mm.s3Config, mm.cryptConfig, mm.s3BasePath)
-	if err != nil {
-		klog.Warningf("Failed to build crypt remote for VFS cache cleanup: %v", err)
+	if mm.vfsName == "" {
+		klog.Warningf("No VFS name stored for volume %s, skipping cache cleanup", mm.volumeID)
 		return
 	}
 
-	// Use vfs/forget to clear the directory cache for this specific VFS
-	params := map[string]interface{}{
-		"fs": cryptRemote,
-	}
+	// VFS cache is stored at ~/.cache/rclone/vfs/<vfsName>/
+	// Since we mount the encrypted LUKS volume at /root/.cache/rclone, the path is:
+	cacheDir := fmt.Sprintf("%s/vfs/%s", VFSCacheBasePath, mm.vfsName)
 
-	_, err = RPC("vfs/forget", params)
-	if err != nil {
-		klog.Warningf("vfs/forget failed for volume %s", mm.volumeID)
+	klog.Infof("Cleaning up VFS cache directory for volume %s: %s", mm.volumeID, cacheDir)
+
+	if err := os.RemoveAll(cacheDir); err != nil {
+		klog.Warningf("Failed to remove VFS cache directory %s: %v", cacheDir, err)
 	} else {
-		klog.Infof("Successfully cleared VFS directory cache for volume %s", mm.volumeID)
+		klog.Infof("Successfully removed VFS cache directory for volume %s", mm.volumeID)
 	}
 }
 
