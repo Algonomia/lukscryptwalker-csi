@@ -2,8 +2,8 @@ apiVersion: v2
 name: lukscryptwalker-csi
 description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI driver with LUKS encryption
 type: application
-version: 1.2.9
-appVersion: "1.2.9"
+version: 1.2.10
+appVersion: "1.2.10"
 keywords:
   - storage
   - csi
