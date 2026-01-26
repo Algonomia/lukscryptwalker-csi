@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"k8s.io/klog"
 )
@@ -106,6 +107,39 @@ func getVFSNames() (map[string]bool, error) {
 	return names, nil
 }
 
+// identifyVFSName identifies the VFS name for this volume with retry logic
+func (mm *MountManager) identifyVFSName(vfsNamesBefore map[string]bool) {
+	maxRetries := 5
+	retryDelay := 200 * time.Millisecond
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			klog.V(4).Infof("Retrying VFS name identification for volume %s (attempt %d/%d)", mm.volumeID, attempt+1, maxRetries)
+			time.Sleep(retryDelay)
+		}
+
+		vfsNamesAfter, err := getVFSNames()
+		if err != nil {
+			klog.Warningf("Failed to get VFS names after mount (attempt %d): %v", attempt+1, err)
+			continue
+		}
+
+		// Find the new VFS name (present in after but not in before)
+		for name := range vfsNamesAfter {
+			if !vfsNamesBefore[name] {
+				mm.vfsName = name
+				klog.Infof("Successfully identified VFS name for volume %s: %s", mm.volumeID, mm.vfsName)
+				return
+			}
+		}
+
+		// Increase delay for subsequent retries
+		retryDelay *= 2
+	}
+
+	klog.Warningf("Could not identify VFS name for volume %s after %d attempts", mm.volumeID, maxRetries)
+}
+
 // Mount mounts the encrypted S3 remote at the mount point using librclone
 func (mm *MountManager) Mount() error {
 
@@ -171,23 +205,8 @@ func (mm *MountManager) Mount() error {
 		return fmt.Errorf("failed to mount: %w", err)
 	}
 
-	// Get VFS names after mounting and find the new entry
-	vfsNamesAfter, err := getVFSNames()
-	if err != nil {
-		klog.Warningf("Failed to get VFS names after mount: %v", err)
-	} else {
-		// Find the new VFS name (present in after but not in before)
-		for name := range vfsNamesAfter {
-			if !vfsNamesBefore[name] {
-				mm.vfsName = name
-				klog.Infof("Identified VFS name for volume %s: %s", mm.volumeID, mm.vfsName)
-				break
-			}
-		}
-		if mm.vfsName == "" {
-			klog.Warningf("Could not identify VFS name for volume %s", mm.volumeID)
-		}
-	}
+	// Get VFS names after mounting with retry logic to handle timing issues
+	mm.identifyVFSName(vfsNamesBefore)
 
 	mm.mounted = true
 	klog.Infof("Successfully mounted encrypted S3 volume %s at %s", mm.volumeID, mm.mountPoint)
