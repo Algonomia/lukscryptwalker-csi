@@ -226,9 +226,6 @@ func (mm *MountManager) Unmount() error {
 
 	mm.mounted = false
 
-	// Clean up VFS cache directory for this volume after successful unmount
-	mm.cleanupVFSCacheDir()
-
 	klog.Infof("Successfully unmounted encrypted S3 volume %s", mm.volumeID)
 	return nil
 }
