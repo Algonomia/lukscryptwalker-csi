@@ -96,10 +96,8 @@ func getVFSNames() (map[string]bool, error) {
 	if result != nil && result.Output != nil {
 		if vfses, ok := result.Output["vfses"].([]interface{}); ok {
 			for _, v := range vfses {
-				if vfs, ok := v.(map[string]interface{}); ok {
-					if name, ok := vfs["Name"].(string); ok && name != "" {
-						names[name] = true
-					}
+				if name, ok := v.(string); ok && name != "" {
+					names[name] = true
 				}
 			}
 		}
@@ -114,7 +112,7 @@ func (mm *MountManager) identifyVFSName(vfsNamesBefore map[string]bool) {
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if attempt > 0 {
-			klog.V(4).Infof("Retrying VFS name identification for volume %s (attempt %d/%d)", mm.volumeID, attempt+1, maxRetries)
+			klog.Infof("Retrying VFS name identification for volume %s (attempt %d/%d)", mm.volumeID, attempt+1, maxRetries)
 			time.Sleep(retryDelay)
 		}
 
