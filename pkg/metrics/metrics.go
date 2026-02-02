@@ -200,25 +200,3 @@ func RecordOperation(operation, status string, durationSeconds float64) {
 }
 
 // SetVolumesTotal sets the total number of volumes for a backend
-func SetVolumesTotal(backend string, count int) {
-	VolumesTotal.WithLabelValues(backend, nodeID).Set(float64(count))
-}
-
-// SetS3CacheSize sets the current S3 cache size
-func SetS3CacheSize(sizeBytes int64) {
-	S3CacheSizeBytes.WithLabelValues(nodeID).Set(float64(sizeBytes))
-}
-
-// SetS3CacheMax sets the maximum S3 cache size
-func SetS3CacheMax(maxBytes int64) {
-	S3CacheMaxBytes.WithLabelValues(nodeID).Set(float64(maxBytes))
-}
-
-// SetHealthy sets the driver health status
-func SetHealthy(healthy bool) {
-	val := float64(0)
-	if healthy {
-		val = 1
-	}
-	DriverHealthy.WithLabelValues(nodeID).Set(val)
-}
