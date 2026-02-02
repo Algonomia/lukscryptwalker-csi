@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/lukscryptwalker-csi/pkg/driver"
+	"github.com/lukscryptwalker-csi/pkg/metrics"
 	"github.com/lukscryptwalker-csi/pkg/rclone"
 	"github.com/lukscryptwalker-csi/pkg/secrets"
 	"k8s.io/client-go/kubernetes"
@@ -22,6 +23,7 @@ var (
 	endpoint            = flag.String("endpoint", "unix:///tmp/csi.sock", "CSI endpoint")
 	nodeID              = flag.String("nodeid", "", "node id")
 	version             = flag.Bool("version", false, "Print the version and exit.")
+	metricsAddr         = flag.String("metrics-addr", ":9090", "Address to serve metrics on")
 	vfsCacheSize        = flag.String("vfs-cache-size", "20G", "Size of the encrypted LUKS volume for VFS cache")
 	luksSecretName      = flag.String("luks-secret-name", "luks-secret", "Name of the Kubernetes secret containing LUKS passphrase")
 	luksSecretNamespace = flag.String("luks-secret-namespace", "kube-system", "Namespace of the LUKS secret")
@@ -113,6 +115,10 @@ func main() {
         klog.Fatalf("Failed to initialize rclone: %v", err)
     }
     defer rclone.Finalize()
+
+	// Initialize and start metrics server
+	metrics.Initialize(*nodeID)
+	metrics.StartServer(*metricsAddr, driver.GetVersion())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
