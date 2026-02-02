@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/container-storage-interface/spec v1.12.0
-	github.com/rclone/rclone v1.72.1
+	github.com/rclone/rclone v1.73.0
 	github.com/stretchr/testify v1.11.1
 	google.golang.org/grpc v1.78.0
 	k8s.io/api v0.35.0
@@ -108,7 +108,7 @@ require (
 	github.com/tklauser/go-sysconf v0.3.15 // indirect
 	github.com/tklauser/numcpus v0.10.0 // indirect
 	github.com/unknwon/goconfig v1.0.0 // indirect
-	github.com/winfsp/cgofuse v1.6.1-0.20250813110601-7d90b0992471 // indirect
+	github.com/winfsp/cgofuse v1.6.1-0.20260126094232-f2c4fccdb286 // indirect
 	github.com/wk8/go-ordered-map/v2 v2.1.8 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect
