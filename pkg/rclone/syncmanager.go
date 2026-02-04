@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"k8s.io/klog"
 )
@@ -95,15 +96,48 @@ func getVFSNames() (map[string]bool, error) {
 	if result != nil && result.Output != nil {
 		if vfses, ok := result.Output["vfses"].([]interface{}); ok {
 			for _, v := range vfses {
-				if vfs, ok := v.(map[string]interface{}); ok {
-					if name, ok := vfs["Name"].(string); ok && name != "" {
-						names[name] = true
-					}
+				if name, ok := v.(string); ok && name != "" {
+					names[name] = true
 				}
 			}
 		}
 	}
 	return names, nil
+}
+
+// identifyVFSName identifies the VFS name for this volume with retry logic
+func (mm *MountManager) identifyVFSName(vfsNamesBefore map[string]bool) {
+	maxRetries := 5
+	retryDelay := 200 * time.Millisecond
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			klog.Infof("Retrying VFS name identification for volume %s (attempt %d/%d)", mm.volumeID, attempt+1, maxRetries)
+			time.Sleep(retryDelay)
+		}
+
+		vfsNamesAfter, err := getVFSNames()
+		if err != nil {
+			klog.Warningf("Failed to get VFS names after mount (attempt %d): %v", attempt+1, err)
+			continue
+		}
+
+		// Find the new VFS name (present in after but not in before)
+		for name := range vfsNamesAfter {
+			if !vfsNamesBefore[name] {
+				// The vfsName from vfs/list has a trailing colon
+				// but rclone creates cache directories without it, so strip it here
+				mm.vfsName = strings.TrimSuffix(name, ":")
+				klog.Infof("Successfully identified VFS name for volume %s: %s", mm.volumeID, mm.vfsName)
+				return
+			}
+		}
+
+		// Increase delay for subsequent retries
+		retryDelay *= 2
+	}
+
+	klog.Warningf("Could not identify VFS name for volume %s after %d attempts", mm.volumeID, maxRetries)
 }
 
 // Mount mounts the encrypted S3 remote at the mount point using librclone
@@ -171,25 +205,8 @@ func (mm *MountManager) Mount() error {
 		return fmt.Errorf("failed to mount: %w", err)
 	}
 
-	// Get VFS names after mounting and find the new entry
-	vfsNamesAfter, err := getVFSNames()
-	if err != nil {
-		klog.Warningf("Failed to get VFS names after mount: %v", err)
-	} else {
-		// Find the new VFS name (present in after but not in before)
-		for name := range vfsNamesAfter {
-			if !vfsNamesBefore[name] {
-				// The vfsName from vfs/list has a trailing colon (e.g., ":crypt{5NTQG}:")
-				// but rclone creates cache directories without it, so strip it here
-				mm.vfsName = strings.TrimSuffix(name, ":")
-				klog.Infof("Identified VFS name for volume %s: %s", mm.volumeID, mm.vfsName)
-				break
-			}
-		}
-		if mm.vfsName == "" {
-			klog.Warningf("Could not identify VFS name for volume %s", mm.volumeID)
-		}
-	}
+	// Get VFS names after mounting with retry logic to handle timing issues
+	mm.identifyVFSName(vfsNamesBefore)
 
 	mm.mounted = true
 	klog.Infof("Successfully mounted encrypted S3 volume %s at %s", mm.volumeID, mm.mountPoint)
