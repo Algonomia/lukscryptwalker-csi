@@ -421,8 +421,8 @@ func aggressiveVFSCacheCleanup(basePath string) {
 		return
 	}
 
-	// Calculate cutoff time - remove files older than 30 minutes when under pressure
-	cutoffTime := time.Now().Add(-30 * time.Minute)
+	// Calculate cutoff time - remove files older than 60 minutes when under pressure
+	cutoffTime := time.Now().Add(-60 * time.Minute)
 	removedFiles := 0
 	freedBytes := int64(0)
 

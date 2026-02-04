@@ -28,10 +28,10 @@ type VFSCacheConfig struct {
 func DefaultVFSCacheConfig() *VFSCacheConfig {
 	return &VFSCacheConfig{
 		CacheMode:         "full",
-		CacheMaxAge:       "1h",
-		CacheMaxSize:      "2G",
-		CachePollInterval: "1m", // Poll every minute for stale cache entries
-		WriteBack:         "5s",
+		CacheMaxAge:       "4h",  // 4 hours to handle long-running operations
+		CacheMaxSize:      "5G", // 5GB to handle large files
+		CachePollInterval: "1m",  // Poll every minute for stale cache entries
+		WriteBack:         "3s",  // Start uploads quickly to reduce cache pressure
 	}
 }
 
@@ -179,7 +179,9 @@ func (mm *MountManager) Mount() error {
 		// Find the new VFS name (present in after but not in before)
 		for name := range vfsNamesAfter {
 			if !vfsNamesBefore[name] {
-				mm.vfsName = name
+				// The vfsName from vfs/list has a trailing colon (e.g., ":crypt{5NTQG}:")
+				// but rclone creates cache directories without it, so strip it here
+				mm.vfsName = strings.TrimSuffix(name, ":")
 				klog.Infof("Identified VFS name for volume %s: %s", mm.volumeID, mm.vfsName)
 				break
 			}
@@ -310,7 +312,7 @@ func (mm *MountManager) waitForPendingUploads() {
 	sleepCmd := exec.Command("sleep", fmt.Sprintf("%d", writeBackWait))
 	_ = sleepCmd.Run()
 
-	maxWaitTime := 300 // 5 minutes max wait
+	maxWaitTime := 1800 // 30 minutes max wait
 	pollInterval := 2  // Check every 2 seconds
 
 	for i := 0; i < maxWaitTime/pollInterval; i++ {
