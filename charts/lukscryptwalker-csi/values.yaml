@@ -1,6 +1,6 @@
 image:
   repository: ghcr.io/algonomia/lukscryptwalker-csi
-  tag: "v1.2.12"
+  tag: "v1.2.13"
   pullPolicy: IfNotPresent
 
 # Image pull secrets
@@ -179,6 +179,12 @@ podSecurityContext:
 # Logging
 logging:
   level: 4
+
+metrics:
+  enabled: true
+  port: 9090
+  service:
+    annotations: {}
 
 # Node selector for deployment
 nodeSelector: {}
