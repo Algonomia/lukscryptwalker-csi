@@ -326,12 +326,6 @@ func runVFSCacheCleanup(diskUsageThreshold float64) {
 			aggressiveVFSCacheCleanup(mountPath)
 		}
 	}
-
-	// Always clean up empty directories
-	removedDirs := cleanupEmptyDirectories(mountPath)
-	if removedDirs > 0 {
-		klog.Infof("Cleaned up %d empty directories from VFS cache", removedDirs)
-	}
 }
 
 // getVFSCacheDiskUsage returns the disk usage percentage (0.0-1.0) of the VFS cache mount
@@ -350,62 +344,6 @@ func getVFSCacheDiskUsage(mountPath string) (float64, error) {
 	}
 
 	return float64(used) / float64(total), nil
-}
-
-// cleanupEmptyDirectories removes empty directories from the VFS cache
-// Returns the number of directories removed
-func cleanupEmptyDirectories(basePath string) int {
-	removedCount := 0
-
-	// Walk the directory tree from bottom up to remove empty directories
-	// We need multiple passes since removing a directory may make its parent empty
-	for {
-		removed := 0
-		err := filepath.Walk(basePath, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil // Skip paths we can't access
-			}
-
-			// Skip the base path itself
-			if path == basePath {
-				return nil
-			}
-
-			// Only process directories
-			if !info.IsDir() {
-				return nil
-			}
-
-			// Check if directory is empty
-			entries, err := os.ReadDir(path)
-			if err != nil {
-				return nil // Skip if we can't read
-			}
-
-			if len(entries) == 0 {
-				if err := os.Remove(path); err != nil {
-					klog.V(5).Infof("Failed to remove empty directory %s: %v", path, err)
-				} else {
-					klog.V(4).Infof("Removed empty VFS cache directory: %s", path)
-					removed++
-				}
-			}
-
-			return nil
-		})
-
-		if err != nil {
-			klog.V(4).Infof("Error walking VFS cache directory: %v", err)
-			break
-		}
-
-		if removed == 0 {
-			break // No more empty directories
-		}
-		removedCount += removed
-	}
-
-	return removedCount
 }
 
 // aggressiveVFSCacheCleanup performs aggressive cleanup when disk usage is high
@@ -460,8 +398,6 @@ func aggressiveVFSCacheCleanup(basePath string) {
 			removedFiles, float64(freedBytes)/(1024*1024))
 	}
 
-	// Also clean up empty directories after removing files
-	cleanupEmptyDirectories(basePath)
 }
 
 // GetVFSCacheSize returns the configured VFS cache size in bytes
