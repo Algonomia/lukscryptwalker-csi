@@ -5,7 +5,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.2.13
-    created: "2026-02-04T13:43:23.850808966Z"
+    created: "2026-02-09T16:06:04.027983391Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: f4bd48b484726666eca2e6aa0a57ac49b718c193a35a102442832664262efca6
@@ -29,7 +29,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.2.12
-    created: "2026-02-04T13:43:23.850059396Z"
+    created: "2026-02-09T16:06:04.027246067Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: a58ecec989d0e28acde78999d6e5c23a852419f503f88e679f662cb08b9618ce
@@ -53,7 +53,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.2.11
-    created: "2026-02-04T13:43:23.849187558Z"
+    created: "2026-02-09T16:06:04.026535383Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: cfa668d217c29745a38ffe96391521fc4c5fd123a6a447736eb4f4110e36c565
@@ -77,7 +77,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.2.10
-    created: "2026-02-04T13:43:23.848453688Z"
+    created: "2026-02-09T16:06:04.025844316Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 83c4366c9a6261643920b1f62a1b1024352b89702fb9559a6a0ecb5bbbef6048
@@ -101,7 +101,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.2.9
-    created: "2026-02-04T13:43:23.857395371Z"
+    created: "2026-02-09T16:06:04.034405688Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 04a7ebe7767bcdbe7ce15eb388f0c4b7fac107204a7ad092e211546027c2fa08
@@ -125,7 +125,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.2.8
-    created: "2026-02-04T13:43:23.856674685Z"
+    created: "2026-02-09T16:06:04.033710794Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 0447552b9e28c234f043fe054b7c1c0223ef42a0f3b8a7c30ecc6034cdcfe73d
@@ -149,7 +149,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.2.7
-    created: "2026-02-04T13:43:23.855947327Z"
+    created: "2026-02-09T16:06:04.032998387Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 70f77ae3b93349618c2f5468f39b3e5d4b2682398daf14c5ab1196e5034d7d97
@@ -173,7 +173,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.2.6
-    created: "2026-02-04T13:43:23.855260274Z"
+    created: "2026-02-09T16:06:04.032292471Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: f408e38b74131ea7b0bf5df4ffb6adf693a041811d2cd50be95e47290a007271
@@ -197,7 +197,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.2.5
-    created: "2026-02-04T13:43:23.854535571Z"
+    created: "2026-02-09T16:06:04.031565758Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 0e7460d9a5d866eb754c4582df018876182ab76b6a27624579df04e0dff17a7b
@@ -221,7 +221,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.2.4
-    created: "2026-02-04T13:43:23.853774199Z"
+    created: "2026-02-09T16:06:04.030050652Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: fc5a3d251c82c16c92525038111454d05b0b0c0071c0eaecaa78366e95907e19
@@ -245,7 +245,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.2.3
-    created: "2026-02-04T13:43:23.853003259Z"
+    created: "2026-02-09T16:06:04.029347522Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 7e7da9cbb353cc6f9f9f031bf154e7f93d4f1f4a3728fc73e04240437b1572cc
@@ -269,7 +269,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.2.2
-    created: "2026-02-04T13:43:23.851754842Z"
+    created: "2026-02-09T16:06:04.028671322Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: dd733284b7d05af5c22d233d7b905982733e33247073493bf742dc344c9db464
@@ -293,7 +293,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.2.1
-    created: "2026-02-04T13:43:23.847718896Z"
+    created: "2026-02-09T16:06:04.025114756Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 857296409ea24da29eeca2a561a09e96c39e5a417063040f3361a14e38ec5046
@@ -317,7 +317,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.2.0
-    created: "2026-02-04T13:43:23.847038185Z"
+    created: "2026-02-09T16:06:04.02442403Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 64150659b6e2ffcefbc93ddeef69eed3779fc4ab8ea79fd55330c700cdbd561c
@@ -341,7 +341,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.27
-    created: "2026-02-04T13:43:23.841159855Z"
+    created: "2026-02-09T16:06:04.01906187Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 47219b8ee03baadd2042255e25a36d3b33d690d427e8471ca4839d7fdeff84c6
@@ -365,7 +365,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.26
-    created: "2026-02-04T13:43:23.840574883Z"
+    created: "2026-02-09T16:06:04.018502147Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: ea14d6702e3ec695a377e38c2ea13f8bfad5df3cceec814a0308d12977262f7a
@@ -389,7 +389,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.25
-    created: "2026-02-04T13:43:23.840031087Z"
+    created: "2026-02-09T16:06:04.017973102Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 4027e140686248fe7db99a61750caa180486744316a36da360324f83fc9078ca
@@ -413,7 +413,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.24
-    created: "2026-02-04T13:43:23.839468487Z"
+    created: "2026-02-09T16:06:04.017407758Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: f80ae30cd6bf27625b57f174b8e04206c81e2415665953096b53bfc4e721657b
@@ -437,7 +437,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.23
-    created: "2026-02-04T13:43:23.838901418Z"
+    created: "2026-02-09T16:06:04.016863815Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: a6b5dbd89835ddf62f60094bf9df2f218a42104fea1df47a4bbbb29a337998ac
@@ -461,7 +461,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.22
-    created: "2026-02-04T13:43:23.838360187Z"
+    created: "2026-02-09T16:06:04.016245473Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 3ab7b084853876310e18e91850d5ee808f50dcdd468625553ead1fe8a715fd1b
@@ -485,7 +485,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.21
-    created: "2026-02-04T13:43:23.837216211Z"
+    created: "2026-02-09T16:06:04.014270832Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 3d88416ba012ff6b25f7e799528e5cbfa42925757b8579295d5338ef82a71978
@@ -509,7 +509,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.20
-    created: "2026-02-04T13:43:23.836612964Z"
+    created: "2026-02-09T16:06:04.01370124Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 18afdd4324dcb1ccd4c24be7143349edfa7404d56d4001e471247f5d89837ea0
@@ -533,7 +533,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.19
-    created: "2026-02-04T13:43:23.836017983Z"
+    created: "2026-02-09T16:06:04.013103547Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 78f0dae25e1cdb94e5b41f502b12174ae1a4497a9831828502ef8f97b8f4f351
@@ -557,7 +557,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.18
-    created: "2026-02-04T13:43:23.834721783Z"
+    created: "2026-02-09T16:06:04.012531301Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 9852ede97225d126f069d4f3628ee6a58c67701f1eafe1b29847c7564f3e2050
@@ -581,7 +581,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.17
-    created: "2026-02-04T13:43:23.834164522Z"
+    created: "2026-02-09T16:06:04.011993599Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 140e91488203aae450622d0c90e6351e5f9350ce6936e15921de1a23e30792ad
@@ -605,7 +605,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.16
-    created: "2026-02-04T13:43:23.833597633Z"
+    created: "2026-02-09T16:06:04.011432664Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 987fcb756f1169c3ef7e8e28ba23cb0d4658c6c5e3c460d10d7a76f40dec9c44
@@ -629,7 +629,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.15
-    created: "2026-02-04T13:43:23.833031656Z"
+    created: "2026-02-09T16:06:04.010896175Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 5550b4b6c063e034ad1fa466089f5613e33cfac8a182ccca004b63ef1c83178a
@@ -653,7 +653,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.14
-    created: "2026-02-04T13:43:23.832456022Z"
+    created: "2026-02-09T16:06:04.010328577Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: c0dd418bc72bebb6ce49fb0566e8f5e27b99ad17a80b9a6506a53a638c584c1f
@@ -677,7 +677,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.13
-    created: "2026-02-04T13:43:23.831862052Z"
+    created: "2026-02-09T16:06:04.009781889Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 10e1053458618afc4877a850fc686d1e41bfca8b21803144e05e5ee70cacfbfc
@@ -701,7 +701,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.11
-    created: "2026-02-04T13:43:23.831271209Z"
+    created: "2026-02-09T16:06:04.009202089Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 87a0fc87e2ef8b1624e64a4bcded671270ace0112e7307e79e782077f04e2b99
@@ -725,7 +725,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.10
-    created: "2026-02-04T13:43:23.846299796Z"
+    created: "2026-02-09T16:06:04.023725679Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: be2ce041ec06e0eb89b1920db8f9425d4d442ac1c3c7ef5b828933cab660ac72
@@ -749,7 +749,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.9
-    created: "2026-02-04T13:43:23.84567019Z"
+    created: "2026-02-09T16:06:04.022423152Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: fc0b965c8b10dc296ae03dafefad4d3d9f1da263a8ea0aea9c294108ec0c95a0
@@ -773,7 +773,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.9
-    created: "2026-02-04T13:43:23.845041897Z"
+    created: "2026-02-09T16:06:04.021839765Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 33afbac5e710867eb9e357306ccf53ec0738b9ac40d03220b9ff9fa176370247
@@ -797,7 +797,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.8
-    created: "2026-02-04T13:43:23.844376755Z"
+    created: "2026-02-09T16:06:04.021279371Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 6de5d78be9885e6841b0584148f79e8727764fd543505362508d67e53416978e
@@ -821,7 +821,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.7
-    created: "2026-02-04T13:43:23.843166031Z"
+    created: "2026-02-09T16:06:04.020734756Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: d1de01d45d4ce6db255c14b677bea9c2caef62ea97561dd02bf2e181676e9169
@@ -845,7 +845,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.6
-    created: "2026-02-04T13:43:23.842375956Z"
+    created: "2026-02-09T16:06:04.020175885Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 2bcfaba3c63b27f8a98cf3f95f8adcf9f4dd0d6023d22917ecbeadeee2d99fed
@@ -869,7 +869,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.5
-    created: "2026-02-04T13:43:23.841733216Z"
+    created: "2026-02-09T16:06:04.019613227Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: a7c298720934b583246736be0d26380bce44c6870686df55e85824ecbdac39dc
@@ -893,7 +893,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.5
-    created: "2026-02-04T13:43:23.837783139Z"
+    created: "2026-02-09T16:06:04.014857685Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: afdcf1810d12247ff027e91dae2ad7b848b5f3b2b77a182b3ccdf38ffb552460
@@ -917,7 +917,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.4
-    created: "2026-02-04T13:43:23.830702046Z"
+    created: "2026-02-09T16:06:04.008210645Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 880404d1c1f62f3475007bb9bd10233410898be891ebf4ee85a244eb882e2b88
@@ -941,7 +941,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.3
-    created: "2026-02-04T13:43:23.830118807Z"
+    created: "2026-02-09T16:06:04.007334513Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: c6c6dc603dfe3b703ba7b3bf48239c1c90a764b0aeffaf7679493aba3dad40b9
@@ -965,7 +965,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.2
-    created: "2026-02-04T13:43:23.829436213Z"
+    created: "2026-02-09T16:06:04.006766966Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 3051624230ec09fd48cf8da10727ac7644d34a9c7825389076346b107ae1ec27
@@ -989,7 +989,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.1
-    created: "2026-02-04T13:43:23.828152144Z"
+    created: "2026-02-09T16:06:04.00620057Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: a21ee205856baaeda817ec5f6e233d97e419677cf43a7cf6adcf917f5bff8cd9
@@ -1013,7 +1013,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.1
-    created: "2026-02-04T13:43:23.827087536Z"
+    created: "2026-02-09T16:06:04.005630949Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: ac120c7b9c6dbdbc02d2de258afe9fdaf2a409822da6860ab48e97b9903af73d
@@ -1037,7 +1037,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.1
-    created: "2026-02-04T13:43:23.826520187Z"
+    created: "2026-02-09T16:06:04.005077478Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 0e5cf7de5dd22f1cc1923dc3751c13bde1b6cdfd83dad32967946b7e21ae1b20
@@ -1061,7 +1061,7 @@ entries:
       category: Storage
     apiVersion: v2
     appVersion: 1.0.0
-    created: "2026-02-04T13:43:23.825933521Z"
+    created: "2026-02-09T16:06:04.004491767Z"
     description: A Helm chart for LUKSCryptWalker - LUKS CSI Driver - Kubernetes CSI
       driver with LUKS encryption
     digest: 9cc9296eef189349e82fc858a0d958d12d1f77f1e20e1b952611a1ee0f27f6d4
@@ -1081,4 +1081,4 @@ entries:
     urls:
     - https://Algonomia.github.io/lukscryptwalker-csi/lukscryptwalker-csi-1.0.0.tgz
     version: 1.0.0
-generated: "2026-02-04T13:43:23.825042958Z"
+generated: "2026-02-09T16:06:04.003581Z"
