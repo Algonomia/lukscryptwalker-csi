@@ -34,6 +34,7 @@ spec:
         - "--v={{ .Values.logging.level }}"
         - "--csi-address=$(ADDRESS)"
         - "--kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)"
+        - "--health-port=9809"
         env:
         - name: ADDRESS
           value: /csi/csi.sock
@@ -43,6 +44,13 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 9809
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
         volumeMounts:
         - name: plugin-dir
           mountPath: /csi/
@@ -90,6 +98,23 @@ spec:
         - name: vfs-cache-dir
           mountPath: /var/lib/lukscrypt-vfs-cache
           mountPropagation: "Bidirectional"
+        startupProbe:
+          exec:
+            command:
+            - test
+            - -S
+            - /csi/csi.sock
+          failureThreshold: 30
+          periodSeconds: 2
+        livenessProbe:
+          exec:
+            command:
+            - test
+            - -S
+            - /csi/csi.sock
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 3
         {{- with .Values.node.resources }}
         resources:
           {{- toYaml . | nindent 10 }}
