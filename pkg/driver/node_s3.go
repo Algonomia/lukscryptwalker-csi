@@ -12,6 +12,7 @@ import (
 
 	"github.com/lukscryptwalker-csi/pkg/rclone"
 	"github.com/lukscryptwalker-csi/pkg/secrets"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog"
 )
@@ -532,5 +533,40 @@ func (ns *NodeServer) unmountStaleS3Mount(mountPath string) {
 	if err := os.RemoveAll(mountPath); err != nil {
 		klog.Warningf("Failed to remove directory %s: %v", mountPath, err)
 	}
+}
+
+// cleanupOrphanedVFSCacheDirs removes VFS cache directories for volumes whose
+// PVs have been deleted. This handles the case where a PV is deleted while the
+// CSI driver pod is down, leaving orphaned cache directories.
+func (ns *NodeServer) cleanupOrphanedVFSCacheDirs() {
+	if ns.clientset == nil {
+		klog.Warning("Kubernetes client not available, skipping orphaned VFS cache cleanup")
+		return
+	}
+
+	nameMap := rclone.LoadVFSNameMap()
+	if len(nameMap) == 0 {
+		klog.V(4).Infof("No persisted VFS name mappings, skipping orphan cleanup")
+		return
+	}
+
+	klog.Infof("Checking %d persisted VFS name mappings for orphaned cache dirs", len(nameMap))
+
+	ctx := context.Background()
+	activeVolumeIDs := make(map[string]bool)
+
+	for volumeID := range nameMap {
+		_, err := ns.clientset.CoreV1().PersistentVolumes().Get(ctx, volumeID, metav1.GetOptions{})
+		if err == nil {
+			activeVolumeIDs[volumeID] = true
+		} else if !k8serrors.IsNotFound(err) {
+			// API error — treat as active to be safe
+			klog.Warningf("Error checking PV %s: %v, treating as active", volumeID, err)
+			activeVolumeIDs[volumeID] = true
+		}
+	}
+
+	rclone.CleanupOrphanedVFSCacheDirs(activeVolumeIDs)
+	klog.Infof("Orphaned VFS cache cleanup completed")
 }
 

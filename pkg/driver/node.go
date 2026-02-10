@@ -49,14 +49,15 @@ func NewNodeServer(d *Driver) *NodeServer {
 		s3SyncMgr:      NewS3SyncManager(),
 	}
 
-	// Clean up and restore stale S3 mounts from previous crashes/restarts
-	ns.cleanupStaleS3Mounts()
+	// Run startup cleanup asynchronously to avoid delaying CSI driver registration
+	go func() {
+		ns.cleanupStaleS3Mounts()
+		ns.cleanupOrphanedVFSCacheDirs()
+		ns.cleanupOrphanedVolumes()
 
-	// Clean up orphaned volume directories (from deleted PVCs)
-	ns.cleanupOrphanedVolumes()
-
-	// Start background goroutine to periodically check for stale S3 mounts
-	go ns.runStaleS3MountChecker()
+		// Periodically check for stale S3 mounts
+		ns.runStaleS3MountChecker()
+	}()
 
 	return ns
 }

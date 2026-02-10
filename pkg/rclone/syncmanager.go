@@ -128,6 +128,7 @@ func (mm *MountManager) identifyVFSName(vfsNamesBefore map[string]bool) {
 				// The vfsName from vfs/list has a trailing colon
 				// but rclone creates cache directories without it, so strip it here
 				mm.vfsName = strings.TrimSuffix(name, ":")
+				SaveVFSName(mm.volumeID, mm.vfsName)
 				klog.Infof("Successfully identified VFS name for volume %s: %s", mm.volumeID, mm.vfsName)
 				return
 			}
@@ -174,6 +175,7 @@ func (mm *MountManager) Mount() error {
 		"AllowOther":    true,
 		"AllowNonEmpty": true,
 		"DirCacheTime":  300000000000, // 5 minutes in nanoseconds
+		"AttrTimeout":   300000000000, // 5 minutes in nanoseconds - caches file attributes (stat) in the kernel FUSE layer
 	}
 
 	// Build VFS options
@@ -410,6 +412,7 @@ func (mm *MountManager) cleanupVFSCacheDir() {
 	if err := os.RemoveAll(cacheDir); err != nil {
 		klog.Warningf("Failed to remove VFS cache directory %s: %v", cacheDir, err)
 	} else {
+		RemoveVFSName(mm.volumeID)
 		klog.Infof("Successfully removed VFS cache directory for volume %s", mm.volumeID)
 	}
 }

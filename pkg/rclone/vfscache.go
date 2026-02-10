@@ -1,6 +1,7 @@
 package rclone
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,7 +21,11 @@ var (
 	vfsCacheCleanupMu   sync.Mutex
 	// vfsCacheSize stores the configured VFS cache size in bytes
 	vfsCacheSize int64 = 20 * 1024 * 1024 * 1024 // 20GB default
+	// vfsNameMapMu protects reads/writes to the vfsName map file
+	vfsNameMapMu sync.Mutex
 )
+
+const vfsNameMapFile = VFSCacheBasePath + "/.vfs-names.json"
 
 const (
 	// VFSCacheBasePath is the base path for the encrypted VFS cache
@@ -29,7 +34,9 @@ const (
 	// VFSCacheMapperName is the LUKS mapper name for VFS cache
 	VFSCacheMapperName = "luks-vfs-cache"
 	// VFSCacheBackingFile is the backing file for VFS cache LUKS volume
-	VFSCacheBackingFile = "/var/lib/lukscrypt-vfs-cache.luks"
+	// Stored inside the host-mounted vfs-cache-dir so it persists across pod restarts,
+	// allowing rclone to resume syncing cached data that wasn't uploaded before a crash
+	VFSCacheBackingFile = "/var/lib/lukscrypt-vfs-cache/vfs-cache.luks"
 )
 
 // SetupVFSCache creates and mounts an encrypted LUKS volume for VFS cache
@@ -403,4 +410,98 @@ func aggressiveVFSCacheCleanup(basePath string) {
 // GetVFSCacheSize returns the configured VFS cache size in bytes
 func GetVFSCacheSize() int64 {
 	return vfsCacheSize
+}
+
+// LoadVFSNameMap reads the persisted volumeID→vfsName mapping from disk.
+// Returns an empty map if the file does not exist or cannot be read.
+func LoadVFSNameMap() map[string]string {
+	data, err := os.ReadFile(vfsNameMapFile)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			klog.Warningf("Failed to read VFS name map file %s: %v", vfsNameMapFile, err)
+		}
+		return make(map[string]string)
+	}
+
+	m := make(map[string]string)
+	if err := json.Unmarshal(data, &m); err != nil {
+		klog.Warningf("Failed to parse VFS name map file %s: %v", vfsNameMapFile, err)
+		return make(map[string]string)
+	}
+	return m
+}
+
+// writeVFSNameMap writes the volumeID→vfsName mapping to disk.
+// Caller must hold vfsNameMapMu.
+func writeVFSNameMap(m map[string]string) {
+	data, err := json.Marshal(m)
+	if err != nil {
+		klog.Warningf("Failed to marshal VFS name map: %v", err)
+		return
+	}
+	if err := os.WriteFile(vfsNameMapFile, data, 0600); err != nil {
+		klog.Warningf("Failed to write VFS name map file %s: %v", vfsNameMapFile, err)
+	}
+}
+
+// SaveVFSName persists a volumeID→vfsName mapping to the JSON file.
+func SaveVFSName(volumeID, vfsName string) {
+	vfsNameMapMu.Lock()
+	defer vfsNameMapMu.Unlock()
+
+	m := LoadVFSNameMap()
+	m[volumeID] = vfsName
+	writeVFSNameMap(m)
+	klog.V(4).Infof("Saved VFS name mapping: %s -> %s", volumeID, vfsName)
+}
+
+// RemoveVFSName removes a volumeID entry from the persisted mapping.
+func RemoveVFSName(volumeID string) {
+	vfsNameMapMu.Lock()
+	defer vfsNameMapMu.Unlock()
+
+	m := LoadVFSNameMap()
+	if _, exists := m[volumeID]; !exists {
+		return
+	}
+	delete(m, volumeID)
+	writeVFSNameMap(m)
+	klog.V(4).Infof("Removed VFS name mapping for volume %s", volumeID)
+}
+
+// CleanupOrphanedVFSCacheDirs removes VFS cache directories for volumes
+// that are no longer active. For each entry in the persisted map where the
+// volumeID is NOT in activeVolumeIDs, it removes the cache directory and
+// the map entry.
+func CleanupOrphanedVFSCacheDirs(activeVolumeIDs map[string]bool) {
+	vfsNameMapMu.Lock()
+	defer vfsNameMapMu.Unlock()
+
+	m := LoadVFSNameMap()
+	if len(m) == 0 {
+		return
+	}
+
+	changed := false
+	for volumeID, vfsName := range m {
+		if activeVolumeIDs[volumeID] {
+			continue
+		}
+
+		cacheDir := fmt.Sprintf("%s/vfs/%s", VFSCacheBasePath, vfsName)
+		klog.Infof("Cleaning up orphaned VFS cache directory for volume %s: %s", volumeID, cacheDir)
+
+		if err := os.RemoveAll(cacheDir); err != nil {
+			klog.Warningf("Failed to remove orphaned VFS cache directory %s: %v", cacheDir, err)
+			continue
+		}
+
+		delete(m, volumeID)
+		changed = true
+		klog.Infof("Successfully removed orphaned VFS cache directory for volume %s", volumeID)
+	}
+
+	if changed {
+		writeVFSNameMap(m)
+	}
 }
