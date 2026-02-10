@@ -5,15 +5,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"sync"
-	"time"
 
 	"k8s.io/klog"
-)
-
-var (
-	// vfsMountMu protects vfs/list operations during mount to correctly identify new VFS entries
-	vfsMountMu sync.Mutex
 )
 
 // VFSCacheConfig holds VFS cache configuration options
@@ -38,14 +31,16 @@ func DefaultVFSCacheConfig() *VFSCacheConfig {
 
 // MountManager handles rclone mount operations for encrypted S3 volumes
 type MountManager struct {
-	s3Config    *S3Config
-	cryptConfig *CryptConfig
-	vfsConfig   *VFSCacheConfig
-	volumeID    string
-	mountPoint  string
-	s3BasePath  string
-	mounted     bool
-	vfsName     string // VFS name from vfs/list, used for vfs/forget on unmount
+	s3Config        *S3Config
+	cryptConfig     *CryptConfig
+	vfsConfig       *VFSCacheConfig
+	volumeID        string
+	mountPoint      string
+	s3BasePath      string
+	mounted         bool
+	vfsName         string // Deterministic VFS name derived from volumeID
+	s3ConfigName    string // Named rclone config for S3 backend
+	cryptConfigName string // Named rclone config for crypt layer
 }
 
 // NewMountManager creates a new rclone mount manager
@@ -73,72 +68,19 @@ func NewMountManager(s3Config *S3Config, volumeID, mountPoint string, vfsConfig 
 	cryptConfig := DeriveRcloneCryptConfig(luksPassphrase, salt)
 
 	manager := &MountManager{
-		s3Config:       s3Config,
-		cryptConfig:    cryptConfig,
-		vfsConfig:      vfsConfig,
-		volumeID:       volumeID,
-		mountPoint:     mountPoint,
-		s3BasePath:     s3BasePath,
+		s3Config:        s3Config,
+		cryptConfig:     cryptConfig,
+		vfsConfig:       vfsConfig,
+		volumeID:        volumeID,
+		mountPoint:      mountPoint,
+		s3BasePath:      s3BasePath,
+		vfsName:         volumeID,
+		s3ConfigName:    volumeID + "-s3",
+		cryptConfigName: volumeID,
 	}
 
 	klog.Infof("Created rclone mount manager for volume %s at %s (s3Path: %s)", volumeID, mountPoint, s3BasePath)
 	return manager, nil
-}
-
-// getVFSNames returns a set of VFS names from vfs/list RPC
-func getVFSNames() (map[string]bool, error) {
-	result, err := RPC("vfs/list", map[string]interface{}{})
-	if err != nil {
-		return nil, fmt.Errorf("vfs/list failed: %w", err)
-	}
-
-	names := make(map[string]bool)
-	if result != nil && result.Output != nil {
-		if vfses, ok := result.Output["vfses"].([]interface{}); ok {
-			for _, v := range vfses {
-				if name, ok := v.(string); ok && name != "" {
-					names[name] = true
-				}
-			}
-		}
-	}
-	return names, nil
-}
-
-// identifyVFSName identifies the VFS name for this volume with retry logic
-func (mm *MountManager) identifyVFSName(vfsNamesBefore map[string]bool) {
-	maxRetries := 5
-	retryDelay := 200 * time.Millisecond
-
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		if attempt > 0 {
-			klog.Infof("Retrying VFS name identification for volume %s (attempt %d/%d)", mm.volumeID, attempt+1, maxRetries)
-			time.Sleep(retryDelay)
-		}
-
-		vfsNamesAfter, err := getVFSNames()
-		if err != nil {
-			klog.Warningf("Failed to get VFS names after mount (attempt %d): %v", attempt+1, err)
-			continue
-		}
-
-		// Find the new VFS name (present in after but not in before)
-		for name := range vfsNamesAfter {
-			if !vfsNamesBefore[name] {
-				// The vfsName from vfs/list has a trailing colon
-				// but rclone creates cache directories without it, so strip it here
-				mm.vfsName = strings.TrimSuffix(name, ":")
-				SaveVFSName(mm.volumeID, mm.vfsName)
-				klog.Infof("Successfully identified VFS name for volume %s: %s", mm.volumeID, mm.vfsName)
-				return
-			}
-		}
-
-		// Increase delay for subsequent retries
-		retryDelay *= 2
-	}
-
-	klog.Warningf("Could not identify VFS name for volume %s after %d attempts", mm.volumeID, maxRetries)
 }
 
 // Mount mounts the encrypted S3 remote at the mount point using librclone
@@ -164,10 +106,15 @@ func (mm *MountManager) Mount() error {
 		return fmt.Errorf("failed to create mount point: %w", err)
 	}
 
-	// Build the crypt remote string for librclone
-	cryptRemote, err := BuildCryptRemoteString(mm.s3Config, mm.cryptConfig, mm.s3BasePath)
-	if err != nil {
-		return fmt.Errorf("failed to build crypt remote: %w", err)
+	// Create named rclone configs (deterministic names for stable VFS cache dirs)
+	if err := CreateNamedS3Config(mm.s3ConfigName, mm.s3Config); err != nil {
+		return fmt.Errorf("failed to create S3 config: %w", err)
+	}
+
+	s3RemotePath := fmt.Sprintf("%s:%s/%s", mm.s3ConfigName, mm.s3Config.Bucket, mm.s3BasePath)
+	if err := CreateNamedCryptConfig(mm.cryptConfigName, s3RemotePath, mm.cryptConfig); err != nil {
+		DeleteNamedConfigs(mm.s3ConfigName)
+		return fmt.Errorf("failed to create crypt config: %w", err)
 	}
 
 	// Build mount options
@@ -181,34 +128,24 @@ func (mm *MountManager) Mount() error {
 	// Build VFS options
 	vfsOpt := mm.buildVFSOpt()
 
-	// Call mount/mount RPC
+	// Call mount/mount RPC using the named crypt remote
 	params := map[string]interface{}{
-		"fs":         cryptRemote,
+		"fs":         mm.cryptConfigName + ":",
 		"mountPoint": mm.mountPoint,
 		"mountOpt":   mountOpt,
 		"vfsOpt":     vfsOpt,
 	}
 
-	// Lock to safely identify the new VFS entry by comparing before/after
-	vfsMountMu.Lock()
-	defer vfsMountMu.Unlock()
-
-	// Get VFS names before mounting
-	vfsNamesBefore, err := getVFSNames()
-	if err != nil {
-		klog.Warningf("Failed to get VFS names before mount: %v", err)
-		vfsNamesBefore = make(map[string]bool)
-	}
-
 	klog.Infof("Calling mount/mount RPC for volume %s", mm.volumeID)
 
-	_, err = RPC("mount/mount", params)
+	_, err := RPC("mount/mount", params)
 	if err != nil {
+		DeleteNamedConfigs(mm.cryptConfigName, mm.s3ConfigName)
 		return fmt.Errorf("failed to mount: %w", err)
 	}
 
-	// Get VFS names after mounting with retry logic to handle timing issues
-	mm.identifyVFSName(vfsNamesBefore)
+	// Persist the vfsName mapping for orphan cleanup across restarts
+	SaveVFSName(mm.volumeID, mm.vfsName)
 
 	mm.mounted = true
 	klog.Infof("Successfully mounted encrypted S3 volume %s at %s", mm.volumeID, mm.mountPoint)
@@ -302,6 +239,9 @@ func (mm *MountManager) Unmount() error {
 			klog.Warningf("Failed to unmount rclone: %v", err)
 		}
 	}
+
+	// Clean up named rclone configs
+	DeleteNamedConfigs(mm.cryptConfigName, mm.s3ConfigName)
 
 	// Clean up the on-disk VFS cache directory after unmount
 	mm.cleanupVFSCacheDir()

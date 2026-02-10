@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/rclone/rclone/fs/config/obscure"
+	"k8s.io/klog"
 )
 
 // S3Config holds S3 connection configuration
@@ -80,61 +80,97 @@ func quoteValue(value string) string {
 	return value
 }
 
-// BuildCryptRemoteString builds an inline crypt remote wrapping an S3 remote
-// The crypt remote provides client-side encryption using rclone's crypt backend
-func BuildCryptRemoteString(s3Config *S3Config, cryptConfig *CryptConfig, s3Path string) (string, error) {
-	if cryptConfig.Password == "" {
-		return "", fmt.Errorf("crypt password is required")
-	}
+// CreateNamedS3Config creates a named rclone S3 config via the config/create RPC.
+// Using named configs (instead of inline remotes) ensures the VFS cache directory
+// name is deterministic across restarts.
+func CreateNamedS3Config(name string, config *S3Config) error {
+	// Delete first to handle pre-existing entries from incomplete previous mounts
+	_, _ = RPC("config/delete", map[string]interface{}{"name": name})
 
-	// Obscure the passwords using rclone's obscure package
-	obscuredPassword, err := obscure.Obscure(cryptConfig.Password)
-	if err != nil {
-		return "", fmt.Errorf("failed to obscure password: %w", err)
-	}
-
-	obscuredPassword2 := ""
-	if cryptConfig.Password2 != "" {
-		obscuredPassword2, err = obscure.Obscure(cryptConfig.Password2)
-		if err != nil {
-			return "", fmt.Errorf("failed to obscure password2: %w", err)
+	provider := config.Provider
+	if provider == "" {
+		if config.Endpoint != "" {
+			provider = "Other"
+		} else {
+			provider = "AWS"
 		}
 	}
 
-	// Build the underlying S3 remote string
-	s3Remote, err := BuildS3RemoteString(s3Config, s3Path)
+	params := map[string]interface{}{
+		"name": name,
+		"type": "s3",
+		"parameters": map[string]interface{}{
+			"provider":          provider,
+			"env_auth":          "false",
+			"access_key_id":     config.AccessKeyID,
+			"secret_access_key": config.SecretAccessKey,
+			"region":            config.Region,
+		},
+	}
+
+	if config.Endpoint != "" {
+		params["parameters"].(map[string]interface{})["endpoint"] = config.Endpoint
+	}
+	if config.ForcePathStyle {
+		params["parameters"].(map[string]interface{})["force_path_style"] = "true"
+	}
+
+	_, err := RPC("config/create", params)
 	if err != nil {
-		return "", fmt.Errorf("failed to build S3 remote: %w", err)
+		return fmt.Errorf("failed to create S3 config %s: %w", name, err)
 	}
-
-	// Escape the S3 remote for nesting within the crypt remote
-	escapedS3Remote := escapeRemoteForNesting(s3Remote)
-
-	// Build crypt remote parts
-	var cryptParts []string
-	cryptParts = append(cryptParts, fmt.Sprintf("remote=%s", escapedS3Remote))
-	cryptParts = append(cryptParts, fmt.Sprintf("password=%s", obscuredPassword))
-	if obscuredPassword2 != "" {
-		cryptParts = append(cryptParts, fmt.Sprintf("password2=%s", obscuredPassword2))
-	}
-	// Encrypt file names for additional security
-	cryptParts = append(cryptParts, "filename_encryption=standard")
-	// Encrypt directory names as well
-	cryptParts = append(cryptParts, "directory_name_encryption=true")
-
-	// Format: :crypt,remote=...,password=...,password2=...:
-	cryptRemote := fmt.Sprintf(":crypt,%s:", strings.Join(cryptParts, ","))
-
-	return cryptRemote, nil
+	klog.V(4).Infof("Created named S3 config: %s", name)
+	return nil
 }
 
-// escapeRemoteForNesting escapes a remote string for use inside another remote's parameters
-// For librclone RPC, we use single quotes to wrap values containing special characters
-func escapeRemoteForNesting(remote string) string {
-	// Escape any existing single quotes by doubling them
-	remote = strings.ReplaceAll(remote, "'", "''")
-	// Wrap in single quotes to handle colons and commas
-	return "'" + remote + "'"
+// CreateNamedCryptConfig creates a named rclone crypt config via the config/create RPC.
+// s3RemotePath is the full remote reference including bucket/path (e.g., "myS3Config:bucket/path").
+// Passwords are passed as plain text; opt.obscure=true tells rclone to obscure them.
+func CreateNamedCryptConfig(name string, s3RemotePath string, cryptConfig *CryptConfig) error {
+	if cryptConfig.Password == "" {
+		return fmt.Errorf("crypt password is required")
+	}
+
+	// Delete first to handle pre-existing entries
+	_, _ = RPC("config/delete", map[string]interface{}{"name": name})
+
+	parameters := map[string]interface{}{
+		"remote":                    s3RemotePath,
+		"password":                  cryptConfig.Password,
+		"filename_encryption":       "standard",
+		"directory_name_encryption": "true",
+	}
+	if cryptConfig.Password2 != "" {
+		parameters["password2"] = cryptConfig.Password2
+	}
+
+	params := map[string]interface{}{
+		"name":       name,
+		"type":       "crypt",
+		"parameters": parameters,
+		"opt": map[string]interface{}{
+			"obscure": true,
+		},
+	}
+
+	_, err := RPC("config/create", params)
+	if err != nil {
+		return fmt.Errorf("failed to create crypt config %s: %w", name, err)
+	}
+	klog.V(4).Infof("Created named crypt config: %s", name)
+	return nil
+}
+
+// DeleteNamedConfigs deletes named rclone configs, ignoring errors.
+func DeleteNamedConfigs(names ...string) {
+	for _, name := range names {
+		_, err := RPC("config/delete", map[string]interface{}{"name": name})
+		if err != nil {
+			klog.V(4).Infof("Failed to delete config %s (may not exist): %v", name, err)
+		} else {
+			klog.V(4).Infof("Deleted named config: %s", name)
+		}
+	}
 }
 
 // DeriveRcloneCryptConfig derives rclone crypt passwords from LUKS passphrase
