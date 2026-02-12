@@ -8,17 +8,12 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
-	"time"
 
 	"github.com/lukscryptwalker-csi/pkg/luks"
 	"k8s.io/klog"
 )
 
 var (
-	// vfsCacheCleanupStop is used to signal the cleanup goroutine to stop
-	vfsCacheCleanupStop chan struct{}
-	vfsCacheCleanupMu   sync.Mutex
 	// vfsCacheSize stores the configured VFS cache size in bytes
 	vfsCacheSize int64 = 20 * 1024 * 1024 * 1024 // 20GB default
 	// vfsNameMapMu protects reads/writes to the vfsName map file
@@ -261,151 +256,7 @@ func unmountFilesystem(mountPath string) error {
 	return cmd.Run()
 }
 
-// StartVFSCacheCleanup starts the background VFS cache cleanup goroutine
-// This should be called after SetupVFSCache succeeds
-func StartVFSCacheCleanup(cleanupInterval time.Duration, diskUsageThreshold float64) {
-	vfsCacheCleanupMu.Lock()
-	defer vfsCacheCleanupMu.Unlock()
 
-	if vfsCacheCleanupStop != nil {
-		klog.Infof("VFS cache cleanup already running")
-		return
-	}
-
-	vfsCacheCleanupStop = make(chan struct{})
-
-	go vfsCacheCleanupLoop(cleanupInterval, diskUsageThreshold, vfsCacheCleanupStop)
-	klog.Infof("Started VFS cache cleanup goroutine with interval=%v, diskUsageThreshold=%.0f%%",
-		cleanupInterval, diskUsageThreshold*100)
-}
-
-// StopVFSCacheCleanup stops the background VFS cache cleanup goroutine
-func StopVFSCacheCleanup() {
-	vfsCacheCleanupMu.Lock()
-	defer vfsCacheCleanupMu.Unlock()
-
-	if vfsCacheCleanupStop != nil {
-		close(vfsCacheCleanupStop)
-		vfsCacheCleanupStop = nil
-		klog.Infof("Stopped VFS cache cleanup goroutine")
-	}
-}
-
-// vfsCacheCleanupLoop is the main cleanup loop that runs in the background
-func vfsCacheCleanupLoop(interval time.Duration, diskUsageThreshold float64, stop chan struct{}) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	// Run cleanup immediately on start
-	runVFSCacheCleanup(diskUsageThreshold)
-
-	for {
-		select {
-		case <-ticker.C:
-			runVFSCacheCleanup(diskUsageThreshold)
-		case <-stop:
-			klog.Infof("VFS cache cleanup goroutine stopping")
-			return
-		}
-	}
-}
-
-// runVFSCacheCleanup performs a single cleanup pass
-func runVFSCacheCleanup(diskUsageThreshold float64) {
-	mountPath := VFSCacheBasePath
-
-	// Check if the VFS cache is mounted
-	if !isVFSCacheMounted(mountPath) {
-		klog.V(5).Infof("VFS cache not mounted, skipping cleanup")
-		return
-	}
-
-	// Check disk usage and perform aggressive cleanup if needed
-	usagePercent, err := getVFSCacheDiskUsage(mountPath)
-	if err != nil {
-		klog.V(4).Infof("Failed to get VFS cache disk usage: %v", err)
-	} else {
-		klog.V(5).Infof("VFS cache disk usage: %.1f%%", usagePercent*100)
-
-		if usagePercent >= diskUsageThreshold {
-			klog.Warningf("VFS cache disk usage (%.1f%%) exceeds threshold (%.0f%%), performing aggressive cleanup",
-				usagePercent*100, diskUsageThreshold*100)
-			aggressiveVFSCacheCleanup(mountPath)
-		}
-	}
-}
-
-// getVFSCacheDiskUsage returns the disk usage percentage (0.0-1.0) of the VFS cache mount
-func getVFSCacheDiskUsage(mountPath string) (float64, error) {
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(mountPath, &stat); err != nil {
-		return 0, fmt.Errorf("statfs failed: %w", err)
-	}
-
-	total := stat.Blocks * uint64(stat.Bsize)
-	free := stat.Bfree * uint64(stat.Bsize)
-	used := total - free
-
-	if total == 0 {
-		return 0, fmt.Errorf("total size is zero")
-	}
-
-	return float64(used) / float64(total), nil
-}
-
-// aggressiveVFSCacheCleanup performs aggressive cleanup when disk usage is high
-// This removes old cached files to free up space
-func aggressiveVFSCacheCleanup(basePath string) {
-	klog.Infof("Starting aggressive VFS cache cleanup at %s", basePath)
-
-	// Find and remove old cache files (files not accessed recently)
-	// rclone stores cache in vfs/<remote>/... structure
-	vfsDir := filepath.Join(basePath, "vfs")
-	if _, err := os.Stat(vfsDir); os.IsNotExist(err) {
-		klog.V(4).Infof("VFS directory %s does not exist, skipping aggressive cleanup", vfsDir)
-		return
-	}
-
-	// Calculate cutoff time - remove files older than 60 minutes when under pressure
-	cutoffTime := time.Now().Add(-60 * time.Minute)
-	removedFiles := 0
-	freedBytes := int64(0)
-
-	err := filepath.Walk(vfsDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil // Skip inaccessible paths
-		}
-
-		// Skip directories
-		if info.IsDir() {
-			return nil
-		}
-
-		// Check if file is old enough to remove
-		if info.ModTime().Before(cutoffTime) {
-			size := info.Size()
-			if err := os.Remove(path); err != nil {
-				klog.V(5).Infof("Failed to remove old cache file %s: %v", path, err)
-			} else {
-				removedFiles++
-				freedBytes += size
-				klog.V(4).Infof("Removed old cache file: %s (age: %v)", path, time.Since(info.ModTime()))
-			}
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		klog.Warningf("Error during aggressive VFS cache cleanup: %v", err)
-	}
-
-	if removedFiles > 0 {
-		klog.Infof("Aggressive cleanup removed %d files, freed %.2f MB",
-			removedFiles, float64(freedBytes)/(1024*1024))
-	}
-
-}
 
 // GetVFSCacheSize returns the configured VFS cache size in bytes
 func GetVFSCacheSize() int64 {
@@ -489,16 +340,19 @@ func CleanupOrphanedVFSCacheDirs(activeVolumeIDs map[string]bool) {
 		}
 
 		cacheDir := fmt.Sprintf("%s/vfs/%s", VFSCacheBasePath, vfsName)
-		klog.Infof("Cleaning up orphaned VFS cache directory for volume %s: %s", volumeID, cacheDir)
+		metaDir := fmt.Sprintf("%s/vfsMeta/%s", VFSCacheBasePath, vfsName)
+		klog.Infof("Cleaning up orphaned VFS cache for volume %s: %s", volumeID, cacheDir)
 
 		if err := os.RemoveAll(cacheDir); err != nil {
-			klog.Warningf("Failed to remove orphaned VFS cache directory %s: %v", cacheDir, err)
-			continue
+			klog.Warningf("Failed to remove orphaned VFS cache dir %s: %v", cacheDir, err)
+		}
+		if err := os.RemoveAll(metaDir); err != nil {
+			klog.Warningf("Failed to remove orphaned VFS meta dir %s: %v", metaDir, err)
 		}
 
 		delete(m, volumeID)
 		changed = true
-		klog.Infof("Successfully removed orphaned VFS cache directory for volume %s", volumeID)
+		klog.Infof("Successfully removed orphaned VFS cache for volume %s", volumeID)
 	}
 
 	if changed {

@@ -101,6 +101,11 @@ func (mm *MountManager) Mount() error {
 		}
 	}
 
+	// Detect stale cache from a previous ungraceful shutdown.
+	// After a crash, vfsMeta/ may reference data files in vfs/ that were lost
+	// (incomplete writes). On clean shutdown, cleanupVFSCacheDir() removes both.
+	hadStaleCache := mm.hasStaleVFSCache()
+
 	// Ensure mount point exists
 	if err := os.MkdirAll(mm.mountPoint, 0755); err != nil {
 		return fmt.Errorf("failed to create mount point: %w", err)
@@ -149,6 +154,16 @@ func (mm *MountManager) Mount() error {
 
 	mm.mounted = true
 	klog.Infof("Successfully mounted encrypted S3 volume %s at %s", mm.volumeID, mm.mountPoint)
+
+	// If stale cache was detected (ungraceful shutdown), refresh the VFS to force
+	// rclone to reconcile its cache state against S3. Without this, stale metadata
+	// in vfsMeta/ referencing lost data files causes "detected external removal of
+	// cache file" errors and rclone fails to re-download from S3.
+	if hadStaleCache {
+		klog.Infof("Stale VFS cache detected for volume %s, triggering VFS refresh to reconcile with S3", mm.volumeID)
+		mm.refreshVFS()
+	}
+
 	return nil
 }
 
@@ -336,25 +351,51 @@ func (mm *MountManager) isMountPoint() bool {
 	return false
 }
 
-// cleanupVFSCacheDir removes the on-disk VFS cache directory after unmount
+// hasStaleVFSCache checks if VFS cache directories exist from a previous mount
+// session that wasn't cleanly unmounted (e.g. after a crash or OOM kill).
+func (mm *MountManager) hasStaleVFSCache() bool {
+	if mm.vfsName == "" {
+		return false
+	}
+	cacheDir := fmt.Sprintf("%s/vfs/%s", VFSCacheBasePath, mm.vfsName)
+	metaDir := fmt.Sprintf("%s/vfsMeta/%s", VFSCacheBasePath, mm.vfsName)
+	_, err1 := os.Stat(cacheDir)
+	_, err2 := os.Stat(metaDir)
+	return err1 == nil || err2 == nil
+}
+
+// refreshVFS forces rclone to reconcile its VFS state against the S3 remote.
+// This clears stale in-memory items and re-reads directory listings from S3,
+// so that missing cache files trigger re-downloads instead of errors.
+func (mm *MountManager) refreshVFS() {
+	fs := mm.cryptConfigName + ":"
+
+	// Forget in-memory directory cache so rclone drops any stale Items
+	if _, err := RPC("vfs/forget", map[string]interface{}{"fs": fs}); err != nil {
+		klog.Warningf("vfs/forget failed for volume %s: %v", mm.volumeID, err)
+	}
+
+	// Refresh directory listings from S3 to rebuild clean state
+	refreshParams := map[string]interface{}{
+		"fs":        fs,
+		"dir":       "",
+		"recursive": true,
+	}
+	if _, err := RPC("vfs/refresh", refreshParams); err != nil {
+		klog.Warningf("vfs/refresh failed for volume %s: %v", mm.volumeID, err)
+	}
+}
+
+// cleanupVFSCacheDir updates the VFS name mapping after unmount.
+// We intentionally do NOT delete rclone's cache directories (vfs/ and vfsMeta/).
+// Rclone manages its own cache via CacheMaxAge, CacheMaxSize, and CachePollInterval.
+// Externally removing cache files causes "detected external removal of cache file"
+// errors. Leaving the cache intact also lets rclone reuse it across remounts.
 func (mm *MountManager) cleanupVFSCacheDir() {
 	if mm.vfsName == "" {
-		klog.Warningf("No VFS name stored for volume %s, skipping cache cleanup", mm.volumeID)
 		return
 	}
-
-	// VFS cache is stored at ~/.cache/rclone/vfs/<vfsName>/
-	// Since we mount the encrypted LUKS volume at /root/.cache/rclone, the path is:
-	cacheDir := fmt.Sprintf("%s/vfs/%s", VFSCacheBasePath, mm.vfsName)
-
-	klog.Infof("Cleaning up VFS cache directory for volume %s: %s", mm.volumeID, cacheDir)
-
-	if err := os.RemoveAll(cacheDir); err != nil {
-		klog.Warningf("Failed to remove VFS cache directory %s: %v", cacheDir, err)
-	} else {
-		RemoveVFSName(mm.volumeID)
-		klog.Infof("Successfully removed VFS cache directory for volume %s", mm.volumeID)
-	}
+	RemoveVFSName(mm.volumeID)
 }
 
 // IsMounted returns whether the volume is currently mounted

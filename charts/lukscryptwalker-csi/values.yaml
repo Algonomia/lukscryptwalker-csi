@@ -45,8 +45,6 @@ controller:
 node:
   # VFS cache configuration
   vfsCacheSize: "20G"  # Size of the encrypted LUKS volume for VFS cache
-  vfsCacheCleanupInterval: "5m"  # How often to run VFS cache directory cleanup
-  vfsCacheDiskThreshold: 0.85  # Disk usage threshold (0.0-1.0) to trigger aggressive cleanup
 
   # Sidecar images
   sidecars:

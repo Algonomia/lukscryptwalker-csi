@@ -67,8 +67,6 @@ spec:
         - "--endpoint=$(CSI_ENDPOINT)"
         - "--nodeid=$(KUBE_NODE_NAME)"
         - "--vfs-cache-size={{ .Values.node.vfsCacheSize }}"
-        - "--vfs-cache-cleanup-interval={{ .Values.node.vfsCacheCleanupInterval }}"
-        - "--vfs-cache-disk-threshold={{ .Values.node.vfsCacheDiskThreshold }}"
         - "--luks-secret-name={{ .Values.secret.name }}"
         - "--luks-secret-namespace={{ .Values.secret.namespace }}"
         - "--luks-secret-key={{ .Values.secret.passphraseKey }}"
