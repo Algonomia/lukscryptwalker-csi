@@ -379,7 +379,7 @@ func (mm *MountManager) refreshVFS() {
 	refreshParams := map[string]interface{}{
 		"fs":        fs,
 		"dir":       "",
-		"recursive": true,
+		"recursive": "true",
 	}
 	if _, err := RPC("vfs/refresh", refreshParams); err != nil {
 		klog.Warningf("vfs/refresh failed for volume %s: %v", mm.volumeID, err)
