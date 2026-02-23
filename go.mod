@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/container-storage-interface/spec v1.12.0
-	github.com/rclone/rclone v1.73.0
+	github.com/rclone/rclone v1.73.1
 	github.com/stretchr/testify v1.11.1
 	google.golang.org/grpc v1.78.0
 	k8s.io/api v0.35.0
@@ -52,7 +52,7 @@ require (
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.11 // indirect
-	github.com/go-chi/chi/v5 v5.2.3 // indirect
+	github.com/go-chi/chi/v5 v5.2.5 // indirect
 	github.com/go-darwin/apfs v0.0.0-20211011131704-f84b94dbf348 // indirect
 	github.com/go-git/go-billy/v5 v5.6.2 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
