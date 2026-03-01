@@ -1,0 +1,26 @@
+{{/*
+Guard against VFS cache shrink: look up the ConfigMap that was persisted by
+the previous release and fail early if the new vfsCacheSize is smaller.
+Shrinking a LUKS volume is not supported and would result in data loss.
+*/}}
+{{- $cmName := printf "%s-vfs-cache-config" (include "lukscryptwalker-csi.fullname" .) -}}
+{{- $existing := lookup "v1" "ConfigMap" .Release.Namespace $cmName -}}
+{{- if $existing -}}
+  {{- $previousSize := index $existing.data "vfsCacheSize" -}}
+  {{- if $previousSize -}}
+    {{- $newBytes := include "lukscryptwalker-csi.vfsSizeToBytes" .Values.node.vfsCacheSize | int64 -}}
+    {{- $oldBytes := include "lukscryptwalker-csi.vfsSizeToBytes" $previousSize | int64 -}}
+    {{- if lt $newBytes $oldBytes -}}
+      {{- fail (printf "node.vfsCacheSize cannot be decreased: current value is %s, requested value is %s. Shrinking a LUKS volume is not supported." $previousSize .Values.node.vfsCacheSize) -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $cmName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "lukscryptwalker-csi.labels" . | nindent 4 }}
+data:
+  vfsCacheSize: {{ .Values.node.vfsCacheSize | quote }}

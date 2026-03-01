@@ -124,6 +124,12 @@ func SetupVFSCache(sizeStr string, passphrase string) (string, error) {
 			_ = detachLoopDevice(loopDevice)
 			return "", fmt.Errorf("failed to open LUKS VFS cache: %w", err)
 		}
+
+		// Resize if the configured size grew (e.g. Helm value changed).
+		// The filesystem is not yet mounted so resize2fs can run safely.
+		if err := resizeVFSCacheIfNeeded(loopDevice, cacheSize, passphrase, luksManager); err != nil {
+			klog.Warningf("Failed to resize VFS cache, continuing with existing size: %v", err)
+		}
 	}
 
 	// Mount the encrypted cache
@@ -194,6 +200,48 @@ func cleanupStaleVFSCache(mountPath string) {
 			_ = detachLoopDevice(loopDevice)
 		}
 	}
+}
+
+// resizeVFSCacheIfNeeded expands the VFS cache LUKS volume when the configured
+// size is larger than the current backing file. The LUKS device must already be
+// open and the filesystem must not yet be mounted when this is called.
+func resizeVFSCacheIfNeeded(loopDevice string, targetSize int64, passphrase string, luksManager *luks.LUKSManager) error {
+	info, err := os.Stat(VFSCacheBackingFile)
+	if err != nil {
+		return fmt.Errorf("failed to stat VFS cache backing file: %w", err)
+	}
+
+	currentSize := info.Size()
+	if currentSize >= targetSize {
+		klog.V(4).Infof("VFS cache size unchanged (%d bytes), no resize needed", currentSize)
+		return nil
+	}
+
+	klog.Infof("Resizing VFS cache backing file from %d to %d bytes", currentSize, targetSize)
+
+	// Expand the sparse backing file
+	if err := os.Truncate(VFSCacheBackingFile, targetSize); err != nil {
+		return fmt.Errorf("failed to expand VFS cache backing file: %w", err)
+	}
+
+	// Inform the loop device of the new file size
+	if out, err := exec.Command("losetup", "-c", loopDevice).CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to refresh loop device %s: %v (%s)", loopDevice, err, strings.TrimSpace(string(out)))
+	}
+
+	// Expand the LUKS container to fill the enlarged block device
+	if err := luksManager.ResizeLUKS(VFSCacheMapperName, passphrase); err != nil {
+		return fmt.Errorf("failed to resize LUKS VFS cache: %w", err)
+	}
+
+	// Expand the ext4 filesystem to fill the enlarged LUKS device
+	mappedDevice := luksManager.GetMappedDevicePath(VFSCacheMapperName)
+	if out, err := exec.Command("resize2fs", mappedDevice).CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to resize VFS cache filesystem: %v (%s)", err, strings.TrimSpace(string(out)))
+	}
+
+	klog.Infof("Successfully resized VFS cache to %d bytes", targetSize)
+	return nil
 }
 
 // Helper functions (these might already exist in syncmanager.go, but included for completeness)

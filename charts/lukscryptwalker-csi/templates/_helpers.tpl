@@ -105,6 +105,23 @@ Create the name of the node service account to use
 {{- end }}
 
 {{/*
+Convert a VFS cache size string (e.g. "20G", "512M") to bytes.
+Supported units: K, M, G, T (case-insensitive). Returns a string
+representation of the integer so it can be compared with int64.
+*/}}
+{{- define "lukscryptwalker-csi.vfsSizeToBytes" -}}
+{{- $s := upper . -}}
+{{- $num := regexReplaceAll "[^0-9]" $s "" | int64 -}}
+{{- $unit := regexReplaceAll "[0-9]" $s "" -}}
+{{- if eq $unit "K" -}}{{- mul $num 1024 -}}
+{{- else if eq $unit "M" -}}{{- mul $num 1048576 -}}
+{{- else if eq $unit "G" -}}{{- mul $num 1073741824 -}}
+{{- else if eq $unit "T" -}}{{- mul $num 1099511627776 -}}
+{{- else -}}{{- $num -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Image pull secrets
 */}}
 {{- define "lukscryptwalker-csi.imagePullSecrets" -}}
