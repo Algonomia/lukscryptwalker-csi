@@ -2,16 +2,20 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/lukscryptwalker-csi/pkg/luks"
+	"github.com/lukscryptwalker-csi/pkg/metrics"
+	"github.com/lukscryptwalker-csi/pkg/rclone"
 	"github.com/lukscryptwalker-csi/pkg/secrets"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -35,18 +39,36 @@ type NodeServer struct {
 	clientset      kubernetes.Interface
 	secretsManager *secrets.SecretsManager
 	s3SyncMgr      *S3SyncManager
+
+	stagedMu          sync.RWMutex
+	stagedVolumes     map[string]stagedVolumeInfo
+	fsUsageInterval   time.Duration
+	usageSem          chan struct{}
+	missingPathLogged map[string]bool
+	missingMu         sync.Mutex
+}
+
+type stagedVolumeInfo struct {
+	stagingPath string
+	backend     string
 }
 
 // NewNodeServer creates a new NodeServer instance
 func NewNodeServer(d *Driver) *NodeServer {
 	clientset := initializeKubernetesClient()
 
+	fsUsageInterval := getFSUsageInterval()
+
 	ns := &NodeServer{
-		driver:         d,
-		luksManager:    luks.NewLUKSManager(),
-		clientset:      clientset,
-		secretsManager: secrets.NewSecretsManager(clientset),
-		s3SyncMgr:      NewS3SyncManager(),
+		driver:            d,
+		luksManager:       luks.NewLUKSManager(),
+		clientset:         clientset,
+		secretsManager:    secrets.NewSecretsManager(clientset),
+		s3SyncMgr:         NewS3SyncManager(),
+		stagedVolumes:     make(map[string]stagedVolumeInfo),
+		fsUsageInterval:   fsUsageInterval,
+		usageSem:          make(chan struct{}, 4),
+		missingPathLogged: make(map[string]bool),
 	}
 
 	// Run startup cleanup asynchronously to avoid delaying CSI driver registration
@@ -59,7 +81,29 @@ func NewNodeServer(d *Driver) *NodeServer {
 		ns.runStaleS3MountChecker()
 	}()
 
+	// Optional background collector for filesystem usage metrics
+	if ns.fsUsageInterval > 0 {
+		go ns.runVolumeUsageCollector()
+	}
+
 	return ns
+}
+
+func getFSUsageInterval() time.Duration {
+	val := os.Getenv("CSI_METRICS_FS_USAGE_INTERVAL")
+	if val == "" {
+		return 0
+	}
+
+	dur, err := time.ParseDuration(val)
+	if err != nil {
+		klog.Warningf("Invalid CSI_METRICS_FS_USAGE_INTERVAL %q: %v (collector disabled)", val, err)
+		return 0
+	}
+	if dur <= 0 {
+		return 0
+	}
+	return dur
 }
 
 // runStaleS3MountChecker periodically checks for and handles stale S3 mounts
@@ -190,10 +234,17 @@ func initializeKubernetesClient() kubernetes.Interface {
 
 // NodeStageVolume stages a volume on the node
 func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
+	startTime := time.Now()
 	klog.Infof("NodeStageVolume called for volume %s", req.GetVolumeId())
+
+	backend := "luks"
+	if ns.isS3Backend(req.GetVolumeContext()) {
+		backend = "s3"
+	}
 
 	// Validate request parameters
 	if err := ns.validateStageVolumeRequest(req); err != nil {
+		metrics.RecordOperation("stage_volume", "error", time.Since(startTime).Seconds())
 		return nil, err
 	}
 
@@ -203,32 +254,47 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	// Check if volume is already staged (idempotency)
 	if ns.isVolumeStaged(volumeID, stagingTargetPath) {
 		klog.Infof("Volume %s is already staged at %s, returning success", volumeID, stagingTargetPath)
+		ns.trackStagedVolume(volumeID, stagingTargetPath, backend)
+		metrics.RecordOperation("stage_volume", "success", time.Since(startTime).Seconds())
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
 
 	// Prepare volume staging
 	stageParams, err := ns.prepareVolumeStaging(req)
 	if err != nil {
+		metrics.RecordOperation("stage_volume", "error", time.Since(startTime).Seconds())
 		return nil, status.Errorf(codes.Internal, "Failed to prepare volume staging: %v", err)
 	}
 
 	// Choose storage backend
-	if ns.isS3Backend(req.GetVolumeContext()) {
+	if backend == "s3" {
 		// S3 backend - no LUKS, files encrypted individually
 		if err := ns.setupS3Volume(stageParams, req.GetVolumeContext(), req.GetSecrets()); err != nil {
+			metrics.RecordOperation("stage_volume", "error", time.Since(startTime).Seconds())
 			return nil, status.Errorf(codes.Internal, "Failed to setup S3 volume: %v", err)
 		}
 	} else {
 		// Local LUKS backend - traditional approach
 		if err := ns.setupLUKSDevice(stageParams); err != nil {
+			metrics.RecordOperation("stage_volume", "error", time.Since(startTime).Seconds())
 			return nil, status.Errorf(codes.Internal, "Failed to setup LUKS device: %v", err)
 		}
 
 		// Mount and configure the LUKS volume
 		if err := ns.mountAndConfigureVolume(stageParams); err != nil {
+			metrics.RecordOperation("stage_volume", "error", time.Since(startTime).Seconds())
 			return nil, status.Errorf(codes.Internal, "Failed to mount and configure volume: %v", err)
 		}
 	}
+
+	// Record metrics for successful staging
+	var capacityBytes int64
+	if capacityStr := req.GetVolumeContext()["capacity"]; capacityStr != "" {
+		capacityBytes, _ = strconv.ParseInt(capacityStr, 10, 64)
+	}
+	metrics.RecordVolumeStaged(volumeID, backend, capacityBytes)
+	ns.trackStagedVolume(volumeID, stagingTargetPath, backend)
+	metrics.RecordOperation("stage_volume", "success", time.Since(startTime).Seconds())
 
 	klog.Infof("Successfully staged volume %s", volumeID)
 	return &csi.NodeStageVolumeResponse{}, nil
@@ -236,15 +302,23 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 
 // NodeUnstageVolume unstages a volume from the node
 func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
+	startTime := time.Now()
 	klog.Infof("NodeUnstageVolume called with request: %+v", req)
 
 	// Validate request parameters
 	if err := ns.validateUnstageVolumeRequest(req); err != nil {
+		metrics.RecordOperation("unstage_volume", "error", time.Since(startTime).Seconds())
 		return nil, err
 	}
 
 	volumeID := req.GetVolumeId()
 	stagingTargetPath := req.GetStagingTargetPath()
+
+	// Determine backend type for metrics
+	backend := "luks"
+	if ns.s3SyncMgr != nil && ns.s3SyncMgr.HasSync(volumeID) {
+		backend = "s3"
+	}
 
 	// Cleanup S3 sync first if configured
 	if err := ns.cleanupS3Sync(volumeID); err != nil {
@@ -254,8 +328,14 @@ func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 
 	// Perform cleanup operations
 	if err := ns.cleanupVolumeStaging(volumeID, stagingTargetPath); err != nil {
+		metrics.RecordOperation("unstage_volume", "error", time.Since(startTime).Seconds())
 		return nil, status.Errorf(codes.Internal, "Failed to cleanup volume staging: %v", err)
 	}
+
+	// Record metrics for successful unstaging
+	metrics.RecordVolumeUnstaged(volumeID, backend)
+	ns.untrackStagedVolume(volumeID)
+	metrics.RecordOperation("unstage_volume", "success", time.Since(startTime).Seconds())
 
 	klog.Infof("Successfully unstaged volume %s", volumeID)
 	return &csi.NodeUnstageVolumeResponse{}, nil
@@ -364,6 +444,190 @@ func (ns *NodeServer) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoReque
 // NodeGetVolumeStats returns volume statistics
 func (ns *NodeServer) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "NodeGetVolumeStats is not implemented")
+}
+
+// trackStagedVolume remembers staging path and backend for optional usage sampling
+func (ns *NodeServer) trackStagedVolume(volumeID, stagingPath, backend string) {
+	if stagingPath == "" {
+		return
+	}
+	ns.stagedMu.Lock()
+	ns.stagedVolumes[volumeID] = stagedVolumeInfo{
+		stagingPath: stagingPath,
+		backend:     backend,
+	}
+	ns.stagedMu.Unlock()
+}
+
+func (ns *NodeServer) untrackStagedVolume(volumeID string) {
+	ns.stagedMu.Lock()
+	delete(ns.stagedVolumes, volumeID)
+	ns.stagedMu.Unlock()
+}
+
+// runVolumeUsageCollector periodically samples filesystem usage for staged volumes
+func (ns *NodeServer) runVolumeUsageCollector() {
+	ticker := time.NewTicker(ns.fsUsageInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		ns.collectVolumeUsage()
+	}
+}
+
+func (ns *NodeServer) collectVolumeUsage() {
+	ns.stagedMu.RLock()
+	snapshot := make(map[string]stagedVolumeInfo, len(ns.stagedVolumes))
+	for k, v := range ns.stagedVolumes {
+		snapshot[k] = v
+	}
+	ns.stagedMu.RUnlock()
+
+	var wg sync.WaitGroup
+	for volumeID, info := range snapshot {
+		ns.usageSem <- struct{}{}
+		wg.Add(1)
+		go func(vol string, sv stagedVolumeInfo) {
+			defer wg.Done()
+			defer func() { <-ns.usageSem }()
+
+			used, err := getUsedBytes(sv.stagingPath)
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					if ns.logMissingOnce(vol, sv.stagingPath) {
+						klog.V(4).Infof("Staging path missing for %s at %s, skipping usage sample", vol, sv.stagingPath)
+					}
+				} else {
+					klog.V(4).Infof("Skipping usage sample for %s: %v", vol, err)
+				}
+				return
+			}
+
+			ns.clearMissingLog(vol)
+			metrics.RecordVolumeUsage(vol, sv.backend, used)
+		}(volumeID, info)
+	}
+	wg.Wait()
+
+	ns.collectLUKSPartitionUsage()
+	ns.collectS3CacheUsage()
+}
+
+func (ns *NodeServer) collectLUKSPartitionUsage() {
+	basePath := GetLocalPathBase()
+	stats, err := dfStats(basePath)
+	if err != nil {
+		klog.V(5).Infof("LUKS partition stats unavailable for %s: %v", basePath, err)
+		return
+	}
+	metrics.RecordLUKSPartitionUsage(basePath, stats.available, stats.total)
+}
+
+func (ns *NodeServer) collectS3CacheUsage() {
+	cachePath := rclone.VFSCacheBasePath
+	if !rclone.IsVFSCacheMounted() {
+		return
+	}
+
+	metrics.SetS3CacheMax(rclone.GetVFSCacheSize())
+
+	stats, err := dfStats(cachePath)
+	if err != nil {
+		klog.V(5).Infof("VFS cache stats unavailable: %v", err)
+		return
+	}
+	metrics.RecordS3CacheUsage(stats.used)
+}
+
+func (ns *NodeServer) logMissingOnce(volumeID, path string) bool {
+	ns.missingMu.Lock()
+	defer ns.missingMu.Unlock()
+	if ns.missingPathLogged[volumeID] {
+		return false
+	}
+	ns.missingPathLogged[volumeID] = true
+	return true
+}
+
+func (ns *NodeServer) clearMissingLog(volumeID string) {
+	ns.missingMu.Lock()
+	delete(ns.missingPathLogged, volumeID)
+	ns.missingMu.Unlock()
+}
+
+func getUsedBytes(path string) (int64, error) {
+	if path == "" {
+		return 0, fmt.Errorf("path is empty")
+	}
+	stats, err := dfStats(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, os.ErrNotExist
+		}
+		return 0, err
+	}
+	return stats.used, nil
+}
+
+type dfResult struct {
+	total     int64
+	used      int64
+	available int64
+}
+
+func dfStats(path string) (*dfResult, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, err
+	}
+
+	// Try GNU coreutils first
+	out, err := exec.Command("df", "--output=size,used,avail", "-B1", path).Output()
+	if err == nil {
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		if len(lines) >= 2 {
+			fields := strings.Fields(lines[1])
+			if len(fields) >= 3 {
+				total, e1 := strconv.ParseInt(fields[0], 10, 64)
+				used, e2 := strconv.ParseInt(fields[1], 10, 64)
+				avail, e3 := strconv.ParseInt(fields[2], 10, 64)
+				if e1 == nil && e2 == nil && e3 == nil {
+					return &dfResult{total: total, used: used, available: avail}, nil
+				}
+			}
+		}
+	}
+
+	// Fallback to BusyBox/POSIX: Filesystem 1B-blocks Used Available Use% Mounted
+	// BusyBox may wrap long device names onto a separate line, shifting field indices.
+	out, err = exec.Command("df", "-B1", path).Output()
+	if err != nil {
+		return nil, fmt.Errorf("df failed for %s: %w", path, err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for i := 1; i < len(lines); i++ {
+		fields := strings.Fields(lines[i])
+		// Normal line: device total used avail use% mount (6+ fields, total at [1])
+		if len(fields) >= 6 {
+			total, e1 := strconv.ParseInt(fields[1], 10, 64)
+			used, e2 := strconv.ParseInt(fields[2], 10, 64)
+			avail, e3 := strconv.ParseInt(fields[3], 10, 64)
+			if e1 == nil && e2 == nil && e3 == nil {
+				return &dfResult{total: total, used: used, available: avail}, nil
+			}
+		}
+		// Wrapped line: total used avail use% mount (5 fields, total at [0])
+		if len(fields) == 5 {
+			total, e1 := strconv.ParseInt(fields[0], 10, 64)
+			used, e2 := strconv.ParseInt(fields[1], 10, 64)
+			avail, e3 := strconv.ParseInt(fields[2], 10, 64)
+			if e1 == nil && e2 == nil && e3 == nil {
+				return &dfResult{total: total, used: used, available: avail}, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("df output malformed for %s", path)
 }
 
 // =============================================================================
@@ -646,4 +910,3 @@ func (ns *NodeServer) applyFsGroupPermissions(targetPath string, fsGroup int64) 
 	klog.Infof("Successfully applied fsGroup %d permissions recursively to %s", fsGroup, targetPath)
 	return nil
 }
-

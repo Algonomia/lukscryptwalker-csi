@@ -70,6 +70,15 @@ spec:
         - "--luks-secret-name={{ .Values.secret.name }}"
         - "--luks-secret-namespace={{ .Values.secret.namespace }}"
         - "--luks-secret-key={{ .Values.secret.passphraseKey }}"
+        {{- if .Values.metrics.enabled }}
+        - "--metrics-addr=:{{ .Values.metrics.port }}"
+        {{- end }}
+        {{- if .Values.metrics.enabled }}
+        ports:
+        - name: metrics
+          containerPort: {{ .Values.metrics.port }}
+          protocol: TCP
+        {{- end }}
         env:
         - name: CSI_ENDPOINT
           value: unix:///csi/csi.sock
@@ -79,6 +88,10 @@ spec:
               fieldPath: spec.nodeName
         - name: CSI_LOCAL_PATH
           value: {{ .Values.storage.defaultPath | quote }}
+        {{- if .Values.metrics.enabled }}
+        - name: CSI_METRICS_FS_USAGE_INTERVAL
+          value: {{ .Values.metrics.fsUsageInterval | default "30s" | quote }}
+        {{- end }}
         volumeMounts:
         - name: plugin-dir
           mountPath: /csi
