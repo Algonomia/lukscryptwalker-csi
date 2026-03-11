@@ -178,6 +178,13 @@ podSecurityContext:
 logging:
   level: 4
 
+metrics:
+  enabled: true
+  port: 9090
+  fsUsageInterval: "30s"
+  service:
+    annotations: {}
+
 # Node selector for deployment
 nodeSelector: {}
 

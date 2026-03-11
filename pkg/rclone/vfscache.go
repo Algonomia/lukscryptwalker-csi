@@ -57,7 +57,7 @@ func SetupVFSCache(sizeStr string, passphrase string) (string, error) {
 		cacheSize, VFSCacheBackingFile, mountPath)
 
 	// Check if already mounted
-	if isVFSCacheMounted(mountPath) {
+	if IsVFSCacheMounted() {
 		klog.Infof("VFS cache already mounted at %s", mountPath)
 		return mountPath, nil
 	}
@@ -170,9 +170,9 @@ func TeardownVFSCache() error {
 	return nil
 }
 
-// isVFSCacheMounted checks if the VFS cache is already mounted
-func isVFSCacheMounted(mountPath string) bool {
-	cmd := exec.Command("mountpoint", "-q", mountPath)
+// IsVFSCacheMounted reports whether the encrypted VFS cache is mounted.
+func IsVFSCacheMounted() bool {
+	cmd := exec.Command("mountpoint", "-q", VFSCacheBasePath)
 	return cmd.Run() == nil
 }
 
