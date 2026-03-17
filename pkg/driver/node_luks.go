@@ -140,7 +140,7 @@ func (ns *NodeServer) restoreLUKSDeviceAndMount(volumeID, backingFile, stagingTa
 	}
 
 	// Apply fsGroup permissions if specified in volume context
-	fsGroup := ns.extractFsGroup(volumeContext)
+	fsGroup := ns.extractFsGroup(volumeContext, nil)
 	if fsGroup != nil {
 		if err := ns.applyFsGroupPermissions(stagingTargetPath, *fsGroup); err != nil {
 			return fmt.Errorf("failed to apply fsGroup permissions during restore: %v", err)

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/lukscryptwalker-csi/pkg/rclone"
 	"github.com/lukscryptwalker-csi/pkg/secrets"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -230,7 +231,7 @@ func (ns *NodeServer) cleanupS3Sync(volumeID string) error {
 }
 
 // restoreS3VolumeStaging restores an S3 volume's staging mount after node reboot
-func (ns *NodeServer) restoreS3VolumeStaging(volumeID, stagingTargetPath string, volumeContext, secrets map[string]string) error {
+func (ns *NodeServer) restoreS3VolumeStaging(volumeID, stagingTargetPath string, volumeContext, secrets map[string]string, volumeCapability *csi.VolumeCapability) error {
 	klog.Infof("Restoring S3 volume %s at %s", volumeID, stagingTargetPath)
 
 	// Create staging directory if it doesn't exist
@@ -239,7 +240,7 @@ func (ns *NodeServer) restoreS3VolumeStaging(volumeID, stagingTargetPath string,
 	}
 
 	// Extract fsGroup for the FUSE mount
-	fsGroup := ns.extractFsGroup(volumeContext)
+	fsGroup := ns.extractFsGroup(volumeContext, volumeCapability)
 
 	// Setup S3 sync
 	if err := ns.setupS3Sync(volumeID, stagingTargetPath, volumeContext, secrets, fsGroup); err != nil {

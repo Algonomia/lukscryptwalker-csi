@@ -273,7 +273,7 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	volumeID := req.GetVolumeId()
 	stagingTargetPath := req.GetStagingTargetPath()
 	targetPath := req.GetTargetPath()
-	fsGroup := ns.extractFsGroup(req.GetVolumeContext())
+	fsGroup := ns.extractFsGroup(req.GetVolumeContext(), req.GetVolumeCapability())
 
 	// Ensure volume is staged, restore if needed after reboot
 	if err := ns.ensureVolumeStaged(ctx, req); err != nil {
@@ -430,7 +430,7 @@ type StagingParameters struct {
 // For S3 volumes, backing file and LUKS-related fields are not populated
 func (ns *NodeServer) prepareVolumeStaging(req *csi.NodeStageVolumeRequest) (*StagingParameters, error) {
 	volumeID := req.GetVolumeId()
-	fsGroup := ns.extractFsGroup(req.GetVolumeContext())
+	fsGroup := ns.extractFsGroup(req.GetVolumeContext(), req.GetVolumeCapability())
 
 	params := &StagingParameters{
 		volumeID:          volumeID,
@@ -489,7 +489,7 @@ func (ns *NodeServer) ensureVolumeStaged(ctx context.Context, req *csi.NodePubli
 			return nil
 		}
 		klog.Infof("S3 volume %s not staged at %s, attempting to restore", volumeID, stagingTargetPath)
-		return ns.restoreS3VolumeStaging(volumeID, stagingTargetPath, volumeContext, req.GetSecrets())
+		return ns.restoreS3VolumeStaging(volumeID, stagingTargetPath, volumeContext, req.GetSecrets(), req.GetVolumeCapability())
 	}
 
 	// LUKS volumes: use existing check
@@ -599,9 +599,11 @@ func (ns *NodeServer) bindMount(sourcePath, targetPath string, readonly bool, fs
 // Permission and Security Management
 // =============================================================================
 
-// extractFsGroup extracts the fsGroup from volume context
-func (ns *NodeServer) extractFsGroup(volumeContext map[string]string) *int64 {
-	// Check for manual fsGroup override
+// extractFsGroup extracts the fsGroup from volume context or volume capability.
+// Priority: 1) manual StorageClass parameter, 2) VolumeMountGroup from CSI request
+// (populated by kubelet when fsGroupPolicy is File), 3) nil.
+func (ns *NodeServer) extractFsGroup(volumeContext map[string]string, volumeCapability *csi.VolumeCapability) *int64 {
+	// Check for manual fsGroup override in StorageClass parameters
 	if fsGroupStr, exists := volumeContext["fsGroup"]; exists {
 		if fsGroup, err := strconv.ParseInt(fsGroupStr, 10, 64); err == nil {
 			klog.Infof("Using manual fsGroup %d from StorageClass parameters", fsGroup)
@@ -609,11 +611,15 @@ func (ns *NodeServer) extractFsGroup(volumeContext map[string]string) *int64 {
 		}
 	}
 
-	// Fall back to auto-detection from pod security context
-	if fsGroupStr, exists := volumeContext["csi.storage.k8s.io/pod.spec.securityContext.fsGroup"]; exists {
-		if fsGroup, err := strconv.ParseInt(fsGroupStr, 10, 64); err == nil {
-			klog.Infof("Auto-detected fsGroup %d from pod volume context", fsGroup)
-			return &fsGroup
+	// Fall back to VolumeMountGroup from CSI request (requires fsGroupPolicy: File)
+	if volumeCapability != nil {
+		if mount := volumeCapability.GetMount(); mount != nil {
+			if mountGroup := mount.GetVolumeMountGroup(); mountGroup != "" {
+				if fsGroup, err := strconv.ParseInt(mountGroup, 10, 64); err == nil {
+					klog.Infof("Using fsGroup %d from VolumeMountGroup", fsGroup)
+					return &fsGroup
+				}
+			}
 		}
 	}
 
