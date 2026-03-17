@@ -84,15 +84,8 @@ func (ns *NodeServer) setupS3Volume(params *StagingParameters, volumeContext, se
 		return fmt.Errorf("failed to create staging directory: %v", err)
 	}
 
-	// Apply fsGroup permissions to the staging directory
-	if params.fsGroup != nil {
-		if err := ns.applyFsGroupPermissions(params.stagingTargetPath, *params.fsGroup); err != nil {
-			return fmt.Errorf("failed to apply fsGroup permissions to S3 staging path: %v", err)
-		}
-	}
-
-	// Setup S3 sync with file encryption
-	if err := ns.setupS3Sync(params.volumeID, params.stagingTargetPath, volumeContext, secrets); err != nil {
+	// Setup S3 sync with file encryption (fsGroup is passed to rclone FUSE mount options)
+	if err := ns.setupS3Sync(params.volumeID, params.stagingTargetPath, volumeContext, secrets, params.fsGroup); err != nil {
 		return fmt.Errorf("failed to setup S3 sync: %v", err)
 	}
 
@@ -101,7 +94,7 @@ func (ns *NodeServer) setupS3Volume(params *StagingParameters, volumeContext, se
 }
 
 // setupS3Sync initializes S3 mount for a volume using rclone mount mode
-func (ns *NodeServer) setupS3Sync(volumeID, stagingPath string, volumeContext map[string]string, _ map[string]string) error {
+func (ns *NodeServer) setupS3Sync(volumeID, stagingPath string, volumeContext map[string]string, _ map[string]string, fsGroup *int64) error {
 	klog.Infof("Setting up S3 mount for volume %s", volumeID)
 
 	// Mark volume as setup in progress to prevent stale mount detection from interfering
@@ -147,7 +140,7 @@ func (ns *NodeServer) setupS3Sync(volumeID, stagingPath string, volumeContext ma
 	s3PathPrefix := volumeContext[S3PathPrefixParam]
 
 	// Create rclone mount manager
-	mountMgr, err := rclone.NewMountManager(s3Config, volumeID, stagingPath, vfsConfig, s3PathPrefix, passphrase)
+	mountMgr, err := rclone.NewMountManager(s3Config, volumeID, stagingPath, vfsConfig, s3PathPrefix, passphrase, fsGroup)
 	if err != nil {
 		return fmt.Errorf("failed to create rclone mount manager: %v", err)
 	}
@@ -245,8 +238,11 @@ func (ns *NodeServer) restoreS3VolumeStaging(volumeID, stagingTargetPath string,
 		return fmt.Errorf("failed to create staging directory: %v", err)
 	}
 
+	// Extract fsGroup for the FUSE mount
+	fsGroup := ns.extractFsGroup(volumeContext)
+
 	// Setup S3 sync
-	if err := ns.setupS3Sync(volumeID, stagingTargetPath, volumeContext, secrets); err != nil {
+	if err := ns.setupS3Sync(volumeID, stagingTargetPath, volumeContext, secrets, fsGroup); err != nil {
 		return fmt.Errorf("failed to setup S3 sync during restore: %v", err)
 	}
 

@@ -41,12 +41,14 @@ type MountManager struct {
 	vfsName         string // Deterministic VFS name derived from volumeID
 	s3ConfigName    string // Named rclone config for S3 backend
 	cryptConfigName string // Named rclone config for crypt layer
+	uid             *int64 // UID for FUSE mount (from fsGroup)
+	gid             *int64 // GID for FUSE mount (from fsGroup)
 }
 
 // NewMountManager creates a new rclone mount manager
 // s3PathPrefix is optional - if empty, defaults to "volumes/{volumeID}/files"
 // If s3PathPrefix is provided, path becomes "{s3PathPrefix}/volumes/{volumeID}/files"
-func NewMountManager(s3Config *S3Config, volumeID, mountPoint string, vfsConfig *VFSCacheConfig, s3PathPrefix string, luksPassphrase string) (*MountManager, error) {
+func NewMountManager(s3Config *S3Config, volumeID, mountPoint string, vfsConfig *VFSCacheConfig, s3PathPrefix string, luksPassphrase string, fsGroup *int64) (*MountManager, error) {
 	if vfsConfig == nil {
 		vfsConfig = DefaultVFSCacheConfig()
 	}
@@ -77,6 +79,8 @@ func NewMountManager(s3Config *S3Config, volumeID, mountPoint string, vfsConfig 
 		vfsName:         volumeID,
 		s3ConfigName:    volumeID + "-s3",
 		cryptConfigName: volumeID,
+		uid:             fsGroup,
+		gid:             fsGroup,
 	}
 
 	klog.Infof("Created rclone mount manager for volume %s at %s (s3Path: %s)", volumeID, mountPoint, s3BasePath)
@@ -128,6 +132,17 @@ func (mm *MountManager) Mount() error {
 		"AllowNonEmpty": true,
 		"DirCacheTime":  300000000000, // 5 minutes in nanoseconds
 		"AttrTimeout":   300000000000, // 5 minutes in nanoseconds - caches file attributes (stat) in the kernel FUSE layer
+	}
+
+	// Set UID/GID on the FUSE mount so files appear owned by the pod's fsGroup,
+	// allowing non-root containers to read, write, and delete files.
+	if mm.uid != nil {
+		mountOpt["UID"] = uint32(*mm.uid)
+		klog.Infof("Setting FUSE mount UID to %d for volume %s", *mm.uid, mm.volumeID)
+	}
+	if mm.gid != nil {
+		mountOpt["GID"] = uint32(*mm.gid)
+		klog.Infof("Setting FUSE mount GID to %d for volume %s", *mm.gid, mm.volumeID)
 	}
 
 	// Build VFS options
