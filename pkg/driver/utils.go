@@ -60,13 +60,16 @@ func GenerateBackingFilePath(localPath, volumeID string) string {
 	return filepath.Join(localPath, fmt.Sprintf("luks-%s.img", volumeID))
 }
 
+// GetLocalPathBase returns the base directory where LUKS backing files are stored,
+// without a volumeID suffix.
+func GetLocalPathBase() string {
+	if envPath := os.Getenv("CSI_LOCAL_PATH"); envPath != "" {
+		return envPath
+	}
+	return DefaultLocalPath
+}
+
 // GetLocalPath determines the local path for a volume using environment variable
 func GetLocalPath(volumeID string) string {
-	// Use environment variable
-	if envPath := os.Getenv("CSI_LOCAL_PATH"); envPath != "" {
-		return filepath.Join(envPath, volumeID)
-	}
-	
-	// Fallback to default
-	return filepath.Join(DefaultLocalPath, volumeID)
+	return filepath.Join(GetLocalPathBase(), volumeID)
 }

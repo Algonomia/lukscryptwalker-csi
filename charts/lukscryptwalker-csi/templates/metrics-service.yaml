@@ -1,0 +1,22 @@
+{{- if .Values.metrics.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "lukscryptwalker-csi.fullname" . }}-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "lukscryptwalker-csi.labels" . | nindent 4 }}
+  {{- with .Values.metrics.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  ports:
+  - name: metrics
+    port: {{ .Values.metrics.port }}
+    targetPort: metrics
+    protocol: TCP
+  selector:
+    {{- include "lukscryptwalker-csi.node.selectorLabels" . | nindent 4 }}
+{{- end }}
