@@ -285,16 +285,10 @@ func formatExt4(device string) error {
 
 func mountFilesystem(device, mountPath string) error {
 	// Check if already mounted
-	// Resolve the path to its canonical form so that bind-mounted kubelet
-	// directories (e.g. microk8s) match the entries in /proc/mounts.
-	resolvedPath, err := filepath.EvalSymlinks(mountPath)
-	if err != nil {
-		resolvedPath = mountPath
-	}
 	data, _ := os.ReadFile("/proc/mounts")
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) >= 2 && (fields[1] == mountPath || fields[1] == resolvedPath) {
+		if len(fields) >= 2 && fields[1] == mountPath {
 			klog.Infof("Filesystem already mounted at %s", mountPath)
 			return nil
 		}

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 
 	"k8s.io/klog"
@@ -23,10 +22,10 @@ type VFSCacheConfig struct {
 func DefaultVFSCacheConfig() *VFSCacheConfig {
 	return &VFSCacheConfig{
 		CacheMode:         "full",
-		CacheMaxAge:       "4h",  // 4 hours to handle long-running operations
+		CacheMaxAge:       "4h", // 4 hours to handle long-running operations
 		CacheMaxSize:      "5G", // 5GB to handle large files
-		CachePollInterval: "1m",  // Poll every minute for stale cache entries
-		WriteBack:         "3s",  // Start uploads quickly to reduce cache pressure
+		CachePollInterval: "1m", // Poll every minute for stale cache entries
+		WriteBack:         "3s", // Start uploads quickly to reduce cache pressure
 	}
 }
 
@@ -303,7 +302,7 @@ func (mm *MountManager) waitForPendingUploads() {
 	_ = sleepCmd.Run()
 
 	maxWaitTime := 1800 // 30 minutes max wait
-	pollInterval := 2  // Check every 2 seconds
+	pollInterval := 2   // Check every 2 seconds
 
 	for i := 0; i < maxWaitTime/pollInterval; i++ {
 		// Check core/stats for active transfers
@@ -351,22 +350,15 @@ func (mm *MountManager) isMountPoint() bool {
 	// Check /proc/mounts for FUSE mounts
 	data, err := os.ReadFile("/proc/mounts")
 	if err != nil {
-		klog.V(5).Infof("Failed to read /proc/mounts: %v", err)
+		klog.Infof("Failed to read /proc/mounts: %v", err)
 		return false
-	}
-
-	// Resolve the path to its canonical form so that bind-mounted kubelet
-	// directories (e.g. microk8s) match the entries in /proc/mounts.
-	resolvedPath, err := filepath.EvalSymlinks(mm.mountPoint)
-	if err != nil {
-		resolvedPath = mm.mountPoint
 	}
 
 	// Look for rclone or fuse mount at our path
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) >= 2 && (fields[1] == mm.mountPoint || fields[1] == resolvedPath) {
-			klog.V(5).Infof("Found mount at %s: %s", mm.mountPoint, line)
+		if len(fields) >= 2 && fields[1] == mm.mountPoint {
+			klog.Infof("Found mount at %s: %s", mm.mountPoint, line)
 			return true
 		}
 	}
@@ -486,4 +478,3 @@ func parseSizeToBytes(s string) (int64, error) {
 		return 0, fmt.Errorf("unknown size unit: %c", unit)
 	}
 }
-

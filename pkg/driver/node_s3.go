@@ -251,11 +251,29 @@ func (ns *NodeServer) restoreS3VolumeStaging(volumeID, stagingTargetPath string,
 	return nil
 }
 
+// resolveKubeletRoot resolves /var/lib/kubelet to its real path on the host.
+// On microk8s, /var/lib/kubelet is a symlink to /var/snap/microk8s/common/var/lib/kubelet.
+// We resolve in the host namespace using nsenter so the path matches what kubelet
+// passes in CSI requests and what rclone uses for FUSE mounts.
+func resolveKubeletRoot() string {
+	cmd := exec.Command("nsenter", "-t", "1", "-m", "-u", "readlink", "-f", "/var/lib/kubelet")
+	output, err := cmd.Output()
+	if err != nil {
+		return "/var/lib/kubelet"
+	}
+	resolved := strings.TrimSpace(string(output))
+	if resolved == "" {
+		return "/var/lib/kubelet"
+	}
+	return resolved
+}
+
 // cleanupStaleS3Mounts cleans up stale or missing S3/FUSE mounts that may remain after
 // an unclean shutdown (e.g., OOM kill). For S3 volumes, it attempts to restore
 // the mount instead of just unmounting to keep existing pods working.
 func (ns *NodeServer) cleanupStaleS3Mounts() {
-	csiPluginPath := "/var/lib/kubelet/plugins/kubernetes.io/csi/" + DriverName
+	kubeletRoot := resolveKubeletRoot()
+	csiPluginPath := kubeletRoot + "/plugins/kubernetes.io/csi/" + DriverName
 	klog.Infof("Checking for stale/missing S3 mounts in %s", csiPluginPath)
 
 	// Check if the CSI plugin directory exists
@@ -352,7 +370,7 @@ func (ns *NodeServer) cleanupStaleS3Mounts() {
 
 // restartPodsWithStaleS3Mount finds pods with stale mounts for this volume and restarts them
 func (ns *NodeServer) restartPodsWithStaleS3Mount(volumeID string) {
-	podsDir := "/var/lib/kubelet/pods"
+	podsDir := resolveKubeletRoot() + "/pods"
 
 	entries, err := os.ReadDir(podsDir)
 	if err != nil {
@@ -448,7 +466,7 @@ func (ns *NodeServer) deletePodByUID(podUID string) {
 	klog.Warningf("Could not find pod with UID %s to delete", podUID)
 }
 
-// isFUSEMountPoint checks if the path has a FUSE mount by reading /proc/mounts
+// isFUSEMountPoint checks if the path has a FUSE mount by reading /proc/mounts.
 func (ns *NodeServer) isFUSEMountPoint(path string) bool {
 	data, err := os.ReadFile("/proc/mounts")
 	if err != nil {
@@ -456,17 +474,9 @@ func (ns *NodeServer) isFUSEMountPoint(path string) bool {
 		return false
 	}
 
-	// Resolve the path to its canonical form so that bind-mounted kubelet
-	// directories (e.g. microk8s: /var/lib/kubelet -> /var/snap/microk8s/common/var/lib/kubelet)
-	// match the mount entries in /proc/mounts.
-	resolvedPath, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		resolvedPath = path // fall back to original if resolve fails
-	}
-
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) >= 3 && (fields[1] == path || fields[1] == resolvedPath) {
+		if len(fields) >= 3 && fields[1] == path {
 			// Check if it's a FUSE mount
 			if strings.Contains(fields[2], "fuse") || strings.Contains(fields[0], "rclone") {
 				return true
