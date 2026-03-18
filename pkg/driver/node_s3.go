@@ -456,9 +456,17 @@ func (ns *NodeServer) isFUSEMountPoint(path string) bool {
 		return false
 	}
 
+	// Resolve the path to its canonical form so that bind-mounted kubelet
+	// directories (e.g. microk8s: /var/lib/kubelet -> /var/snap/microk8s/common/var/lib/kubelet)
+	// match the mount entries in /proc/mounts.
+	resolvedPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		resolvedPath = path // fall back to original if resolve fails
+	}
+
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) >= 3 && fields[1] == path {
+		if len(fields) >= 3 && (fields[1] == path || fields[1] == resolvedPath) {
 			// Check if it's a FUSE mount
 			if strings.Contains(fields[2], "fuse") || strings.Contains(fields[0], "rclone") {
 				return true

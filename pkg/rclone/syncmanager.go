@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"k8s.io/klog"
@@ -354,10 +355,17 @@ func (mm *MountManager) isMountPoint() bool {
 		return false
 	}
 
+	// Resolve the path to its canonical form so that bind-mounted kubelet
+	// directories (e.g. microk8s) match the entries in /proc/mounts.
+	resolvedPath, err := filepath.EvalSymlinks(mm.mountPoint)
+	if err != nil {
+		resolvedPath = mm.mountPoint
+	}
+
 	// Look for rclone or fuse mount at our path
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) >= 2 && fields[1] == mm.mountPoint {
+		if len(fields) >= 2 && (fields[1] == mm.mountPoint || fields[1] == resolvedPath) {
 			klog.V(5).Infof("Found mount at %s: %s", mm.mountPoint, line)
 			return true
 		}
