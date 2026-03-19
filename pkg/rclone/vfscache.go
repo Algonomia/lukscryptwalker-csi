@@ -58,8 +58,16 @@ func SetupVFSCache(sizeStr string, passphrase string) (string, error) {
 
 	// Check if already mounted
 	if isVFSCacheMounted(mountPath) {
-		klog.Infof("VFS cache already mounted at %s", mountPath)
-		return mountPath, nil
+		// Check if resize is needed even though it's already mounted
+		if info, err := os.Stat(VFSCacheBackingFile); err == nil && info.Size() < cacheSize {
+			klog.Infof("VFS cache mounted at %s but backing file (%d bytes) is smaller than configured size (%d bytes), unmounting to resize",
+				mountPath, info.Size(), cacheSize)
+			cleanupStaleVFSCache(mountPath)
+			// Fall through to re-setup with the new size
+		} else {
+			klog.Infof("VFS cache already mounted at %s", mountPath)
+			return mountPath, nil
+		}
 	}
 
 	// Clean up any stale state
