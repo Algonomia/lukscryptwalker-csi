@@ -2,9 +2,13 @@ package rclone
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
 	"k8s.io/klog"
 )
@@ -43,6 +47,7 @@ type MountManager struct {
 	cryptConfigName string // Named rclone config for crypt layer
 	uid             *int64 // UID for FUSE mount (from fsGroup)
 	gid             *int64 // GID for FUSE mount (from fsGroup)
+	stopCacheMon    chan struct{} // Signals the background cache monitor to stop
 }
 
 // NewMountManager creates a new rclone mount manager
@@ -170,6 +175,13 @@ func (mm *MountManager) Mount() error {
 	mm.mounted = true
 	klog.Infof("Successfully mounted encrypted S3 volume %s at %s", mm.volumeID, mm.mountPoint)
 
+	// Start background cache monitor to evict uploaded files that rclone's
+	// built-in eviction won't remove (e.g. recently-accessed but already-synced files).
+	// This is critical for long-lived mounts like pgbackrest pods where CacheMaxSize
+	// is a soft limit and CacheMaxAge resets on every access.
+	mm.stopCacheMon = make(chan struct{})
+	go mm.cacheMonitor()
+
 	// If stale cache was detected (ungraceful shutdown), refresh the VFS to force
 	// rclone to reconcile its cache state against S3. Without this, stale metadata
 	// in vfsMeta/ referencing lost data files causes "detected external removal of
@@ -250,6 +262,11 @@ func (mm *MountManager) Unmount() error {
 	}
 
 	klog.Infof("Unmounting encrypted S3 volume %s from %s", mm.volumeID, mm.mountPoint)
+
+	// Stop the background cache monitor
+	if mm.stopCacheMon != nil {
+		close(mm.stopCacheMon)
+	}
 
 	// CRITICAL: Wait for pending uploads to complete before unmounting
 	// This prevents data loss when there are cached writes not yet uploaded to S3
@@ -401,16 +418,159 @@ func (mm *MountManager) refreshVFS() {
 	}
 }
 
-// cleanupVFSCacheDir updates the VFS name mapping after unmount.
-// We intentionally do NOT delete rclone's cache directories (vfs/ and vfsMeta/).
-// Rclone manages its own cache via CacheMaxAge, CacheMaxSize, and CachePollInterval.
-// Externally removing cache files causes "detected external removal of cache file"
-// errors. Leaving the cache intact also lets rclone reuse it across remounts.
+// cleanupVFSCacheDir removes the on-disk VFS cache directories after unmount.
+// This is safe because it is only called from Unmount() AFTER waitForPendingUploads()
+// has confirmed all cached writes are synced to S3. On a hard restart/crash,
+// Unmount() never runs so the cache survives for rclone to resume on remount.
+// Without this cleanup, cache data accumulates indefinitely because rclone's
+// CacheMaxSize eviction only runs while the VFS is active.
 func (mm *MountManager) cleanupVFSCacheDir() {
 	if mm.vfsName == "" {
 		return
 	}
+
+	cacheDir := fmt.Sprintf("%s/vfs/%s", VFSCacheBasePath, mm.vfsName)
+	metaDir := fmt.Sprintf("%s/vfsMeta/%s", VFSCacheBasePath, mm.vfsName)
+
+	if err := os.RemoveAll(cacheDir); err != nil {
+		klog.Warningf("Failed to remove VFS cache dir %s: %v", cacheDir, err)
+	} else {
+		klog.Infof("Removed VFS cache dir %s for volume %s", cacheDir, mm.volumeID)
+	}
+	if err := os.RemoveAll(metaDir); err != nil {
+		klog.Warningf("Failed to remove VFS meta dir %s: %v", metaDir, err)
+	}
+
 	RemoveVFSName(mm.volumeID)
+}
+
+// cacheMonitor runs in the background while the volume is mounted.
+// It periodically checks the on-disk VFS cache size and, when it exceeds
+// CacheMaxSize, removes the oldest already-uploaded files. This handles
+// the case where rclone's built-in eviction is insufficient (e.g. long-lived
+// mounts where CacheMaxAge resets on every file access).
+func (mm *MountManager) cacheMonitor() {
+	if mm.vfsName == "" {
+		return
+	}
+
+	// Parse the configured max size; if not set, nothing to enforce
+	var maxBytes int64
+	if mm.vfsConfig.CacheMaxSize != "" {
+		parsed, err := parseSizeToBytes(mm.vfsConfig.CacheMaxSize)
+		if err != nil || parsed <= 0 {
+			return
+		}
+		maxBytes = parsed
+	} else {
+		return
+	}
+
+	// Poll every CachePollInterval (default 1m), or fall back to 1m
+	pollInterval := time.Minute
+	if mm.vfsConfig.CachePollInterval != "" {
+		if ns, err := parseDurationToNs(mm.vfsConfig.CachePollInterval); err == nil && ns > 0 {
+			pollInterval = time.Duration(ns)
+		}
+	}
+
+	cacheDir := fmt.Sprintf("%s/vfs/%s", VFSCacheBasePath, mm.vfsName)
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-mm.stopCacheMon:
+			return
+		case <-ticker.C:
+			mm.evictCacheIfNeeded(cacheDir, maxBytes)
+		}
+	}
+}
+
+// evictCacheIfNeeded checks the cache directory size and removes the oldest
+// files until the total is back under maxBytes. It only removes files when
+// there are no active transfers (all data is synced to S3).
+func (mm *MountManager) evictCacheIfNeeded(cacheDir string, maxBytes int64) {
+	// Check for active transfers first — never delete files that may not be
+	// uploaded yet
+	if mm.hasActiveTransfers() {
+		return
+	}
+
+	// Collect all files with their sizes and modification times
+	type cachedFile struct {
+		path    string
+		size    int64
+		modTime time.Time
+	}
+	var files []cachedFile
+	var totalSize int64
+
+	_ = filepath.WalkDir(cacheDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		totalSize += info.Size()
+		files = append(files, cachedFile{path: path, size: info.Size(), modTime: info.ModTime()})
+		return nil
+	})
+
+	if totalSize <= maxBytes {
+		return
+	}
+
+	klog.Infof("VFS cache for volume %s is %d bytes (limit %d), evicting oldest files",
+		mm.volumeID, totalSize, maxBytes)
+
+	// Sort oldest first
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].modTime.Before(files[j].modTime)
+	})
+
+	for _, f := range files {
+		if totalSize <= maxBytes {
+			break
+		}
+		if err := os.Remove(f.path); err != nil {
+			klog.V(4).Infof("Could not remove cache file %s: %v", f.path, err)
+			continue
+		}
+		totalSize -= f.size
+	}
+
+	klog.Infof("VFS cache for volume %s reduced to %d bytes", mm.volumeID, totalSize)
+
+	// After removing cache data files, clear rclone's in-memory directory
+	// cache so it doesn't serve stale entries pointing to removed files.
+	// On the next read rclone will re-download from S3 as needed.
+	mm.refreshVFS()
+}
+
+// hasActiveTransfers returns true if rclone is currently uploading files
+func (mm *MountManager) hasActiveTransfers() bool {
+	result, err := RPC("core/stats", map[string]interface{}{})
+	if err != nil {
+		return true // Assume busy on error
+	}
+	if result == nil || result.Output == nil {
+		return false
+	}
+	if t, ok := result.Output["transferring"]; ok {
+		if tList, ok := t.([]interface{}); ok && len(tList) > 0 {
+			return true
+		}
+	}
+	if c, ok := result.Output["checking"]; ok {
+		if cList, ok := c.([]interface{}); ok && len(cList) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // IsMounted returns whether the volume is currently mounted
