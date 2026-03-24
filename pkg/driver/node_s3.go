@@ -94,13 +94,11 @@ func (ns *NodeServer) setupS3Volume(params *StagingParameters, volumeContext, se
 	return nil
 }
 
-// setupS3Sync initializes S3 mount for a volume using rclone mount mode
+// setupS3Sync initializes S3 mount for a volume using rclone mount mode.
+// The caller is responsible for calling markVolumeSetupInProgress/markVolumeSetupComplete
+// to guard the full publish flow (including bind mount) from stale mount detection.
 func (ns *NodeServer) setupS3Sync(volumeID, stagingPath string, volumeContext map[string]string, _ map[string]string, fsGroup *int64) error {
 	klog.Infof("Setting up S3 mount for volume %s", volumeID)
-
-	// Mark volume as setup in progress to prevent stale mount detection from interfering
-	ns.s3SyncMgr.markVolumeSetupInProgress(volumeID)
-	defer ns.s3SyncMgr.markVolumeSetupComplete(volumeID)
 
 	ctx := context.Background()
 

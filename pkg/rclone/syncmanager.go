@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"k8s.io/klog"
@@ -42,12 +43,13 @@ type MountManager struct {
 	mountPoint      string
 	s3BasePath      string
 	mounted         bool
-	vfsName         string // Deterministic VFS name derived from volumeID
-	s3ConfigName    string // Named rclone config for S3 backend
-	cryptConfigName string // Named rclone config for crypt layer
-	uid             *int64 // UID for FUSE mount (from fsGroup)
-	gid             *int64 // GID for FUSE mount (from fsGroup)
+	vfsName         string        // Deterministic VFS name derived from volumeID
+	s3ConfigName    string        // Named rclone config for S3 backend
+	cryptConfigName string        // Named rclone config for crypt layer
+	uid             *int64        // UID for FUSE mount (from fsGroup)
+	gid             *int64        // GID for FUSE mount (from fsGroup)
 	stopCacheMon    chan struct{} // Signals the background cache monitor to stop
+	refreshMu       sync.Mutex    // Serializes refreshVFS calls to prevent concurrent forget/refresh races
 }
 
 // NewMountManager creates a new rclone mount manager
@@ -175,21 +177,27 @@ func (mm *MountManager) Mount() error {
 	mm.mounted = true
 	klog.Infof("Successfully mounted encrypted S3 volume %s at %s", mm.volumeID, mm.mountPoint)
 
-	// Start background cache monitor to evict uploaded files that rclone's
-	// built-in eviction won't remove (e.g. recently-accessed but already-synced files).
-	// This is critical for long-lived mounts like pgbackrest pods where CacheMaxSize
-	// is a soft limit and CacheMaxAge resets on every access.
-	mm.stopCacheMon = make(chan struct{})
-	go mm.cacheMonitor()
-
-	// If stale cache was detected (ungraceful shutdown), refresh the VFS to force
-	// rclone to reconcile its cache state against S3. Without this, stale metadata
-	// in vfsMeta/ referencing lost data files causes "detected external removal of
-	// cache file" errors and rclone fails to re-download from S3.
+	// If stale cache was detected (ungraceful shutdown), refresh the VFS BEFORE
+	// starting the cache monitor and BEFORE returning. This ensures the mount is
+	// fully reconciled with S3 before any pod tries to access files, preventing
+	// "transport endpoint not connected" or empty directory listing errors.
 	if hadStaleCache {
 		klog.Infof("Stale VFS cache detected for volume %s, triggering VFS refresh to reconcile with S3", mm.volumeID)
 		mm.refreshVFS()
 	}
+
+	// Verify the FUSE mount is actually responding before declaring success.
+	// The mount RPC may return before the FUSE daemon is fully initialized,
+	// causing pods to see "transport endpoint not connected" errors.
+	if err := mm.waitForMountReady(); err != nil {
+		klog.Warningf("Mount readiness check failed for volume %s: %v (mount may still work)", mm.volumeID, err)
+	}
+
+	// Start background cache monitor AFTER VFS refresh and readiness check.
+	// This prevents the monitor from triggering additional refreshVFS() calls
+	// while the mount is still stabilizing.
+	mm.stopCacheMon = make(chan struct{})
+	go mm.cacheMonitor()
 
 	return nil
 }
@@ -399,7 +407,12 @@ func (mm *MountManager) hasStaleVFSCache() bool {
 // refreshVFS forces rclone to reconcile its VFS state against the S3 remote.
 // This clears stale in-memory items and re-reads directory listings from S3,
 // so that missing cache files trigger re-downloads instead of errors.
+// Serialized with a mutex to prevent concurrent forget/refresh races from
+// the cache monitor and mount paths.
 func (mm *MountManager) refreshVFS() {
+	mm.refreshMu.Lock()
+	defer mm.refreshMu.Unlock()
+
 	fs := mm.cryptConfigName + ":"
 
 	// Forget in-memory directory cache so rclone drops any stale Items
@@ -416,6 +429,27 @@ func (mm *MountManager) refreshVFS() {
 	if _, err := RPC("vfs/refresh", refreshParams); err != nil {
 		klog.Warningf("vfs/refresh failed for volume %s: %v", mm.volumeID, err)
 	}
+}
+
+// waitForMountReady verifies the FUSE mount is responding by stat-ing the
+// mount point. Retries for up to 5 seconds to allow the FUSE daemon to
+// fully initialize after the mount RPC returns.
+func (mm *MountManager) waitForMountReady() error {
+	deadline := time.Now().Add(5 * time.Second)
+	var lastErr error
+
+	for time.Now().Before(deadline) {
+		_, err := os.ReadDir(mm.mountPoint)
+		if err == nil {
+			klog.Infof("FUSE mount verified ready for volume %s at %s", mm.volumeID, mm.mountPoint)
+			return nil
+		}
+		lastErr = err
+		klog.Infof("FUSE mount not ready yet for volume %s: %v, retrying...", mm.volumeID, err)
+		time.Sleep(250 * time.Millisecond)
+	}
+
+	return fmt.Errorf("FUSE mount not ready after 5s for volume %s: %v", mm.volumeID, lastErr)
 }
 
 // cleanupVFSCacheDir removes the on-disk VFS cache directories after unmount.

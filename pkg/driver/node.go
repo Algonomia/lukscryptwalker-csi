@@ -215,6 +215,10 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	// Choose storage backend
 	if ns.isS3Backend(req.GetVolumeContext()) {
 		// S3 backend - no LUKS, files encrypted individually
+		// Guard the entire staging flow from stale mount detection
+		ns.s3SyncMgr.markVolumeSetupInProgress(req.GetVolumeId())
+		defer ns.s3SyncMgr.markVolumeSetupComplete(req.GetVolumeId())
+
 		if err := ns.setupS3Volume(stageParams, req.GetVolumeContext(), req.GetSecrets()); err != nil {
 			return nil, status.Errorf(codes.Internal, "Failed to setup S3 volume: %v", err)
 		}
@@ -274,6 +278,15 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	stagingTargetPath := req.GetStagingTargetPath()
 	targetPath := req.GetTargetPath()
 	fsGroup := ns.extractFsGroup(req.GetVolumeContext(), req.GetVolumeCapability())
+
+	// For S3 volumes, mark setup-in-progress for the entire publish flow
+	// (staging restore + bind mount) to prevent the stale mount detector
+	// from interfering between mount completion and bind mount.
+	isS3 := ns.isS3Backend(req.GetVolumeContext())
+	if isS3 {
+		ns.s3SyncMgr.markVolumeSetupInProgress(volumeID)
+		defer ns.s3SyncMgr.markVolumeSetupComplete(volumeID)
+	}
 
 	// Ensure volume is staged, restore if needed after reboot
 	if err := ns.ensureVolumeStaged(ctx, req); err != nil {
