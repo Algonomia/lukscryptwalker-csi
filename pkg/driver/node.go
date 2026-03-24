@@ -293,6 +293,17 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return nil, status.Errorf(codes.Internal, "Failed to ensure volume staged: %v", err)
 	}
 
+	// Apply fsGroup permissions if available from pod lookup but not applied during staging.
+	// With fsGroupPolicy=None, NodeStageVolume does not receive pod info, so fsGroup from
+	// the pod's securityContext is only available here (via podInfoOnMount). For LUKS volumes
+	// we apply chown/chmod on the staging path; for S3 volumes FUSE UID/GID was already set
+	// at mount time (if StorageClass had fsGroup), so we only need this for LUKS.
+	if fsGroup != nil && !isS3 {
+		if err := ns.applyFsGroupPermissions(stagingTargetPath, *fsGroup); err != nil {
+			klog.Warningf("Failed to apply fsGroup %d during publish for volume %s: %v", *fsGroup, volumeID, err)
+		}
+	}
+
 	// Create bind mount
 	if err := ns.bindMount(stagingTargetPath, targetPath, req.GetReadonly(), fsGroup); err != nil {
 		return nil, status.Errorf(codes.Internal, "Failed to bind mount: %v", err)
@@ -613,8 +624,16 @@ func (ns *NodeServer) bindMount(sourcePath, targetPath string, readonly bool, fs
 // =============================================================================
 
 // extractFsGroup extracts the fsGroup from volume context or volume capability.
-// Priority: 1) manual StorageClass parameter, 2) VolumeMountGroup from CSI request
-// (populated by kubelet when fsGroupPolicy is File), 3) nil.
+// Priority: 1) manual StorageClass parameter, 2) VolumeMountGroup from CSI request,
+// 3) pod's securityContext.fsGroup via Kubernetes API lookup, 4) nil.
+//
+// fsGroupPolicy is set to None so kubelet does not recursively chown the mount
+// (which causes "software caused connection abort" on S3 FUSE mounts with many
+// files). The driver applies fsGroup itself: via FUSE UID/GID for S3 volumes,
+// and via applyFsGroupPermissions for LUKS volumes. With fsGroupPolicy=None,
+// kubelet does not send VolumeMountGroup, so we fall back to looking up the
+// pod's securityContext.fsGroup via the Kubernetes API (podInfoOnMount provides
+// pod name and namespace in the volume context).
 func (ns *NodeServer) extractFsGroup(volumeContext map[string]string, volumeCapability *csi.VolumeCapability) *int64 {
 	// Check for manual fsGroup override in StorageClass parameters
 	if fsGroupStr, exists := volumeContext["fsGroup"]; exists {
@@ -624,7 +643,7 @@ func (ns *NodeServer) extractFsGroup(volumeContext map[string]string, volumeCapa
 		}
 	}
 
-	// Fall back to VolumeMountGroup from CSI request (requires fsGroupPolicy: File)
+	// Fall back to VolumeMountGroup from CSI request (only populated with fsGroupPolicy: File)
 	if volumeCapability != nil {
 		if mount := volumeCapability.GetMount(); mount != nil {
 			if mountGroup := mount.GetVolumeMountGroup(); mountGroup != "" {
@@ -636,7 +655,42 @@ func (ns *NodeServer) extractFsGroup(volumeContext map[string]string, volumeCapa
 		}
 	}
 
+	// Fall back to pod's securityContext.fsGroup via Kubernetes API lookup.
+	// With fsGroupPolicy=None, kubelet does not send VolumeMountGroup, so we
+	// look up the pod directly using info from podInfoOnMount.
+	if fsGroup := ns.extractFsGroupFromPod(volumeContext); fsGroup != nil {
+		return fsGroup
+	}
+
 	klog.Infof("No fsGroup found - using default permissions")
+	return nil
+}
+
+// extractFsGroupFromPod looks up the pod's securityContext.fsGroup using the
+// pod name and namespace provided by podInfoOnMount in the volume context.
+func (ns *NodeServer) extractFsGroupFromPod(volumeContext map[string]string) *int64 {
+	if ns.clientset == nil {
+		return nil
+	}
+
+	podName := volumeContext["csi.storage.k8s.io/pod.name"]
+	podNamespace := volumeContext["csi.storage.k8s.io/pod.namespace"]
+	if podName == "" || podNamespace == "" {
+		return nil
+	}
+
+	pod, err := ns.clientset.CoreV1().Pods(podNamespace).Get(context.Background(), podName, metav1.GetOptions{})
+	if err != nil {
+		klog.Warningf("Failed to get pod %s/%s for fsGroup lookup: %v", podNamespace, podName, err)
+		return nil
+	}
+
+	if pod.Spec.SecurityContext != nil && pod.Spec.SecurityContext.FSGroup != nil {
+		fsGroup := *pod.Spec.SecurityContext.FSGroup
+		klog.Infof("Using fsGroup %d from pod %s/%s securityContext", fsGroup, podNamespace, podName)
+		return &fsGroup
+	}
+
 	return nil
 }
 
