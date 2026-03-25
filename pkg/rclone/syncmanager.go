@@ -112,11 +112,6 @@ func (mm *MountManager) Mount() error {
 		}
 	}
 
-	// Detect stale cache from a previous ungraceful shutdown.
-	// After a crash, vfsMeta/ may reference data files in vfs/ that were lost
-	// (incomplete writes). On clean shutdown, cleanupVFSCacheDir() removes both.
-	hadStaleCache := mm.hasStaleVFSCache()
-
 	// Ensure mount point exists
 	if err := os.MkdirAll(mm.mountPoint, 0755); err != nil {
 		return fmt.Errorf("failed to create mount point: %w", err)
@@ -177,15 +172,6 @@ func (mm *MountManager) Mount() error {
 	mm.mounted = true
 	klog.Infof("Successfully mounted encrypted S3 volume %s at %s", mm.volumeID, mm.mountPoint)
 
-	// If stale cache was detected (ungraceful shutdown), refresh the VFS BEFORE
-	// starting the cache monitor and BEFORE returning. This ensures the mount is
-	// fully reconciled with S3 before any pod tries to access files, preventing
-	// "transport endpoint not connected" or empty directory listing errors.
-	if hadStaleCache {
-		klog.Infof("Stale VFS cache detected for volume %s, triggering VFS refresh to reconcile with S3", mm.volumeID)
-		mm.refreshVFS()
-	}
-
 	// Verify the FUSE mount is actually responding before declaring success.
 	// The mount RPC may return before the FUSE daemon is fully initialized,
 	// causing pods to see "transport endpoint not connected" errors.
@@ -193,11 +179,23 @@ func (mm *MountManager) Mount() error {
 		klog.Warningf("Mount readiness check failed for volume %s: %v (mount may still work)", mm.volumeID, err)
 	}
 
-	// Start background cache monitor AFTER VFS refresh and readiness check.
-	// This prevents the monitor from triggering additional refreshVFS() calls
-	// while the mount is still stabilizing.
+	// Start background cache monitor after readiness check.
 	mm.stopCacheMon = make(chan struct{})
 	go mm.cacheMonitor()
+
+	// If stale VFS cache was detected (ungraceful shutdown), run vfs/forget +
+	// vfs/refresh asynchronously to reconcile rclone's in-memory state against
+	// S3. This prevents stale directory listings without blocking
+	// NodePublishVolume (a recursive S3 listing can take minutes and would
+	// cause a DeadlineExceeded RPC error at the kubelet).
+	// Both vfs/ and vfsMeta/ are intentionally preserved so rclone can resume
+	// incomplete uploads. The narrow risk — "didn't Close file" for files that
+	// were mid-write at crash time — is mitigated by the per-file open check
+	// in evictCacheIfNeeded.
+	if mm.hasStaleVFSCache() {
+		klog.Infof("Stale VFS cache detected for volume %s, triggering async VFS refresh", mm.volumeID)
+		go mm.refreshVFS()
+	}
 
 	return nil
 }
@@ -523,11 +521,10 @@ func (mm *MountManager) cacheMonitor() {
 }
 
 // evictCacheIfNeeded checks the cache directory size and removes the oldest
-// files until the total is back under maxBytes. It only removes files when
-// there are no active transfers (all data is synced to S3).
+// files until the total is back under maxBytes. It only removes files that
+// have no open file descriptors and are not actively being transferred.
 func (mm *MountManager) evictCacheIfNeeded(cacheDir string, maxBytes int64) {
-	// Check for active transfers first — never delete files that may not be
-	// uploaded yet
+	// Never delete files that may not be uploaded yet.
 	if mm.hasActiveTransfers() {
 		return
 	}
@@ -570,6 +567,13 @@ func (mm *MountManager) evictCacheIfNeeded(cacheDir string, maxBytes int64) {
 		if totalSize <= maxBytes {
 			break
 		}
+		// Skip files that have open file descriptors — removing them while
+		// rclone holds a handle leaves the VFS item with didClose=false,
+		// causing "internal error: didn't Close file" on the next access.
+		if isCacheFileOpen(f.path) {
+			klog.V(4).Infof("Skipping eviction of open cache file %s", f.path)
+			continue
+		}
 		if err := os.Remove(f.path); err != nil {
 			klog.V(4).Infof("Could not remove cache file %s: %v", f.path, err)
 			continue
@@ -583,6 +587,38 @@ func (mm *MountManager) evictCacheIfNeeded(cacheDir string, maxBytes int64) {
 	// cache so it doesn't serve stale entries pointing to removed files.
 	// On the next read rclone will re-download from S3 as needed.
 	mm.refreshVFS()
+}
+
+// isCacheFileOpen reports whether any process has an open file descriptor
+// pointing at path. It scans /proc/*/fd symlinks, the same technique used by
+// lsof. Returns true on any error so callers err on the side of safety.
+func isCacheFileOpen(path string) bool {
+	// Resolve to canonical path so symlinks don't fool the comparison.
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		real = path
+	}
+
+	fdDirs, err := filepath.Glob("/proc/*/fd")
+	if err != nil {
+		return true
+	}
+	for _, fdDir := range fdDirs {
+		entries, err := os.ReadDir(fdDir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			target, err := os.Readlink(filepath.Join(fdDir, e.Name()))
+			if err != nil {
+				continue
+			}
+			if target == real || target == path {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // hasActiveTransfers returns true if rclone is currently uploading files
