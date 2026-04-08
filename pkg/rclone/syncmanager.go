@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -274,8 +273,11 @@ func (mm *MountManager) Unmount() error {
 		close(mm.stopCacheMon)
 	}
 
-	// CRITICAL: Wait for pending uploads to complete before unmounting
-	// This prevents data loss when there are cached writes not yet uploaded to S3
+	// Wait for pending uploads before unmounting.
+	// CRITICAL: rclone's Shutdown() cancels the VFS context, which propagates to
+	// all in-flight upload goroutines (their contexts are derived from wb.ctx).
+	// Calling mount/unmount while uploads are in progress will abort them mid-stream
+	// and leave partial objects in S3. We must drain the write-back queue first.
 	mm.waitForPendingUploads()
 
 	// Call mount/unmount RPC
@@ -305,66 +307,85 @@ func (mm *MountManager) Unmount() error {
 	return nil
 }
 
-// waitForPendingUploads waits for any pending VFS cache uploads to complete
-// This is critical to prevent data loss on unmount
+// waitForPendingUploads waits for the VFS write-back queue to drain before
+// unmounting. This is required because rclone's Shutdown() cancels the VFS
+// context, which propagates to all in-flight upload goroutines (their contexts
+// are derived from wb.ctx via context.WithCancel). Any upload still running
+// when Shutdown() is called will be aborted mid-stream, leaving a partial
+// object in S3.
+//
+// We query vfs/stats scoped to THIS volume's remote (not core/stats which is
+// global and would block as long as any other volume on the node is busy,
+// causing NodeUnstageVolume to hang past kubelet's RPC timeout).
+//
+// We wait until the queue is fully drained. The pod will remain in Terminating
+// during this time, which is correct: it means "backup data is being durably
+// stored." The StatefulSet controller waits for pod deletion before scheduling
+// a replacement, so there is no rush to return early at the cost of data loss.
+//
+// The hard cap (6 h) exists only to guard against permanent hangs caused by an
+// S3 outage or network partition where uploads would never complete. Log lines
+// are emitted every 30 s so progress is visible in driver logs.
 func (mm *MountManager) waitForPendingUploads() {
 	klog.Infof("Waiting for pending uploads to complete for volume %s", mm.volumeID)
 
-	// First, wait for the write-back duration to ensure cached writes are flushed
-	// The write-back delay means files may not start uploading until this time elapses
-	writeBackWait := 5 // Default 5 seconds
+	// Wait for the write-back delay so that recently closed files have had a
+	// chance to enter the upload queue before we start polling.
+	writeBackWait := 5 // seconds, default
 	if mm.vfsConfig.WriteBack != "" {
 		if ns, err := parseDurationToNs(mm.vfsConfig.WriteBack); err == nil {
-			writeBackWait = int(ns / 1e9) // Convert nanoseconds to seconds
+			writeBackWait = int(ns / 1e9)
 		}
 	}
-	// Add a small buffer to ensure write-back has completed
-	writeBackWait += 2
-	klog.Infof("Waiting %d seconds for write-back to complete for volume %s", writeBackWait, mm.volumeID)
-	sleepCmd := exec.Command("sleep", fmt.Sprintf("%d", writeBackWait))
-	_ = sleepCmd.Run()
+	writeBackWait += 2 // small buffer
+	klog.Infof("Waiting %d seconds for write-back to flush for volume %s", writeBackWait, mm.volumeID)
+	time.Sleep(time.Duration(writeBackWait) * time.Second)
 
-	maxWaitTime := 1800 // 30 minutes max wait
-	pollInterval := 2   // Check every 2 seconds
+	// Poll vfs/stats for this volume only.
+	// diskCache.uploadsInProgress — active S3 transfers (context would be
+	//   cancelled by Shutdown if we unmounted now)
+	// diskCache.uploadsQueued    — items waiting for their write-back delay
+	//   (they haven't started yet, but Shutdown would prevent them ever starting)
+	maxWait := 6 * time.Hour
+	pollInterval := 2 * time.Second
+	logInterval := 30 * time.Second
+	deadline := time.Now().Add(maxWait)
+	lastLog := time.Now()
 
-	for i := 0; i < maxWaitTime/pollInterval; i++ {
-		// Check core/stats for active transfers
-		result, err := RPC("core/stats", map[string]interface{}{})
+	fsName := mm.cryptConfigName + ":"
+	for time.Now().Before(deadline) {
+		result, err := RPC("vfs/stats", map[string]interface{}{"fs": fsName})
 		if err != nil {
-			klog.Warningf("Failed to get transfer stats: %v", err)
+			klog.Warningf("vfs/stats RPC failed for volume %s: %v, proceeding with unmount", mm.volumeID, err)
 			break
 		}
 
-		// Parse the stats to check for active transfers
+		inProgress, queued := int64(0), int64(0)
 		if result != nil && result.Output != nil {
-			transfers := int64(0)
-			if t, ok := result.Output["transferring"]; ok {
-				if tList, ok := t.([]interface{}); ok {
-					transfers = int64(len(tList))
+			if dc, ok := result.Output["diskCache"].(map[string]interface{}); ok {
+				if v, ok := dc["uploadsInProgress"].(float64); ok {
+					inProgress = int64(v)
+				}
+				if v, ok := dc["uploadsQueued"].(float64); ok {
+					queued = int64(v)
 				}
 			}
-
-			// Also check checks (which includes uploads)
-			checks := int64(0)
-			if c, ok := result.Output["checking"]; ok {
-				if cList, ok := c.([]interface{}); ok {
-					checks = int64(len(cList))
-				}
-			}
-
-			if transfers == 0 && checks == 0 {
-				klog.Infof("No pending transfers for volume %s", mm.volumeID)
-				break
-			}
-
-			klog.Infof("Waiting for %d transfers and %d checks to complete for volume %s", transfers, checks, mm.volumeID)
 		}
 
-		// Wait before checking again
-		sleepCmd := exec.Command("sleep", fmt.Sprintf("%d", pollInterval))
-		_ = sleepCmd.Run()
+		if inProgress == 0 && queued == 0 {
+			klog.Infof("No pending uploads for volume %s, proceeding with unmount", mm.volumeID)
+			break
+		}
+		if time.Since(lastLog) >= logInterval {
+			klog.Infof("Volume %s: waiting for %d uploads in progress, %d queued", mm.volumeID, inProgress, queued)
+			lastLog = time.Now()
+		}
+		time.Sleep(pollInterval)
 	}
 
+	if time.Now().After(deadline) {
+		klog.Warningf("Volume %s: upload drain timed out after %s, proceeding with unmount — uploads may be incomplete", mm.volumeID, maxWait)
+	}
 	klog.Infof("Finished waiting for pending uploads for volume %s", mm.volumeID)
 }
 
@@ -451,8 +472,8 @@ func (mm *MountManager) waitForMountReady() error {
 }
 
 // cleanupVFSCacheDir removes the on-disk VFS cache directories after unmount.
-// This is safe because it is only called from Unmount() AFTER waitForPendingUploads()
-// has confirmed all cached writes are synced to S3. On a hard restart/crash,
+// This is safe because it is only called from Unmount() after rclone's own graceful
+// unmount has flushed the write-back queue to S3. On a hard restart/crash,
 // Unmount() never runs so the cache survives for rclone to resume on remount.
 // Without this cleanup, cache data accumulates indefinitely because rclone's
 // CacheMaxSize eviction only runs while the VFS is active.

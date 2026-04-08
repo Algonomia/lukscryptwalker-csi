@@ -15,6 +15,7 @@ import (
 	"github.com/lukscryptwalker-csi/pkg/secrets"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog"
 )
 
@@ -450,6 +451,21 @@ func (ns *NodeServer) deletePodByUID(podUID string) {
 
 	for _, pod := range pods.Items {
 		if string(pod.UID) == podUID {
+			// Skip pods that are already in a terminal phase — they completed normally
+			// and should not be force-deleted (this would confuse StatefulSet/Job controllers
+			// and could prevent the backup pod from ever being rescheduled).
+			if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+				klog.Infof("Pod %s/%s (UID: %s) is in terminal phase %s, skipping delete",
+					pod.Namespace, pod.Name, podUID, pod.Status.Phase)
+				return
+			}
+			// Skip pods already being deleted (DeletionTimestamp set) — kubelet is
+			// handling teardown; no need to race with it.
+			if pod.DeletionTimestamp != nil {
+				klog.Infof("Pod %s/%s (UID: %s) is already being deleted, skipping",
+					pod.Namespace, pod.Name, podUID)
+				return
+			}
 			klog.Infof("Deleting pod %s/%s (UID: %s) to recover from stale S3 mount", pod.Namespace, pod.Name, podUID)
 			err := ns.clientset.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
 			if err != nil {
