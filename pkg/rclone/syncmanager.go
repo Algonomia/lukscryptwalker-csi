@@ -371,6 +371,32 @@ func (mm *MountManager) waitForPendingUploads() bool {
 	return false
 }
 
+// IsUploadQueueEmpty does a single non-blocking poll of vfs/stats.
+// Returns true if there are no uploads in progress or queued.
+// Use waitForPendingUploads to block until the queue drains.
+func (mm *MountManager) IsUploadQueueEmpty() bool {
+	if !mm.isMountPoint() {
+		return true
+	}
+	result, err := RPC("vfs/stats", map[string]interface{}{"fs": mm.cryptConfigName + ":"})
+	if err != nil {
+		return false // assume work pending on RPC error
+	}
+	if result != nil && result.Output != nil {
+		if dc, ok := result.Output["diskCache"].(map[string]interface{}); ok {
+			inProgress, queued := int64(0), int64(0)
+			if v, ok := dc["uploadsInProgress"].(float64); ok {
+				inProgress = int64(v)
+			}
+			if v, ok := dc["uploadsQueued"].(float64); ok {
+				queued = int64(v)
+			}
+			return inProgress == 0 && queued == 0
+		}
+	}
+	return false
+}
+
 func (mm *MountManager) isMountPoint() bool {
 	data, err := os.ReadFile("/proc/mounts")
 	if err != nil {

@@ -139,8 +139,7 @@ func (ns *NodeServer) cleanupOrphanedVolumes() {
 		// PV not found and backing file exists - this is an orphaned volume from our driver
 		klog.Infof("Found orphaned volume directory (PV deleted): %s", volumeDir)
 
-		// Clean up S3 sync if present (safe to call even if not S3 volume)
-		if err := ns.cleanupS3Sync(volumeID); err != nil {
+		if _, err := ns.cleanupS3Sync(volumeID); err != nil {
 			klog.Warningf("Failed to cleanup S3 sync for orphaned volume %s: %v", volumeID, err)
 		}
 
@@ -250,13 +249,19 @@ func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 	volumeID := req.GetVolumeId()
 	stagingTargetPath := req.GetStagingTargetPath()
 
-	// Cleanup S3 sync first if configured
-	if err := ns.cleanupS3Sync(volumeID); err != nil {
+	draining, err := ns.cleanupS3Sync(volumeID)
+	if err != nil {
 		klog.Errorf("Failed to cleanup S3 sync for volume %s: %v", volumeID, err)
-		// Don't fail the unstage operation
+	}
+	if draining {
+		// A background drain is running; the FUSE mount must stay live.
+		// Return success now — kubelet will delete the pod, the StatefulSet
+		// can schedule a replacement, and the drain goroutine will unmount
+		// once uploads complete.
+		klog.Infof("Volume %s: background drain active, skipping staging cleanup", volumeID)
+		return &csi.NodeUnstageVolumeResponse{}, nil
 	}
 
-	// Perform cleanup operations
 	if err := ns.cleanupVolumeStaging(volumeID, stagingTargetPath); err != nil {
 		return nil, status.Errorf(codes.Internal, "Failed to cleanup volume staging: %v", err)
 	}

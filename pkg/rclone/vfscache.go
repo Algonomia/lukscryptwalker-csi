@@ -319,6 +319,49 @@ func GetVFSCacheSize() int64 {
 	return vfsCacheSize
 }
 
+const drainPendingDir = VFSCacheBasePath + "/.drain-pending"
+
+// SaveDrainPending writes a marker file indicating that volumeID has an
+// in-progress drain. The marker survives process restarts because it lives
+// inside the LUKS-backed VFS cache filesystem.
+func SaveDrainPending(volumeID string) {
+	if err := os.MkdirAll(drainPendingDir, 0700); err != nil {
+		klog.Warningf("Volume %s: failed to create drain-pending dir: %v", volumeID, err)
+		return
+	}
+	path := filepath.Join(drainPendingDir, volumeID)
+	if err := os.WriteFile(path, []byte{}, 0600); err != nil {
+		klog.Warningf("Volume %s: failed to write drain-pending marker: %v", volumeID, err)
+	}
+}
+
+// ClearDrainPending removes the drain-pending marker for volumeID.
+func ClearDrainPending(volumeID string) {
+	path := filepath.Join(drainPendingDir, volumeID)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		klog.Warningf("Volume %s: failed to remove drain-pending marker: %v", volumeID, err)
+	}
+}
+
+// ListDrainPending returns the volumeIDs that have a persistent drain-pending
+// marker, indicating an incomplete drain from a previous driver instance.
+func ListDrainPending() []string {
+	entries, err := os.ReadDir(drainPendingDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			klog.Warningf("Failed to read drain-pending dir: %v", err)
+		}
+		return nil
+	}
+	result := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			result = append(result, e.Name())
+		}
+	}
+	return result
+}
+
 // LoadVFSNameMap reads the persisted volumeID→vfsName mapping from disk.
 // Returns an empty map if the file does not exist or cannot be read.
 func LoadVFSNameMap() map[string]string {

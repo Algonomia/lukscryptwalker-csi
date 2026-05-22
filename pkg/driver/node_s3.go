@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 	"sync"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -33,17 +34,84 @@ const (
 
 // S3SyncManager holds mount managers for active S3 volumes
 type S3SyncManager struct {
-	mountManagers  map[string]*rclone.MountManager // volumeID -> mount manager
-	volumesInSetup map[string]bool                 // volumes currently being set up (to prevent stale detection race)
-	mutex          sync.RWMutex
-	setupMutex     sync.RWMutex // protects volumesInSetup
+	mountManagers    map[string]*rclone.MountManager
+	volumesInSetup   map[string]bool
+	mutex            sync.RWMutex
+	setupMutex       sync.RWMutex
+	backgroundDrains map[string]chan struct{} // volumeID → closed when drain completes
+	pendingDrains    map[string]bool          // volumeIDs with drain pending from a previous driver instance
+	drainMu          sync.Mutex
 }
 
 // NewS3SyncManager creates a new S3 sync manager
 func NewS3SyncManager() *S3SyncManager {
-	return &S3SyncManager{
-		mountManagers:  make(map[string]*rclone.MountManager),
-		volumesInSetup: make(map[string]bool),
+	sm := &S3SyncManager{
+		mountManagers:    make(map[string]*rclone.MountManager),
+		volumesInSetup:   make(map[string]bool),
+		backgroundDrains: make(map[string]chan struct{}),
+		pendingDrains:    make(map[string]bool),
+	}
+	sm.loadPendingDrains()
+	return sm
+}
+
+// loadPendingDrains reads drain-pending markers written by a previous driver
+// instance and populates the in-memory pendingDrains map. Called once at startup.
+func (sm *S3SyncManager) loadPendingDrains() {
+	volumeIDs := rclone.ListDrainPending()
+	if len(volumeIDs) == 0 {
+		return
+	}
+	sm.drainMu.Lock()
+	defer sm.drainMu.Unlock()
+	for _, id := range volumeIDs {
+		sm.pendingDrains[id] = true
+		klog.Infof("Volume %s: found persistent drain-pending marker — VFS cache has unuploaded data from previous session", id)
+	}
+}
+
+func (sm *S3SyncManager) startBackgroundDrain(volumeID string) {
+	sm.drainMu.Lock()
+	defer sm.drainMu.Unlock()
+	sm.backgroundDrains[volumeID] = make(chan struct{})
+	rclone.SaveDrainPending(volumeID)
+}
+
+func (sm *S3SyncManager) isBackgroundDraining(volumeID string) bool {
+	sm.drainMu.Lock()
+	defer sm.drainMu.Unlock()
+	_, ok := sm.backgroundDrains[volumeID]
+	return ok
+}
+
+func (sm *S3SyncManager) hasPendingDrain(volumeID string) bool {
+	sm.drainMu.Lock()
+	defer sm.drainMu.Unlock()
+	return sm.pendingDrains[volumeID]
+}
+
+func (sm *S3SyncManager) finishBackgroundDrain(volumeID string) {
+	sm.drainMu.Lock()
+	defer sm.drainMu.Unlock()
+	if done, ok := sm.backgroundDrains[volumeID]; ok {
+		close(done)
+		delete(sm.backgroundDrains, volumeID)
+	}
+	delete(sm.pendingDrains, volumeID)
+	rclone.ClearDrainPending(volumeID)
+}
+
+func (sm *S3SyncManager) waitForBackgroundDrain(volumeID string, timeout time.Duration) {
+	sm.drainMu.Lock()
+	done, ok := sm.backgroundDrains[volumeID]
+	sm.drainMu.Unlock()
+	if !ok {
+		return
+	}
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		klog.Warningf("Volume %s: timed out waiting for background drain", volumeID)
 	}
 }
 
@@ -139,6 +207,25 @@ func (ns *NodeServer) setupS3Sync(volumeID, stagingPath string, volumeContext ma
 	// S3 path prefix is now a StorageClass parameter
 	s3PathPrefix := volumeContext[S3PathPrefixParam]
 
+	// If a background drain is still running (previous pod terminated with
+	// uploads in progress), wait for it to finish before remounting.
+	if ns.s3SyncMgr.isBackgroundDraining(volumeID) {
+		klog.Infof("Volume %s: waiting for background drain before remounting", volumeID)
+		ns.s3SyncMgr.waitForBackgroundDrain(volumeID, 30*time.Minute)
+	}
+
+	// Post-restart: a drain was in progress when the driver was killed. The
+	// VFS cache has unuploaded data; Mount() will detect it via hasStaleVFSCache
+	// and schedule a background refreshVFS. Clear the in-memory and disk markers
+	// now since the stale-cache path takes ownership from here.
+	if ns.s3SyncMgr.hasPendingDrain(volumeID) {
+		klog.Infof("Volume %s: post-restart pending drain detected, Mount() will upload stale VFS cache data", volumeID)
+		ns.s3SyncMgr.drainMu.Lock()
+		delete(ns.s3SyncMgr.pendingDrains, volumeID)
+		ns.s3SyncMgr.drainMu.Unlock()
+		rclone.ClearDrainPending(volumeID)
+	}
+
 	// Create rclone mount manager
 	mountMgr, err := rclone.NewMountManager(s3Config, volumeID, stagingPath, vfsConfig, s3PathPrefix, passphrase, fsGroup)
 	if err != nil {
@@ -207,26 +294,56 @@ func (ns *NodeServer) getS3ConfigFromSecrets(volSecrets *secrets.VolumeSecrets) 
 	return config
 }
 
-// cleanupS3Sync unmounts S3 volume for cleanup
-func (ns *NodeServer) cleanupS3Sync(volumeID string) error {
+// cleanupS3Sync unmounts an S3 volume. Returns (true, nil) when a background
+// drain was started — the caller must skip staging cleanup so the FUSE mount
+// stays live for the drain goroutine to finish uploading.
+func (ns *NodeServer) cleanupS3Sync(volumeID string) (bool, error) {
 	klog.Infof("Cleaning up S3 mount for volume %s", volumeID)
 
-	ns.s3SyncMgr.mutex.Lock()
-	defer ns.s3SyncMgr.mutex.Unlock()
-
-	// Unmount the S3 volume
-	if mountMgr, exists := ns.s3SyncMgr.mountManagers[volumeID]; exists {
-
-		// Unmount the volume (this also tears down the encrypted cache mount)
-		if err := mountMgr.Unmount(); err != nil {
-			klog.Errorf("Failed to unmount S3 volume %s: %v", volumeID, err)
-			return err
-		}
-		delete(ns.s3SyncMgr.mountManagers, volumeID)
+	// Kubelet retried NodeUnstageVolume while a previous drain is still running.
+	if ns.s3SyncMgr.isBackgroundDraining(volumeID) {
+		klog.Infof("Volume %s: background drain still in progress", volumeID)
+		return true, nil
 	}
 
-	klog.Infof("S3 mount cleanup completed for volume %s", volumeID)
-	return nil
+	ns.s3SyncMgr.mutex.Lock()
+	mountMgr, exists := ns.s3SyncMgr.mountManagers[volumeID]
+	if !exists {
+		ns.s3SyncMgr.mutex.Unlock()
+		return false, nil
+	}
+
+	// Fast path: nothing pending, unmount synchronously.
+	if mountMgr.IsUploadQueueEmpty() {
+		defer ns.s3SyncMgr.mutex.Unlock()
+		if err := mountMgr.Unmount(); err != nil {
+			return false, err
+		}
+		delete(ns.s3SyncMgr.mountManagers, volumeID)
+		return false, nil
+	}
+	ns.s3SyncMgr.mutex.Unlock()
+
+	// Uploads in progress: drain in the background so NodeUnstageVolume returns
+	// immediately, letting kubelet delete the pod and the StatefulSet schedule
+	// a replacement without waiting for S3 transfers to complete.
+	ns.s3SyncMgr.startBackgroundDrain(volumeID)
+	go func() {
+		defer ns.s3SyncMgr.finishBackgroundDrain(volumeID)
+		klog.Infof("Volume %s: background drain started", volumeID)
+		ns.s3SyncMgr.mutex.Lock()
+		mm := ns.s3SyncMgr.mountManagers[volumeID]
+		ns.s3SyncMgr.mutex.Unlock()
+		if mm != nil {
+			mm.Unmount()
+			ns.s3SyncMgr.mutex.Lock()
+			delete(ns.s3SyncMgr.mountManagers, volumeID)
+			ns.s3SyncMgr.mutex.Unlock()
+		}
+		klog.Infof("Volume %s: background drain complete", volumeID)
+	}()
+
+	return true, nil
 }
 
 // restoreS3VolumeStaging restores an S3 volume's staging mount after node reboot
@@ -326,9 +443,14 @@ func (ns *NodeServer) cleanupStaleS3Mounts() {
 			continue
 		}
 
-		// Skip if this volume is currently being set up (prevents race condition)
 		if ns.s3SyncMgr.isVolumeSetupInProgress(volumeID) {
 			klog.V(4).Infof("Volume %s is currently being set up, skipping stale detection", volumeID)
+			continue
+		}
+		// Skip volumes whose drain goroutine is still live or whose drain persisted
+		// across a driver restart — the VFS cache contains unuploaded data.
+		if ns.s3SyncMgr.isBackgroundDraining(volumeID) || ns.s3SyncMgr.hasPendingDrain(volumeID) {
+			klog.V(4).Infof("Volume %s has an active or post-restart pending drain, skipping stale detection", volumeID)
 			continue
 		}
 
