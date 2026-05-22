@@ -335,7 +335,9 @@ func (ns *NodeServer) cleanupS3Sync(volumeID string) (bool, error) {
 		mm := ns.s3SyncMgr.mountManagers[volumeID]
 		ns.s3SyncMgr.mutex.Unlock()
 		if mm != nil {
-			mm.Unmount()
+			if err := mm.Unmount(); err != nil {
+				klog.Errorf("Volume %s: background drain unmount failed: %v", volumeID, err)
+			}
 			ns.s3SyncMgr.mutex.Lock()
 			delete(ns.s3SyncMgr.mountManagers, volumeID)
 			ns.s3SyncMgr.mutex.Unlock()
