@@ -178,21 +178,13 @@ func (mm *MountManager) Mount() error {
 		klog.Warningf("Mount readiness check failed for volume %s: %v (mount may still work)", mm.volumeID, err)
 	}
 
-	// Start background cache monitor after readiness check.
 	mm.stopCacheMon = make(chan struct{})
 	go mm.cacheMonitor()
 
-	// If stale VFS cache was detected (ungraceful shutdown), run vfs/forget +
-	// vfs/refresh asynchronously to reconcile rclone's in-memory state against
-	// S3. This prevents stale directory listings without blocking
-	// NodePublishVolume (a recursive S3 listing can take minutes and would
-	// cause a DeadlineExceeded RPC error at the kubelet).
-	// Both vfs/ and vfsMeta/ are intentionally preserved so rclone can resume
-	// incomplete uploads. The narrow risk — "didn't Close file" for files that
-	// were mid-write at crash time — is mitigated by the per-file open check
-	// in evictCacheIfNeeded.
+	// Stale cache from unclean shutdown: async refresh reconciles rclone's
+	// in-memory state with S3 while dirty files remain available for re-upload.
 	if mm.hasStaleVFSCache() {
-		klog.Infof("Stale VFS cache detected for volume %s, triggering async VFS refresh", mm.volumeID)
+		klog.Infof("Volume %s: stale VFS cache detected, triggering async VFS refresh", mm.volumeID)
 		go mm.refreshVFS()
 	}
 
@@ -268,38 +260,37 @@ func (mm *MountManager) Unmount() error {
 
 	klog.Infof("Unmounting encrypted S3 volume %s from %s", mm.volumeID, mm.mountPoint)
 
-	// Stop the background cache monitor
 	if mm.stopCacheMon != nil {
 		close(mm.stopCacheMon)
 	}
 
-	// Wait for pending uploads before unmounting.
-	// CRITICAL: rclone's Shutdown() cancels the VFS context, which propagates to
-	// all in-flight upload goroutines (their contexts are derived from wb.ctx).
-	// Calling mount/unmount while uploads are in progress will abort them mid-stream
-	// and leave partial objects in S3. We must drain the write-back queue first.
-	mm.waitForPendingUploads()
+	// Drain before unmounting: mount/unmount cancels rclone's VFS context, which
+	// aborts all in-flight uploads mid-stream and leaves partial objects in S3.
+	// false → drain unconfirmed; keep VFS cache so rclone can retry on next mount.
+	drained := mm.waitForPendingUploads()
 
-	// Call mount/unmount RPC
-	params := map[string]interface{}{
-		"mountPoint": mm.mountPoint,
-	}
-
+	params := map[string]interface{}{"mountPoint": mm.mountPoint}
 	_, err := RPC("mount/unmount", params)
 	if err != nil {
-		klog.Warningf("mount/unmount RPC failed: %v", err)
-		// Try unmountall as fallback
-		_, err = RPC("mount/unmountall", map[string]interface{}{})
-		if err != nil {
-			klog.Warningf("Failed to unmount rclone: %v", err)
+		if strings.Contains(err.Error(), "mount not found") {
+			// rclone self-unmounted (e.g. VFS error); already gone, not a failure.
+			klog.Infof("Volume %s: mount already gone when calling mount/unmount — rclone self-unmounted", mm.volumeID)
+		} else {
+			klog.Warningf("mount/unmount RPC failed: %v", err)
+			_, err = RPC("mount/unmountall", map[string]interface{}{})
+			if err != nil {
+				klog.Warningf("Failed to unmount rclone: %v", err)
+			}
 		}
 	}
 
-	// Clean up named rclone configs
 	DeleteNamedConfigs(mm.cryptConfigName, mm.s3ConfigName)
 
-	// Clean up the on-disk VFS cache directory after unmount
-	mm.cleanupVFSCacheDir()
+	if drained {
+		mm.cleanupVFSCacheDir()
+	} else {
+		klog.Infof("Volume %s: preserving VFS cache for retry on next mount", mm.volumeID)
+	}
 
 	mm.mounted = false
 
@@ -307,58 +298,51 @@ func (mm *MountManager) Unmount() error {
 	return nil
 }
 
-// waitForPendingUploads waits for the VFS write-back queue to drain before
-// unmounting. This is required because rclone's Shutdown() cancels the VFS
-// context, which propagates to all in-flight upload goroutines (their contexts
-// are derived from wb.ctx via context.WithCancel). Any upload still running
-// when Shutdown() is called will be aborted mid-stream, leaving a partial
-// object in S3.
-//
-// We query vfs/stats scoped to THIS volume's remote (not core/stats which is
-// global and would block as long as any other volume on the node is busy,
-// causing NodeUnstageVolume to hang past kubelet's RPC timeout).
-//
-// We wait until the queue is fully drained. The pod will remain in Terminating
-// during this time, which is correct: it means "backup data is being durably
-// stored." The StatefulSet controller waits for pod deletion before scheduling
-// a replacement, so there is no rush to return early at the cost of data loss.
-//
-// The hard cap (6 h) exists only to guard against permanent hangs caused by an
-// S3 outage or network partition where uploads would never complete. Log lines
-// are emitted every 30 s so progress is visible in driver logs.
-func (mm *MountManager) waitForPendingUploads() {
+// waitForPendingUploads polls vfs/stats until the write-back queue is empty.
+// Returns true only when the queue is confirmed empty; false otherwise (the
+// caller must preserve the local VFS cache for retry on next mount).
+// RPC failures are retried indefinitely while the FUSE mount is alive — a
+// lost RC connection is not evidence the queue is empty.
+func (mm *MountManager) waitForPendingUploads() bool {
 	klog.Infof("Waiting for pending uploads to complete for volume %s", mm.volumeID)
 
-	// Wait for the write-back delay so that recently closed files have had a
-	// chance to enter the upload queue before we start polling.
-	writeBackWait := 5 // seconds, default
+	writeBackWait := 5
 	if mm.vfsConfig.WriteBack != "" {
 		if ns, err := parseDurationToNs(mm.vfsConfig.WriteBack); err == nil {
 			writeBackWait = int(ns / 1e9)
 		}
 	}
-	writeBackWait += 2 // small buffer
+	writeBackWait += 2
 	klog.Infof("Waiting %d seconds for write-back to flush for volume %s", writeBackWait, mm.volumeID)
 	time.Sleep(time.Duration(writeBackWait) * time.Second)
 
-	// Poll vfs/stats for this volume only.
-	// diskCache.uploadsInProgress — active S3 transfers (context would be
-	//   cancelled by Shutdown if we unmounted now)
-	// diskCache.uploadsQueued    — items waiting for their write-back delay
-	//   (they haven't started yet, but Shutdown would prevent them ever starting)
 	maxWait := 6 * time.Hour
 	pollInterval := 2 * time.Second
 	logInterval := 30 * time.Second
 	deadline := time.Now().Add(maxWait)
 	lastLog := time.Now()
+	consecutiveRPCFailures := 0
 
 	fsName := mm.cryptConfigName + ":"
 	for time.Now().Before(deadline) {
+		// Self-unmount: rclone tore down the FUSE and cancelled all in-flight uploads.
+		if !mm.isMountPoint() {
+			klog.Errorf("Volume %s: rclone FUSE mount disappeared while waiting for uploads to drain — "+
+				"in-flight uploads were cancelled; local VFS cache will be preserved for retry on next mount", mm.volumeID)
+			return false
+		}
+
 		result, err := RPC("vfs/stats", map[string]interface{}{"fs": fsName})
 		if err != nil {
-			klog.Warningf("vfs/stats RPC failed for volume %s: %v, proceeding with unmount", mm.volumeID, err)
-			break
+			consecutiveRPCFailures++
+			if consecutiveRPCFailures == 1 || consecutiveRPCFailures%5 == 0 {
+				klog.Warningf("Volume %s: vfs/stats RPC failing (consecutive failures: %d): %v — "+
+					"retrying to protect locally cached data", mm.volumeID, consecutiveRPCFailures, err)
+			}
+			time.Sleep(pollInterval)
+			continue
 		}
+		consecutiveRPCFailures = 0
 
 		inProgress, queued := int64(0), int64(0)
 		if result != nil && result.Output != nil {
@@ -373,8 +357,8 @@ func (mm *MountManager) waitForPendingUploads() {
 		}
 
 		if inProgress == 0 && queued == 0 {
-			klog.Infof("No pending uploads for volume %s, proceeding with unmount", mm.volumeID)
-			break
+			klog.Infof("Volume %s: upload queue empty, proceeding with unmount", mm.volumeID)
+			return true
 		}
 		if time.Since(lastLog) >= logInterval {
 			klog.Infof("Volume %s: waiting for %d uploads in progress, %d queued", mm.volumeID, inProgress, queued)
@@ -383,22 +367,17 @@ func (mm *MountManager) waitForPendingUploads() {
 		time.Sleep(pollInterval)
 	}
 
-	if time.Now().After(deadline) {
-		klog.Warningf("Volume %s: upload drain timed out after %s, proceeding with unmount — uploads may be incomplete", mm.volumeID, maxWait)
-	}
-	klog.Infof("Finished waiting for pending uploads for volume %s", mm.volumeID)
+	klog.Warningf("Volume %s: upload drain timed out after %s — local VFS cache will be preserved for retry on next mount", mm.volumeID, maxWait)
+	return false
 }
 
-// isMountPoint checks if the path is a mount point
 func (mm *MountManager) isMountPoint() bool {
-	// Check /proc/mounts for FUSE mounts
 	data, err := os.ReadFile("/proc/mounts")
 	if err != nil {
 		klog.Infof("Failed to read /proc/mounts: %v", err)
 		return false
 	}
 
-	// Look for rclone or fuse mount at our path
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) >= 2 && fields[1] == mm.mountPoint {
@@ -410,8 +389,6 @@ func (mm *MountManager) isMountPoint() bool {
 	return false
 }
 
-// hasStaleVFSCache checks if VFS cache directories exist from a previous mount
-// session that wasn't cleanly unmounted (e.g. after a crash or OOM kill).
 func (mm *MountManager) hasStaleVFSCache() bool {
 	if mm.vfsName == "" {
 		return false
