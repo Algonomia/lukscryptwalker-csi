@@ -1,6 +1,6 @@
 image:
   repository: ghcr.io/algonomia/lukscryptwalker-csi
-  tag: "v1.2.21"
+  tag: "v1.3.0"
   pullPolicy: IfNotPresent
 
 # Image pull secrets
@@ -51,7 +51,7 @@ node:
     nodeDriverRegistrar:
       image:
         repository: registry.k8s.io/sig-storage/csi-node-driver-registrar
-        tag: v2.9.2
+        tag: v2.13.0
         pullPolicy: IfNotPresent
 
   resources:

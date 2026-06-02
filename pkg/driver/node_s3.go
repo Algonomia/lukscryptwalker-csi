@@ -3,11 +3,13 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 	"sync"
 
@@ -415,20 +417,25 @@ func (ns *NodeServer) cleanupStaleS3Mounts() {
 		volumeDir := filepath.Join(csiPluginPath, entry.Name())
 		globalmountPath := filepath.Join(volumeDir, "globalmount")
 
-		// Check if globalmount exists - use Lstat to not follow symlinks
-		_, statErr := os.Lstat(globalmountPath)
-		if os.IsNotExist(statErr) {
+		// Probe the mount with statfs rather than stat/lstat. statfs is answered
+		// locally by the FUSE/VFS layer and does NOT trigger an S3 ListObjects on a
+		// healthy mount, so this periodic check does not hit the backend every tick
+		// nor produce "Dir.Stat: ListObjects, context canceled" log spam (a blocking
+		// stat() on the mount root gets interrupted by Go's async preemption). A dead
+		// FUSE daemon still surfaces here as ENOTCONN/ESTALE.
+		var st syscall.Statfs_t
+		statErr := syscall.Statfs(globalmountPath, &st)
+		if errors.Is(statErr, syscall.ENOENT) {
+			// globalmount directory does not exist yet - nothing to clean up
 			continue
 		}
 
 		// Check if it's a stale FUSE mount (transport endpoint not connected)
-		_, err := os.Stat(globalmountPath)
-		isStaleFUSE := err != nil && (strings.Contains(err.Error(), "transport endpoint is not connected") ||
-			strings.Contains(err.Error(), "stale file handle"))
+		isStaleFUSE := errors.Is(statErr, syscall.ENOTCONN) || errors.Is(statErr, syscall.ESTALE)
 
 		// Check if mount is missing (directory exists but no FUSE mount)
 		// This happens when the stale mount was already cleaned up but pods still need it
-		isMissingMount := err == nil && !ns.isFUSEMountPoint(globalmountPath)
+		isMissingMount := statErr == nil && !ns.isFUSEMountPoint(globalmountPath)
 
 		if !isStaleFUSE && !isMissingMount {
 			// Mount is healthy, skip
@@ -470,25 +477,194 @@ func (ns *NodeServer) cleanupStaleS3Mounts() {
 
 		if isStaleFUSE {
 			klog.Infof("Detected stale FUSE mount for S3 volume %s at %s", volumeID, globalmountPath)
-			// Unmount the stale FUSE mount
-			umountCmd := exec.Command("umount", "-l", globalmountPath)
-			if err := umountCmd.Run(); err != nil {
-				klog.Warningf("umount -l failed for stale FUSE mount %s: %v", globalmountPath, err)
-			}
 		} else {
 			klog.Infof("Detected missing FUSE mount for S3 volume %s at %s", volumeID, globalmountPath)
 		}
 
-		// Remove the globalmount directory so kubelet can recreate it on pod restart
-		if err := os.RemoveAll(globalmountPath); err != nil {
-			klog.Warningf("Failed to remove globalmount directory %s: %v", globalmountPath, err)
-		}
-
-		// Find and restart pods using this volume - they will get fresh mounts via normal CSI flow
-		ns.restartPodsWithStaleS3Mount(volumeID)
+		// Heal in place: re-mount the volume in-process and re-attach consumers
+		// without bouncing pods that can self-heal via mount propagation.
+		ns.reconcileS3Mount(volumeID, globalmountPath, volumeContext)
 	}
 
 	klog.Infof("Stale/missing S3 mount cleanup completed")
+}
+
+// reconcileS3Mount heals a stale/missing S3 mount in place: it re-mounts the
+// volume in-process (resuming from the persistent LUKS VFS cache) and then
+// re-attaches consumers. Consumers whose volumeMount uses HostToContainer or
+// Bidirectional propagation pick up the fresh mount automatically and are left
+// running; consumers without propagation (which cannot see the re-mount) are
+// restarted so kubelet re-publishes them. If the re-mount itself fails, it falls
+// back to the legacy behavior (remove globalmount + restart all consumers).
+func (ns *NodeServer) reconcileS3Mount(volumeID, globalmountPath string, volumeContext map[string]string) {
+	// Guard against the periodic checker racing with our own re-mount.
+	ns.s3SyncMgr.markVolumeSetupInProgress(volumeID)
+	defer ns.s3SyncMgr.markVolumeSetupComplete(volumeID)
+
+	pvcNamespace, pvcName, pvName := ns.resolveVolumeRefs(volumeID)
+	consumers := ns.podsUsingPVC(pvcNamespace, pvcName)
+	fsGroup := fsGroupFromPods(consumers)
+
+	// Detach the dead FUSE mount (if any) so a fresh mount can take the path.
+	_ = exec.Command("umount", "-l", globalmountPath).Run()
+
+	// Drop any stale in-memory manager from a previous driver instance.
+	ns.s3SyncMgr.mutex.Lock()
+	delete(ns.s3SyncMgr.mountManagers, volumeID)
+	ns.s3SyncMgr.mutex.Unlock()
+
+	if err := os.MkdirAll(globalmountPath, 0777); err != nil {
+		klog.Warningf("Volume %s: failed to ensure globalmount dir: %v", volumeID, err)
+	}
+
+	if err := ns.setupS3Sync(volumeID, globalmountPath, volumeContext, nil, fsGroup); err != nil {
+		klog.Errorf("Volume %s: in-place re-mount failed (%v); falling back to remove + restart all consumers", volumeID, err)
+		_ = os.RemoveAll(globalmountPath)
+		ns.restartPodsWithStaleS3Mount(volumeID)
+		return
+	}
+	klog.Infof("Volume %s: re-mounted in-process; re-attaching consumers", volumeID)
+
+	// Hybrid heal: leave a consumer running ONLY if it both declares
+	// HostToContainer/Bidirectional propagation AND its mount path on the host
+	// actually reflects the re-mount (i.e. propagation really re-attached).
+	// Anything else is restarted so kubelet cleanly re-publishes it.
+	for i := range consumers {
+		pod := &consumers[i]
+		if podSelfHealsViaPropagation(pod, pvcName) && ns.consumerMountHealthy(string(pod.UID), pvName) {
+			klog.Infof("Pod %s/%s self-healed via mount propagation for volume %s; left running",
+				pod.Namespace, pod.Name, volumeID)
+			continue
+		}
+		klog.Infof("Pod %s/%s cannot self-heal for volume %s; restarting to recover",
+			pod.Namespace, pod.Name, volumeID)
+		ns.deletePodByUID(string(pod.UID))
+	}
+}
+
+// consumerMountHealthy reports whether the re-mount has propagated to a
+// consumer pod's CSI mount path on the host (statfs not ENOTCONN/ESTALE). It
+// retries briefly to let kernel mount propagation settle. pvName is the PV name
+// (the directory kubelet uses under the pod's kubernetes.io~csi volumes).
+func (ns *NodeServer) consumerMountHealthy(podUID, pvName string) bool {
+	if pvName == "" {
+		return false
+	}
+	mountPath := filepath.Join(resolveKubeletRoot(), "pods", podUID,
+		"volumes", "kubernetes.io~csi", pvName, "mount")
+
+	for attempt := 0; attempt < 6; attempt++ {
+		var st syscall.Statfs_t
+		err := syscall.Statfs(mountPath, &st)
+		if err == nil {
+			return true
+		}
+		if errors.Is(err, syscall.ENOENT) {
+			// No bind mount for this pod yet (not published here) — nothing to heal.
+			return true
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return false
+}
+
+// resolveVolumeRefs returns the namespace and name of the PVC bound to the
+// volume (via the PV's ClaimRef) plus the PV name. Returns empty strings if it
+// can't be resolved.
+func (ns *NodeServer) resolveVolumeRefs(volumeID string) (pvcNamespace, pvcName, pvName string) {
+	if ns.clientset == nil {
+		return "", "", ""
+	}
+	pv, err := getPVByVolumeID(context.Background(), ns.clientset, volumeID)
+	if err != nil || pv.Spec.ClaimRef == nil {
+		klog.V(4).Infof("Volume %s: could not resolve PVC (consumer self-heal detection degraded): %v", volumeID, err)
+		return "", "", ""
+	}
+	return pv.Spec.ClaimRef.Namespace, pv.Spec.ClaimRef.Name, pv.Name
+}
+
+// podsUsingPVC returns the pods on THIS node in the given namespace that mount
+// the given PVC. Returns nil if inputs are empty or the lookup fails.
+func (ns *NodeServer) podsUsingPVC(namespace, pvcName string) []corev1.Pod {
+	if ns.clientset == nil || namespace == "" || pvcName == "" {
+		return nil
+	}
+	pods, err := ns.clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
+		FieldSelector: "spec.nodeName=" + ns.driver.nodeID,
+	})
+	if err != nil {
+		klog.Warningf("Failed to list pods in %s for PVC %s: %v", namespace, pvcName, err)
+		return nil
+	}
+	var out []corev1.Pod
+	for _, p := range pods.Items {
+		for _, v := range p.Spec.Volumes {
+			if v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == pvcName {
+				out = append(out, p)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// fsGroupFromPods returns the first fsGroup found among the given pods'
+// security contexts, so an in-place re-mount preserves file ownership for
+// non-root consumers. Returns nil if none declare one.
+func fsGroupFromPods(pods []corev1.Pod) *int64 {
+	for i := range pods {
+		if sc := pods[i].Spec.SecurityContext; sc != nil && sc.FSGroup != nil {
+			return sc.FSGroup
+		}
+	}
+	return nil
+}
+
+// podSelfHealsViaPropagation reports whether the pod mounts the given PVC with
+// mountPropagation HostToContainer or Bidirectional in any (init)container. Only
+// such mounts let a running container observe an in-place re-mount on the host;
+// without it the container holds a private bind to the dead mount and must be
+// restarted to recover.
+func podSelfHealsViaPropagation(pod *corev1.Pod, pvcName string) bool {
+	if pvcName == "" {
+		return false
+	}
+	// Resolve the pod-local volume name backed by this PVC.
+	volName := ""
+	for _, v := range pod.Spec.Volumes {
+		if v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == pvcName {
+			volName = v.Name
+			break
+		}
+	}
+	if volName == "" {
+		return false
+	}
+
+	hasPropagation := func(mounts []corev1.VolumeMount) bool {
+		for _, m := range mounts {
+			if m.Name != volName || m.MountPropagation == nil {
+				continue
+			}
+			if *m.MountPropagation == corev1.MountPropagationHostToContainer ||
+				*m.MountPropagation == corev1.MountPropagationBidirectional {
+				return true
+			}
+		}
+		return false
+	}
+
+	for i := range pod.Spec.Containers {
+		if hasPropagation(pod.Spec.Containers[i].VolumeMounts) {
+			return true
+		}
+	}
+	for i := range pod.Spec.InitContainers {
+		if hasPropagation(pod.Spec.InitContainers[i].VolumeMounts) {
+			return true
+		}
+	}
+	return false
 }
 
 // restartPodsWithStaleS3Mount finds pods with stale mounts for this volume and restarts them

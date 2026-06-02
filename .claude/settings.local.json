@@ -1,7 +1,23 @@
 {
   "permissions": {
     "allow": [
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(rtk ls *)",
+      "Bash(rtk grep *)",
+      "Bash(rtk git *)",
+      "Bash(rtk find *)",
+      "Bash(rtk helm *)",
+      "Bash(rtk wc *)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(rtk go *)",
+      "Bash(echo \"BUILD_EXIT=$?\")",
+      "Bash(echo \"VET_EXIT=$?\")",
+      "Bash(cd /home/brice/Projects/lukscryptwalker-csi *)",
+      "Bash(go test *)",
+      "Bash(git checkout *)"
+    ],
+    "additionalDirectories": [
+      "/tmp"
     ]
   }
 }
