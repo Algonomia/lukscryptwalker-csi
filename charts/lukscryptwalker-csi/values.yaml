@@ -231,6 +231,12 @@ s3StorageClasses:
       maxSize: "1G"  # Max total size of cache
       pollInterval: "1m"  # How often rclone checks for stale cache entries
       writeBack: "5s"  # Time to wait before uploading modified files
+      # Directory-metadata caching. Raise these for metadata-heavy workloads on
+      # large directories (e.g. pgbackrest WAL archives) so stat/readdir/exists
+      # checks don't trigger an S3 ListObjects + filename decryption every time.
+      # Safe to set high for these RWO/single-writer volumes.
+      # dirCacheTime: "1h"   # default: 1h
+      # attrTimeout: "1h"    # default: 1h
 
   # Example S3 StorageClass with minimal caching (saves local space)
   # - name: lukscryptwalker-s3-minimal

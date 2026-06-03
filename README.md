@@ -139,7 +139,7 @@ kubectl create secret generic s3-credentials \
 # S3-compatible (MinIO/OVH): also add s3-endpoint and, for MinIO, s3-force-path-style=true
 ```
 
-### VFS cache parameters (optional)
+### Tuning parameters (optional)
 
 | Parameter | Description | Default |
 |---|---|---|
@@ -148,8 +148,12 @@ kubectl create secret generic s3-credentials \
 | `rclone-vfs-cache-max-size` | Max total cache size | `2G` |
 | `rclone-vfs-cache-poll-interval` | Stale-entry scan interval | `1m` |
 | `rclone-vfs-write-back` | Delay before uploading changes | `5s` |
+| `rclone-dir-cache-time` | How long directory listings are cached | `1h` |
+| `rclone-attr-timeout` | How long file attributes (stat) are cached | `1h` |
 
 The cache lives in a LUKS-encrypted volume on the node; a background process enforces the size limit and prunes empty directories.
+
+`rclone-dir-cache-time` / `rclone-attr-timeout` control directory **metadata** caching. With filename encryption on, each uncached `stat`/`readdir` costs an S3 `ListObjects` + decrypt, so metadata-heavy workloads on large directories (e.g. pgbackrest WAL archives) can stall. The `1h` default avoids that; these are RWO/single-writer volumes, so a writer always sees its own changes immediately regardless. Lower it per StorageClass if a volume is modified from outside the cluster and needs fresher metadata. The default applies to existing volumes too — they pick it up on the next mount (pod restart), with no re-provisioning.
 
 ### Layout in S3
 
@@ -250,6 +254,7 @@ sudo cryptsetup status && ls -la /dev/mapper/
 | Secret not found | Wrong secret name/namespace in the StorageClass |
 | Mount failures | Check `fsType` support and `/dev` access |
 | S3 pod sees I/O errors after a driver restart | Add `mountPropagation: HostToContainer` (see [Resilience](#resilience-s3-mounts)) |
+| Slow `stat`/`ls` or app timeouts on a large S3 dir (e.g. pgbackrest WAL archive) | Metadata listing cost — raise `rclone-dir-cache-time` (default `1h`) and keep the directory pruned |
 
 ---
 

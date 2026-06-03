@@ -54,6 +54,12 @@ parameters:
   {{- if .vfsCache.writeBack }}
   rclone-vfs-write-back: {{ .vfsCache.writeBack | quote }}
   {{- end }}
+  {{- if .vfsCache.dirCacheTime }}
+  rclone-dir-cache-time: {{ .vfsCache.dirCacheTime | quote }}
+  {{- end }}
+  {{- if .vfsCache.attrTimeout }}
+  rclone-attr-timeout: {{ .vfsCache.attrTimeout | quote }}
+  {{- end }}
   {{- end }}
 
   # File system and permissions

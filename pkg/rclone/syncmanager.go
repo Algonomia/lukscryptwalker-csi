@@ -13,13 +13,15 @@ import (
 	"k8s.io/klog"
 )
 
-// VFSCacheConfig holds VFS cache configuration options
+// VFSCacheConfig holds VFS cache and directory-metadata configuration options
 type VFSCacheConfig struct {
 	CacheMode         string // off, minimal, writes, full
 	CacheMaxAge       string // e.g., "1h", "24h"
 	CacheMaxSize      string // e.g., "10G", "100M"
 	CachePollInterval string // e.g., "1m", "5m" - how often to poll for stale cache entries
 	WriteBack         string // e.g., "5s", "0" for immediate
+	DirCacheTime      string // cache directory listings, e.g. "5m", "1h"
+	AttrTimeout       string // cache file attributes (stat), e.g. "5m", "1h"
 }
 
 // DefaultVFSCacheConfig returns sensible defaults for VFS caching
@@ -30,6 +32,10 @@ func DefaultVFSCacheConfig() *VFSCacheConfig {
 		CacheMaxSize:      "5G", // 5GB to handle large files
 		CachePollInterval: "1m", // Poll every minute for stale cache entries
 		WriteBack:         "3s", // Start uploads quickly to reduce cache pressure
+		// 1h metadata caching avoids an S3 ListObjects+decrypt on every stat/
+		// readdir; safe for these RWO/single-writer volumes. Override per SC.
+		DirCacheTime: "1h",
+		AttrTimeout:  "1h",
 	}
 }
 
@@ -127,12 +133,14 @@ func (mm *MountManager) Mount() error {
 		return fmt.Errorf("failed to create crypt config: %w", err)
 	}
 
-	// Build mount options
+	// Fallback only if a StorageClass passes an invalid duration; matches the 1h
+	// DefaultVFSCacheConfig.
+	const defaultCacheNs = int64(3600000000000) // 1h
 	mountOpt := map[string]interface{}{
 		"AllowOther":    true,
 		"AllowNonEmpty": true,
-		"DirCacheTime":  300000000000, // 5 minutes in nanoseconds
-		"AttrTimeout":   300000000000, // 5 minutes in nanoseconds - caches file attributes (stat) in the kernel FUSE layer
+		"DirCacheTime":  durationOrDefault(mm.vfsConfig.DirCacheTime, defaultCacheNs),
+		"AttrTimeout":   durationOrDefault(mm.vfsConfig.AttrTimeout, defaultCacheNs),
 	}
 
 	// Set UID/GID on the FUSE mount so files appear owned by the pod's fsGroup,
@@ -670,6 +678,19 @@ func (mm *MountManager) hasActiveTransfers() bool {
 // IsMounted returns whether the volume is currently mounted
 func (mm *MountManager) IsMounted() bool {
 	return mm.mounted && mm.isMountPoint()
+}
+
+// durationOrDefault parses a duration string to nanoseconds, falling back to
+// defaultNs when empty or invalid.
+func durationOrDefault(s string, defaultNs int64) int64 {
+	if s == "" {
+		return defaultNs
+	}
+	if ns, err := parseDurationToNs(s); err == nil && ns > 0 {
+		return ns
+	}
+	klog.Warningf("Invalid duration %q, using default", s)
+	return defaultNs
 }
 
 // parseDurationToNs parses a duration string like "1h" or "5s" to nanoseconds
