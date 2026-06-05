@@ -48,6 +48,11 @@ parameters:
   # Manual fsGroup override for this StorageClass
   fsGroup: {{ .fsGroup | quote }}
   {{- end }}
+  {{- if .fsMode }}
+  # Recursive permission mode applied with fsGroup (default 0750).
+  # Use 0750 for PostgreSQL data dirs; 0770 if a non-owner needs group-write.
+  fs-mode: {{ .fsMode | quote }}
+  {{- end }}
 
 reclaimPolicy: {{ .reclaimPolicy | default "Delete" }}
 allowVolumeExpansion: {{ .allowVolumeExpansion | default true }}

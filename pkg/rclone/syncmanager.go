@@ -342,6 +342,15 @@ func (mm *MountManager) waitForPendingUploads() bool {
 
 		result, err := RPC("vfs/stats", map[string]interface{}{"fs": fsName})
 		if err != nil {
+			// "no VFS found" is terminal, not transient: the kernel mount exists
+			// but this librclone instance never created its VFS (orphaned after a
+			// driver restart). Retrying can never succeed, so stop and preserve
+			// the on-disk cache for the next mount to resume.
+			if isNoVFSError(err) {
+				klog.Warningf("Volume %s: mount has no VFS in this driver instance (orphaned after a restart); "+
+					"stopping drain, preserving cache for re-mount", mm.volumeID)
+				return false
+			}
 			consecutiveRPCFailures++
 			if consecutiveRPCFailures == 1 || consecutiveRPCFailures%5 == 0 {
 				klog.Warningf("Volume %s: vfs/stats RPC failing (consecutive failures: %d): %v — "+
@@ -388,7 +397,12 @@ func (mm *MountManager) IsUploadQueueEmpty() bool {
 	}
 	result, err := RPC("vfs/stats", map[string]interface{}{"fs": mm.cryptConfigName + ":"})
 	if err != nil {
-		return false // assume work pending on RPC error
+		// Orphaned mount (no VFS in this instance): nothing to drain here, take
+		// the fast unmount path rather than starting an endless background drain.
+		if isNoVFSError(err) {
+			return true
+		}
+		return false // assume work pending on other RPC errors
 	}
 	if result != nil && result.Output != nil {
 		if dc, ok := result.Output["diskCache"].(map[string]interface{}); ok {
@@ -678,6 +692,13 @@ func (mm *MountManager) hasActiveTransfers() bool {
 // IsMounted returns whether the volume is currently mounted
 func (mm *MountManager) IsMounted() bool {
 	return mm.mounted && mm.isMountPoint()
+}
+
+// isNoVFSError reports whether an rclone RPC error means this librclone instance
+// has no VFS for the mount — a terminal state for an orphaned kernel mount left
+// by a previous driver instance, not a transient RPC failure.
+func isNoVFSError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "no VFS found")
 }
 
 // durationOrDefault parses a duration string to nanoseconds, falling back to

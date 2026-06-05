@@ -97,11 +97,14 @@ storageClasses:
     allowVolumeExpansion: true
     volumeBindingMode: WaitForFirstConsumer
     # fsGroup: null  # Auto-detect from pod (default behavior)
+    # fsMode: "0750"  # Recursive mode applied with fsGroup (default 0750).
+    #                 # 0750 works for PostgreSQL data dirs (0775 is rejected by PG);
+    #                 # set "0770" only if a non-owner container must group-write.
     secret:
       name: luks-secret
       namespace: kube-system
       passphraseKey: "passphrase"
-  
+
   # Example configurations for different database types
   # Uncomment and customize as needed
   

@@ -37,7 +37,7 @@ func (ns *NodeServer) mountAndConfigureVolume(params *StagingParameters) error {
 
 	// Apply fsGroup permissions to the real mounted filesystem before bind mounting
 	if params.fsGroup != nil {
-		if err := ns.applyFsGroupPermissions(params.stagingTargetPath, *params.fsGroup); err != nil {
+		if err := ns.applyFsGroupPermissions(params.stagingTargetPath, *params.fsGroup, params.fsMode); err != nil {
 			return fmt.Errorf("failed to apply fsGroup permissions to staging path: %v", err)
 		}
 	}
@@ -142,7 +142,7 @@ func (ns *NodeServer) restoreLUKSDeviceAndMount(volumeID, backingFile, stagingTa
 	// Apply fsGroup permissions if specified in volume context
 	fsGroup := ns.extractFsGroup(volumeContext, nil)
 	if fsGroup != nil {
-		if err := ns.applyFsGroupPermissions(stagingTargetPath, *fsGroup); err != nil {
+		if err := ns.applyFsGroupPermissions(stagingTargetPath, *fsGroup, extractFsMode(volumeContext)); err != nil {
 			return fmt.Errorf("failed to apply fsGroup permissions during restore: %v", err)
 		}
 	}

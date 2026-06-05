@@ -198,7 +198,7 @@ Consumers without propagation are restarted automatically so kubelet re-publishe
 
 ## Permissions
 
-By default the driver detects `fsGroup` from the requesting pod and sets group ownership with `0775`:
+By default the driver detects `fsGroup` from the requesting pod, chowns the volume to that group, and applies mode `0750`:
 
 ```yaml
 spec:
@@ -206,7 +206,7 @@ spec:
     fsGroup: 26   # e.g. PostgreSQL
 ```
 
-To pin a group regardless of the pod, set `fsGroup` in the StorageClass `parameters` (it takes precedence over pod detection). With no `fsGroup` anywhere, directories are owner-only (`0755`).
+To pin a group regardless of the pod, set `fsGroup` in the StorageClass `parameters` (it takes precedence over pod detection).
 
 ---
 
@@ -255,6 +255,7 @@ sudo cryptsetup status && ls -la /dev/mapper/
 | Mount failures | Check `fsType` support and `/dev` access |
 | S3 pod sees I/O errors after a driver restart | Add `mountPropagation: HostToContainer` (see [Resilience](#resilience-s3-mounts)) |
 | Slow `stat`/`ls` or app timeouts on a large S3 dir (e.g. pgbackrest WAL archive) | Metadata listing cost — raise `rclone-dir-cache-time` (default `1h`) and keep the directory pruned |
+| PostgreSQL `FATAL: data directory ... has invalid permissions` | Volume mode too permissive — uses default `0750` now; ensure the StorageClass isn't overriding `fs-mode` to `0770`/`0775` |
 
 ---
 

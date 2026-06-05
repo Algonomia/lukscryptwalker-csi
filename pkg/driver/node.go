@@ -304,7 +304,7 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	// we apply chown/chmod on the staging path; for S3 volumes FUSE UID/GID was already set
 	// at mount time (if StorageClass had fsGroup), so we only need this for LUKS.
 	if fsGroup != nil && !isS3 {
-		if err := ns.applyFsGroupPermissions(stagingTargetPath, *fsGroup); err != nil {
+		if err := ns.applyFsGroupPermissions(stagingTargetPath, *fsGroup, extractFsMode(req.GetVolumeContext())); err != nil {
 			klog.Warningf("Failed to apply fsGroup %d during publish for volume %s: %v", *fsGroup, volumeID, err)
 		}
 	}
@@ -452,6 +452,7 @@ type StagingParameters struct {
 	mapperName        string
 	mappedDevice      string
 	fsGroup           *int64
+	fsMode            string
 	volumeCapability  *csi.VolumeCapability
 }
 
@@ -465,6 +466,7 @@ func (ns *NodeServer) prepareVolumeStaging(req *csi.NodeStageVolumeRequest) (*St
 		volumeID:          volumeID,
 		stagingTargetPath: req.GetStagingTargetPath(),
 		fsGroup:           fsGroup,
+		fsMode:            extractFsMode(req.GetVolumeContext()),
 		volumeCapability:  req.GetVolumeCapability(),
 	}
 
@@ -699,9 +701,50 @@ func (ns *NodeServer) extractFsGroupFromPod(volumeContext map[string]string) *in
 	return nil
 }
 
-// applyFsGroupPermissions applies fsGroup ownership to the bind mount target
-func (ns *NodeServer) applyFsGroupPermissions(targetPath string, fsGroup int64) error {
-	klog.Infof("Applying fsGroup %d permissions recursively to %s", fsGroup, targetPath)
+// FsModeParam is the StorageClass parameter overriding the recursive mode the
+// driver applies when an fsGroup is set. Defaults to defaultFsMode.
+const FsModeParam = "fs-mode"
+
+// defaultFsMode is 0750 (owner rwx, group rx, no other). Since the driver also
+// chowns owner to the fsGroup, a process running as that fsGroup gets full
+// access — and 0750 is one of the two modes PostgreSQL accepts on its data
+// directory (0775 is rejected). Workloads needing group-write can set fs-mode.
+const defaultFsMode = "0750"
+
+// extractFsMode returns the recursive permission mode from the StorageClass
+// parameters, or defaultFsMode if unset/invalid.
+func extractFsMode(volumeContext map[string]string) string {
+	mode := volumeContext[FsModeParam]
+	if mode == "" {
+		return defaultFsMode
+	}
+	if !isValidOctalMode(mode) {
+		klog.Warningf("Invalid fs-mode %q, using default %s", mode, defaultFsMode)
+		return defaultFsMode
+	}
+	return mode
+}
+
+// isValidOctalMode reports whether s is a 3- or 4-digit octal permission string.
+func isValidOctalMode(s string) bool {
+	if len(s) < 3 || len(s) > 4 {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '7' {
+			return false
+		}
+	}
+	return true
+}
+
+// applyFsGroupPermissions applies fsGroup ownership and the configured mode to
+// the bind mount target. mode defaults to defaultFsMode when empty.
+func (ns *NodeServer) applyFsGroupPermissions(targetPath string, fsGroup int64, mode string) error {
+	if mode == "" {
+		mode = defaultFsMode
+	}
+	klog.Infof("Applying fsGroup %d (mode %s) recursively to %s", fsGroup, mode, targetPath)
 
 	// Recursive chown using nsenter to operate in host namespace
 	chownCmd := exec.Command("nsenter", "-t", "1", "-m", "-u", "chown", "-R", fmt.Sprintf("%d:%d", fsGroup, fsGroup), targetPath)
@@ -712,8 +755,8 @@ func (ns *NodeServer) applyFsGroupPermissions(targetPath string, fsGroup int64) 
 		klog.Infof("nsenter chown command successful, output: %s", string(output))
 	}
 
-	// Ensure group writable using nsenter
-	chmodCmd := exec.Command("nsenter", "-t", "1", "-m", "-u", "chmod", "-R", "775", targetPath)
+	// Apply the directory mode using nsenter
+	chmodCmd := exec.Command("nsenter", "-t", "1", "-m", "-u", "chmod", "-R", mode, targetPath)
 	if output, err := chmodCmd.CombinedOutput(); err != nil {
 		klog.Errorf("nsenter chmod command failed: %v, output: %s", err, string(output))
 		return fmt.Errorf("failed to recursively chmod with nsenter: %v, output: %s", err, string(output))
