@@ -98,6 +98,11 @@ func (d *Driver) Run(ctx context.Context) error {
 	}
 }
 
+// StartRegistrationHealthServer starts the registration-health endpoint. Node mode only.
+func (d *Driver) StartRegistrationHealthServer(addr string) {
+	go d.ns.RunRegistrationHealthServer(addr)
+}
+
 func (d *Driver) GetName() string {
 	return d.name
 }

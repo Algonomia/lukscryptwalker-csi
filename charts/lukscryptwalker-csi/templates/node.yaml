@@ -45,16 +45,15 @@ spec:
             fieldRef:
               fieldPath: spec.nodeName
         livenessProbe:
+          # Probe the driver's CSINode-backed registration endpoint (via
+          # hostNetwork), so a lost registration restarts only this registrar.
           httpGet:
             path: /healthz
-            port: 9809
-          initialDelaySeconds: 5
-          # Probe registration state frequently so a lost registration (e.g. after
-          # a kubelet restart) is detected and the registrar restarts to re-register,
-          # rather than the node staying broken until a reboot.
-          periodSeconds: 5
+            port: 9810
+          initialDelaySeconds: 30
+          periodSeconds: 10
           timeoutSeconds: 3
-          failureThreshold: 2
+          failureThreshold: 3
         volumeMounts:
         - name: plugin-dir
           mountPath: /csi/

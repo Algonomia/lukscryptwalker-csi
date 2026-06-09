@@ -121,6 +121,12 @@ func main() {
 	d := driver.NewDriver(*endpoint, *nodeID)
 	klog.Info("Starting LUKS CSI driver")
 
+	// Node mode: serve the registration-health endpoint the registrar's
+	// liveness probe targets.
+	if !isControllerMode(*endpoint) {
+		d.StartRegistrationHealthServer(driver.RegistrationHealthPort)
+	}
+
 	if err := d.Run(ctx); err != nil {
 		klog.Fatalf("Failed to run CSI driver: %v", err)
 	}
