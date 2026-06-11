@@ -16,7 +16,8 @@
       "Bash(go test *)",
       "Bash(git checkout *)",
       "Bash(rtk kubectl *)",
-      "Bash(rtk read *)"
+      "Bash(rtk read *)",
+      "Bash(rtk proxy *)"
     ],
     "additionalDirectories": [
       "/tmp"

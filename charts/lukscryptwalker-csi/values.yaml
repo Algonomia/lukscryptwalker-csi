@@ -14,8 +14,14 @@ csiDriver:
 
 # Controller configuration
 controller:
-  replicas: 1
-  
+  # 2 replicas + sidecar leader election give failover during crashes and upgrades.
+  # A PodDisruptionBudget (minAvailable: 1) is created whenever replicas > 1.
+  replicas: 2
+
+  # Requires the chart to be installed in kube-system; use a custom
+  # PriorityClass name otherwise.
+  priorityClassName: system-cluster-critical
+
   # Sidecar images
   sidecars:
     provisioner:
@@ -25,9 +31,16 @@ controller:
         pullPolicy: IfNotPresent
     resizer:
       image:
-        repository: registry.k8s.io/sig-storage/csi-resizer  
+        repository: registry.k8s.io/sig-storage/csi-resizer
         tag: v1.9.2
         pullPolicy: IfNotPresent
+    livenessProbe:
+      image:
+        repository: registry.k8s.io/sig-storage/livenessprobe
+        tag: v2.15.0
+        pullPolicy: IfNotPresent
+      # Port the sidecar serves /healthz on (pod-local network)
+      healthPort: 9808
 
   resources:
     limits:
@@ -46,6 +59,17 @@ node:
   # VFS cache configuration
   vfsCacheSize: "20G"  # Size of the encrypted LUKS volume for VFS cache
 
+  # Upgrade one node at a time: the driver serves FUSE mounts in-process, so
+  # restarting it disrupts every volume on the node.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+
+  # Requires the chart to be installed in kube-system; use a custom
+  # PriorityClass name otherwise.
+  priorityClassName: system-node-critical
+
   # Sidecar images
   sidecars:
     nodeDriverRegistrar:
@@ -53,6 +77,14 @@ node:
         repository: registry.k8s.io/sig-storage/csi-node-driver-registrar
         tag: v2.13.0
         pullPolicy: IfNotPresent
+    livenessProbe:
+      image:
+        repository: registry.k8s.io/sig-storage/livenessprobe
+        tag: v2.15.0
+        pullPolicy: IfNotPresent
+      # Host port (hostNetwork pod); 9809/9810 are used by the registrar and
+      # the registration health endpoint.
+      healthPort: 9811
 
   resources:
     limits:

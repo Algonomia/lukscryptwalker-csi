@@ -6,6 +6,10 @@ metadata:
   labels:
     {{- include "lukscryptwalker-csi.node.labels" . | nindent 4 }}
 spec:
+  {{- with .Values.node.updateStrategy }}
+  updateStrategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "lukscryptwalker-csi.node.selectorLabels" . | nindent 6 }}
@@ -20,6 +24,9 @@ spec:
     spec:
       {{- include "lukscryptwalker-csi.imagePullSecrets" . | nindent 6 }}
       serviceAccountName: {{ include "lukscryptwalker-csi.node.serviceAccountName" . }}
+      {{- with .Values.node.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
       hostNetwork: true
       hostPID: true
       {{- with .Values.podSecurityContext.node }}
@@ -59,6 +66,15 @@ spec:
           mountPath: /csi/
         - name: registration-dir
           mountPath: /registration/
+      - name: liveness-probe
+        image: {{ .Values.node.sidecars.livenessProbe.image.repository }}:{{ .Values.node.sidecars.livenessProbe.image.tag }}
+        imagePullPolicy: {{ .Values.node.sidecars.livenessProbe.image.pullPolicy }}
+        args:
+        - "--csi-address=/csi/csi.sock"
+        - "--health-port={{ .Values.node.sidecars.livenessProbe.healthPort }}"
+        volumeMounts:
+        - name: plugin-dir
+          mountPath: /csi/
       - name: lukscryptwalker-csi
         image: {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
         imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -99,23 +115,27 @@ spec:
         - name: vfs-cache-dir
           mountPath: /var/lib/lukscrypt-vfs-cache
           mountPropagation: "Bidirectional"
+        ports:
+        - name: healthz
+          containerPort: {{ .Values.node.sidecars.livenessProbe.healthPort }}
+          protocol: TCP
+        # Both probes go through the livenessprobe sidecar, which calls the
+        # CSI Probe() RPC — verifying the gRPC server responds, not just that
+        # the socket file exists.
         startupProbe:
-          exec:
-            command:
-            - test
-            - -S
-            - /csi/csi.sock
+          httpGet:
+            path: /healthz
+            port: healthz
           failureThreshold: 30
           periodSeconds: 2
         livenessProbe:
-          exec:
-            command:
-            - test
-            - -S
-            - /csi/csi.sock
+          httpGet:
+            path: /healthz
+            port: healthz
           initialDelaySeconds: 10
           periodSeconds: 30
-          timeoutSeconds: 3
+          timeoutSeconds: 5
+          failureThreshold: 3
         {{- with .Values.node.resources }}
         resources:
           {{- toYaml . | nindent 10 }}

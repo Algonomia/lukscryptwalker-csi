@@ -22,6 +22,9 @@ spec:
     spec:
       {{- include "lukscryptwalker-csi.imagePullSecrets" . | nindent 6 }}
       serviceAccountName: {{ include "lukscryptwalker-csi.controller.serviceAccountName" . }}
+      {{- with .Values.controller.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
       {{- with .Values.podSecurityContext.controller }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -35,6 +38,8 @@ spec:
         - "--v={{ .Values.logging.level }}"
         - "--feature-gates=Topology=true"
         - "--strict-topology=false"
+        - "--leader-election=true"
+        - "--leader-election-namespace={{ .Release.Namespace }}"
         env:
         - name: ADDRESS
           value: /var/lib/csi/sockets/pluginproxy/csi.sock
@@ -47,9 +52,20 @@ spec:
         args:
         - "--csi-address=$(ADDRESS)"
         - "--v={{ .Values.logging.level }}"
+        - "--leader-election=true"
+        - "--leader-election-namespace={{ .Release.Namespace }}"
         env:
         - name: ADDRESS
           value: /var/lib/csi/sockets/pluginproxy/csi.sock
+        volumeMounts:
+        - name: socket-dir
+          mountPath: /var/lib/csi/sockets/pluginproxy/
+      - name: liveness-probe
+        image: {{ .Values.controller.sidecars.livenessProbe.image.repository }}:{{ .Values.controller.sidecars.livenessProbe.image.tag }}
+        imagePullPolicy: {{ .Values.controller.sidecars.livenessProbe.image.pullPolicy }}
+        args:
+        - "--csi-address=/var/lib/csi/sockets/pluginproxy/csi.sock"
+        - "--health-port={{ .Values.controller.sidecars.livenessProbe.healthPort }}"
         volumeMounts:
         - name: socket-dir
           mountPath: /var/lib/csi/sockets/pluginproxy/
@@ -69,6 +85,25 @@ spec:
               fieldPath: spec.nodeName
         - name: CSI_LOCAL_PATH
           value: {{ .Values.storage.defaultPath | quote }}
+        ports:
+        - name: healthz
+          containerPort: {{ .Values.controller.sidecars.livenessProbe.healthPort }}
+          protocol: TCP
+        # Served by the livenessprobe sidecar, which calls the CSI Probe() RPC.
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: healthz
+          failureThreshold: 30
+          periodSeconds: 2
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: healthz
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
         volumeMounts:
         - name: socket-dir
           mountPath: /var/lib/csi/sockets/pluginproxy/
