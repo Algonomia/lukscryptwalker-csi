@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -35,6 +36,10 @@ type NodeServer struct {
 	clientset      kubernetes.Interface
 	secretsManager *secrets.SecretsManager
 	s3SyncMgr      *S3SyncManager
+
+	// lastNodeGetInfo (unix nanos): kubelet calls NodeGetInfo only while
+	// (re-)registering the plugin, so this is the registration heartbeat.
+	lastNodeGetInfo atomic.Int64
 }
 
 // NewNodeServer creates a new NodeServer instance
@@ -385,6 +390,7 @@ func (ns *NodeServer) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetC
 
 // NodeGetInfo returns information about the node
 func (ns *NodeServer) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
+	ns.lastNodeGetInfo.Store(time.Now().UnixNano())
 	return &csi.NodeGetInfoResponse{
 		NodeId: ns.driver.nodeID,
 	}, nil

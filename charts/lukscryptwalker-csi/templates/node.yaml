@@ -45,8 +45,8 @@ spec:
             fieldRef:
               fieldPath: spec.nodeName
         livenessProbe:
-          # Probe the driver's CSINode-backed registration endpoint (via
-          # hostNetwork), so a lost registration restarts only this registrar.
+          # The driver's registration-health endpoint: a lost registration
+          # restarts only this registrar, not the driver or its mounts.
           httpGet:
             path: /healthz
             port: 9810
