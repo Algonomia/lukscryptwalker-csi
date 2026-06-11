@@ -761,6 +761,10 @@ func (ns *NodeServer) deletePodByUID(podUID string) {
 				return
 			}
 			klog.Infof("Deleting pod %s/%s (UID: %s) to recover from stale S3 mount", pod.Namespace, pod.Name, podUID)
+			if ns.recorder != nil {
+				ns.recorder.Event(&pod, corev1.EventTypeWarning, "StaleS3MountRecovery",
+					"Deleting pod: its S3-backed volume mount went stale and cannot self-heal via mount propagation")
+			}
 			err := ns.clientset.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
 			if err != nil {
 				klog.Errorf("Failed to delete pod %s/%s: %v", pod.Namespace, pod.Name, err)

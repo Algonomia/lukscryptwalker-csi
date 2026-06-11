@@ -16,10 +16,14 @@ import (
 	"github.com/lukscryptwalker-csi/pkg/secrets"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/klog"
 )
 
@@ -36,10 +40,14 @@ type NodeServer struct {
 	clientset      kubernetes.Interface
 	secretsManager *secrets.SecretsManager
 	s3SyncMgr      *S3SyncManager
+	recorder       record.EventRecorder
 
 	// lastNodeGetInfo (unix nanos): kubelet calls NodeGetInfo only while
 	// (re-)registering the plugin, so this is the registration heartbeat.
 	lastNodeGetInfo atomic.Int64
+	// regUnhealthy tracks the last registration-health state for
+	// transition-only event emission.
+	regUnhealthy atomic.Bool
 }
 
 // NewNodeServer creates a new NodeServer instance
@@ -52,6 +60,12 @@ func NewNodeServer(d *Driver) *NodeServer {
 		clientset:      clientset,
 		secretsManager: secrets.NewSecretsManager(clientset),
 		s3SyncMgr:      NewS3SyncManager(),
+	}
+
+	if clientset != nil {
+		broadcaster := record.NewBroadcaster()
+		broadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: clientset.CoreV1().Events("")})
+		ns.recorder = broadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "lukscryptwalker-csi", Host: d.nodeID})
 	}
 
 	// Run startup cleanup asynchronously to avoid delaying CSI driver registration

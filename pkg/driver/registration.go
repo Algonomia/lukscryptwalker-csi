@@ -9,7 +9,9 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog"
 )
 
@@ -35,7 +37,9 @@ func (ns *NodeServer) RunRegistrationHealthServer(addr string) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		if ns.isDriverRegistered() {
+		healthy := ns.isDriverRegistered()
+		ns.recordRegistrationTransition(healthy)
+		if healthy {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("registered"))
 			return
@@ -48,6 +52,23 @@ func (ns *NodeServer) RunRegistrationHealthServer(addr string) {
 	klog.Infof("Registration health server listening on %s", addr)
 	if err := srv.ListenAndServe(); err != nil {
 		klog.Errorf("Registration health server stopped: %v", err)
+	}
+}
+
+// recordRegistrationTransition emits a Node event when registration health
+// changes state, so a lost registration is visible without reading driver logs.
+func (ns *NodeServer) recordRegistrationTransition(healthy bool) {
+	was := ns.regUnhealthy.Swap(!healthy)
+	if ns.recorder == nil || was == !healthy {
+		return
+	}
+	nodeRef := &corev1.ObjectReference{Kind: "Node", Name: ns.driver.nodeID, UID: types.UID(ns.driver.nodeID)}
+	if healthy {
+		ns.recorder.Eventf(nodeRef, corev1.EventTypeNormal, "CSIRegistrationRecovered",
+			"CSI driver %s re-registered with kubelet", DriverName)
+	} else {
+		ns.recorder.Eventf(nodeRef, corev1.EventTypeWarning, "CSIRegistrationLost",
+			"CSI driver %s is not registered with kubelet; restarting the registrar to force re-registration", DriverName)
 	}
 }
 

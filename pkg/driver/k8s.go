@@ -106,12 +106,13 @@ func (cs *ControllerServer) GetStorageClassParametersByVolumeID(ctx context.Cont
 	return scParams, nil
 }
 
-// GetS3PathPrefixByVolumeID retrieves the S3 pathPrefix parameter for a volume with graceful fallback
-func GetS3PathPrefixByVolumeID(ctx context.Context, retriever StorageClassParamsRetriever, volumeID string) string {
+// GetS3PathPrefixByVolumeID retrieves the S3 pathPrefix parameter for a volume.
+// Lookup failures are returned rather than defaulted: deleting with a wrong
+// prefix would silently miss the data and orphan it.
+func GetS3PathPrefixByVolumeID(ctx context.Context, retriever StorageClassParamsRetriever, volumeID string) (string, error) {
 	scParams, err := retriever.GetStorageClassParametersByVolumeID(ctx, volumeID)
 	if err != nil {
-		klog.Warningf("Failed to get StorageClass parameters for volume %s, using default path: %v", volumeID, err)
-		return ""
+		return "", err
 	}
 
 	pathPrefix := scParams[S3PathPrefixParam]
@@ -121,5 +122,5 @@ func GetS3PathPrefixByVolumeID(ctx context.Context, retriever StorageClassParams
 		klog.V(4).Infof("No pathPrefix configured for volume %s, using default", volumeID)
 	}
 
-	return pathPrefix
+	return pathPrefix, nil
 }

@@ -103,8 +103,12 @@ func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 		} else {
 			klog.Infof("Deleting S3 data for volume: %s", volumeID)
 
-			// Get pathPrefix from StorageClass parameters
-			s3PathPrefix := GetS3PathPrefixByVolumeID(ctx, cs, volumeID)
+			// Fail (and let the provisioner retry) rather than silently
+			// orphan or mistarget the S3 data.
+			s3PathPrefix, err := GetS3PathPrefixByVolumeID(ctx, cs, volumeID)
+			if err != nil {
+				return nil, status.Errorf(codes.Unavailable, "cannot determine S3 path prefix for volume %s: %v", volumeID, err)
+			}
 
 			s3Config := &rclone.S3Config{
 				Region:          s3Creds.Region,
@@ -115,9 +119,7 @@ func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 			}
 
 			if err := rclone.DeleteVolumeData(s3Config, volumeID, s3PathPrefix); err != nil {
-				klog.Errorf("Failed to delete S3 data for volume %s: %v", volumeID, err)
-				// Don't fail the deletion - the volume should still be removed from Kubernetes
-				// The S3 data might need manual cleanup if this fails
+				return nil, status.Errorf(codes.Internal, "failed to delete S3 data for volume %s: %v", volumeID, err)
 			}
 		}
 	}
