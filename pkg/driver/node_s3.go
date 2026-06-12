@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -543,8 +544,81 @@ func (ns *NodeServer) reconcileS3Mount(volumeID, globalmountPath string, volumeC
 		}
 		klog.Infof("Pod %s/%s cannot self-heal for volume %s; restarting to recover",
 			pod.Namespace, pod.Name, volumeID)
-		ns.deletePodByUID(string(pod.UID))
+		ns.recoverConsumerPod(pod)
 	}
+}
+
+// recoverConsumerPod restarts the pod's containers in place: the host-side pod
+// volume path already healed via mount propagation, so freshly started
+// containers bind the repaired mount. Falls back to pod deletion when
+// containers won't restart (RestartPolicy=Never) or no processes are found.
+func (ns *NodeServer) recoverConsumerPod(pod *corev1.Pod) {
+	if pod.Spec.RestartPolicy != corev1.RestartPolicyNever {
+		if ns.restartPodContainers(pod) {
+			return
+		}
+		klog.Warningf("Pod %s/%s: no container processes found to restart; falling back to pod deletion",
+			pod.Namespace, pod.Name)
+	}
+	ns.deletePodByUID(string(pod.UID))
+}
+
+// restartPodContainers kills the pod's container processes (visible via
+// hostPID) so kubelet restarts them with fresh volume binds, leaving the pod
+// object — and its scheduling — untouched.
+func (ns *NodeServer) restartPodContainers(pod *corev1.Pod) bool {
+	pids := podContainerPIDs(string(pod.UID))
+	if len(pids) == 0 {
+		return false
+	}
+	klog.Infof("Pod %s/%s: killing %d container process(es) so they restart onto the repaired mount",
+		pod.Namespace, pod.Name, len(pids))
+	if ns.recorder != nil {
+		ns.recorder.Event(pod, corev1.EventTypeWarning, "StaleS3MountRecovery",
+			"Restarting containers in place: the S3-backed volume mount went stale and cannot self-heal via mount propagation")
+	}
+	killed := false
+	for _, pid := range pids {
+		if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+			klog.Warningf("Pod %s/%s: failed to kill pid %d: %v", pod.Namespace, pod.Name, pid, err)
+		} else {
+			killed = true
+		}
+	}
+	return killed
+}
+
+// podContainerPIDs returns the host PIDs of the pod's container processes,
+// excluding the sandbox pause process so the pod sandbox survives.
+func podContainerPIDs(podUID string) []int {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	var pids []int
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		cgroup, err := os.ReadFile("/proc/" + e.Name() + "/cgroup")
+		if err != nil || !cgroupBelongsToPod(string(cgroup), podUID) {
+			continue
+		}
+		comm, err := os.ReadFile("/proc/" + e.Name() + "/comm")
+		if err == nil && strings.TrimSpace(string(comm)) == "pause" {
+			continue
+		}
+		pids = append(pids, pid)
+	}
+	return pids
+}
+
+// cgroupBelongsToPod matches both cgroupfs (pod<uid>) and systemd
+// (pod<uid_with_underscores>) cgroup path styles.
+func cgroupBelongsToPod(cgroup, podUID string) bool {
+	return strings.Contains(cgroup, "pod"+podUID) ||
+		strings.Contains(cgroup, "pod"+strings.ReplaceAll(podUID, "-", "_"))
 }
 
 // consumerMountHealthy reports whether the re-mount reached a consumer pod's CSI
