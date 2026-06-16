@@ -54,7 +54,17 @@ type MountManager struct {
 	uid             *int64        // UID for FUSE mount (from fsGroup)
 	gid             *int64        // GID for FUSE mount (from fsGroup)
 	stopCacheMon    chan struct{} // Signals the background cache monitor to stop
+	stopMonOnce     sync.Once     // Guards stopCacheMon close so it is safe to call from both Unmount and reconcile
 	refreshMu       sync.Mutex    // Serializes refreshVFS calls to prevent concurrent forget/refresh races
+}
+
+// StopCacheMonitor stops the background cache monitor without unmounting.
+// Idempotent. Call before dropping a stale manager so its monitor doesn't keep
+// evicting a cache dir that a replacement mount now owns.
+func (mm *MountManager) StopCacheMonitor() {
+	if mm.stopCacheMon != nil {
+		mm.stopMonOnce.Do(func() { close(mm.stopCacheMon) })
+	}
 }
 
 // NewMountManager creates a new rclone mount manager
@@ -268,9 +278,7 @@ func (mm *MountManager) Unmount() error {
 
 	klog.Infof("Unmounting encrypted S3 volume %s from %s", mm.volumeID, mm.mountPoint)
 
-	if mm.stopCacheMon != nil {
-		close(mm.stopCacheMon)
-	}
+	mm.StopCacheMonitor()
 
 	// Drain before unmounting: mount/unmount cancels rclone's VFS context, which
 	// aborts all in-flight uploads mid-stream and leaves partial objects in S3.
@@ -570,8 +578,11 @@ func (mm *MountManager) cacheMonitor() {
 // files until the total is back under maxBytes. It only removes files that
 // have no open file descriptors and are not actively being transferred.
 func (mm *MountManager) evictCacheIfNeeded(cacheDir string, maxBytes int64) {
-	// Never delete files that may not be uploaded yet.
-	if mm.hasActiveTransfers() {
+	// Never delete files that may not be uploaded yet. hasActiveTransfers only
+	// covers files mid-transfer; a written-and-closed file sits in the
+	// write-back queue (not transferring, not open) until WriteBack fires, so
+	// also require the upload queue to be empty before evicting anything.
+	if mm.hasActiveTransfers() || !mm.IsUploadQueueEmpty() {
 		return
 	}
 

@@ -516,8 +516,12 @@ func (ns *NodeServer) reconcileS3Mount(volumeID, globalmountPath string, volumeC
 	// Detach the dead FUSE mount (if any) so a fresh mount can take the path.
 	_ = exec.Command("umount", "-l", globalmountPath).Run()
 
-	// Drop any stale in-memory manager from a previous driver instance.
+	// Drop any stale in-memory manager, stopping its cache monitor first so it
+	// doesn't keep evicting the cache dir the fresh mount is about to own.
 	ns.s3SyncMgr.mutex.Lock()
+	if old := ns.s3SyncMgr.mountManagers[volumeID]; old != nil {
+		old.StopCacheMonitor()
+	}
 	delete(ns.s3SyncMgr.mountManagers, volumeID)
 	ns.s3SyncMgr.mutex.Unlock()
 
