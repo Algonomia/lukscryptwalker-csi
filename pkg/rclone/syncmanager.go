@@ -578,10 +578,8 @@ func (mm *MountManager) cacheMonitor() {
 // files until the total is back under maxBytes. It only removes files that
 // have no open file descriptors and are not actively being transferred.
 func (mm *MountManager) evictCacheIfNeeded(cacheDir string, maxBytes int64) {
-	// Never delete files that may not be uploaded yet. hasActiveTransfers only
-	// covers files mid-transfer; a written-and-closed file sits in the
-	// write-back queue (not transferring, not open) until WriteBack fires, so
-	// also require the upload queue to be empty before evicting anything.
+	// Never evict while anything is dirty: write-back-queued files aren't
+	// "transferring" yet but aren't on S3 either.
 	if mm.hasActiveTransfers() || !mm.IsUploadQueueEmpty() {
 		return
 	}

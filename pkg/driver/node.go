@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -48,6 +49,9 @@ type NodeServer struct {
 	// regUnhealthy tracks the last registration-health state for
 	// transition-only event emission.
 	regUnhealthy atomic.Bool
+	// vfsProbesInFlight caps the zombie-mount readdir probe at one goroutine
+	// per mount path, so a wedged FUSE can't leak one on every checker tick.
+	vfsProbesInFlight sync.Map
 }
 
 // NewNodeServer creates a new NodeServer instance
@@ -248,6 +252,10 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 
 		// Mount and configure the LUKS volume
 		if err := ns.mountAndConfigureVolume(stageParams); err != nil {
+			// Close the mapper opened above so a mount failure doesn't leak it.
+			if cerr := ns.luksManager.CloseLUKS(stageParams.mapperName); cerr != nil {
+				klog.Warningf("Volume %s: failed to close LUKS after mount failure: %v", volumeID, cerr)
+			}
 			return nil, status.Errorf(codes.Internal, "Failed to mount and configure volume: %v", err)
 		}
 	}

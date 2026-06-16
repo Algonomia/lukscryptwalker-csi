@@ -63,8 +63,8 @@ func (ns *NodeServer) cleanupVolumeStaging(volumeID, stagingTargetPath string) e
 			}
 
 			if err := ns.unmountPath(stagingTargetPath); err != nil {
-				klog.Errorf("Failed to unmount staging path %s: %v", stagingTargetPath, err)
-				// Continue with cleanup even if unmount fails
+				// Don't close LUKS under a possibly-live fs; retry unstage instead.
+				return fmt.Errorf("failed to unmount staging path %s; not closing LUKS: %w", stagingTargetPath, err)
 			}
 		} else {
 			klog.V(4).Infof("Staging path %s is not mounted, skipping unmount", stagingTargetPath)

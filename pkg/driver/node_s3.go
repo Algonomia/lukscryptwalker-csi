@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -448,6 +449,13 @@ func (ns *NodeServer) cleanupStaleS3Mounts() {
 		// This happens when the stale mount was already cleaned up but pods still need it
 		isMissingMount := statErr == nil && !ns.isFUSEMountPoint(globalmountPath)
 
+		// statfs is FUSE-local, so a healthy-looking mount can be a cancelled-VFS
+		// zombie (real ops return EIO); probe it and reconcile if unresponsive.
+		if statErr == nil && !isMissingMount && !ns.mountVFSResponsive(globalmountPath) {
+			klog.Warningf("S3 mount %s passes statfs but fails directory reads (cancelled-VFS zombie); reconciling", globalmountPath)
+			isStaleFUSE = true
+		}
+
 		if !isStaleFUSE && !isMissingMount {
 			// Mount is healthy, skip
 			continue
@@ -885,6 +893,38 @@ func (ns *NodeServer) deletePodByUID(podUID string) {
 	}
 
 	klog.Warningf("Could not find pod with UID %s to delete", podUID)
+}
+
+// mountVFSResponsive reports whether a FUSE mount can serve a directory read,
+// catching a cancelled-VFS zombie that passes statfs but fails real ops. Times
+// out as healthy (slow backend), and runs one probe per path at a time.
+func (ns *NodeServer) mountVFSResponsive(globalmountPath string) bool {
+	if _, inFlight := ns.vfsProbesInFlight.LoadOrStore(globalmountPath, struct{}{}); inFlight {
+		return true
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		defer ns.vfsProbesInFlight.Delete(globalmountPath)
+		f, err := os.Open(globalmountPath)
+		if err != nil {
+			done <- err
+			return
+		}
+		_, err = f.Readdirnames(1)
+		_ = f.Close()
+		if err == io.EOF { // empty directory is healthy
+			err = nil
+		}
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		return err == nil
+	case <-time.After(3 * time.Second):
+		return true
+	}
 }
 
 // isFUSEMountPoint checks if the path has a FUSE mount by reading /proc/mounts.
