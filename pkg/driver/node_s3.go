@@ -533,13 +533,21 @@ func (ns *NodeServer) reconcileS3Mount(volumeID, globalmountPath string, volumeC
 	}
 	klog.Infof("Volume %s: re-mounted in-process; re-attaching consumers", volumeID)
 
-	// Leave a consumer running only if it declares propagation AND its host
-	// mount path actually reflects the re-mount; otherwise restart it.
 	for i := range consumers {
 		pod := &consumers[i]
+		// Re-point the consumer's stale bind at the fresh globalmount.
+		rebound := ns.rebindConsumerMount(globalmountPath, string(pod.UID), pvName, fsGroup)
+
 		if podSelfHealsViaPropagation(pod, pvcName) && ns.consumerMountHealthy(string(pod.UID), pvName) {
 			klog.Infof("Pod %s/%s self-healed via mount propagation for volume %s; left running",
 				pod.Namespace, pod.Name, volumeID)
+			continue
+		}
+		// Re-bind failed: only a full re-publish (pod delete) can recover it.
+		if !rebound {
+			klog.Warningf("Pod %s/%s: re-bind failed for volume %s; deleting to force re-publish",
+				pod.Namespace, pod.Name, volumeID)
+			ns.deletePodByUID(string(pod.UID))
 			continue
 		}
 		klog.Infof("Pod %s/%s cannot self-heal for volume %s; restarting to recover",
@@ -548,10 +556,33 @@ func (ns *NodeServer) reconcileS3Mount(volumeID, globalmountPath string, volumeC
 	}
 }
 
-// recoverConsumerPod restarts the pod's containers in place: the host-side pod
-// volume path already healed via mount propagation, so freshly started
-// containers bind the repaired mount. Falls back to pod deletion when
-// containers won't restart (RestartPolicy=Never) or no processes are found.
+// rebindConsumerMount re-points a consumer's stale CSI bind mount at the freshly
+// re-mounted globalmount (the host-side half of NodePublishVolume), so a
+// restarted container lands on a live mount instead of the torn-down FUSE.
+// Returns true when the host path now backs the fresh mount (including when the
+// pod isn't published here).
+func (ns *NodeServer) rebindConsumerMount(globalmountPath, podUID, pvName string, fsGroup *int64) bool {
+	if pvName == "" {
+		return false
+	}
+	targetPath := filepath.Join(resolveKubeletRoot(), "pods", podUID,
+		"volumes", "kubernetes.io~csi", pvName, "mount")
+	if _, err := os.Stat(filepath.Dir(targetPath)); err != nil {
+		return true // not published on this node; nothing stale to re-point
+	}
+
+	_ = exec.Command("umount", "-l", targetPath).Run()
+	if err := ns.bindMount(globalmountPath, targetPath, false, fsGroup); err != nil {
+		klog.Warningf("Pod %s: failed to re-bind CSI mount %s to %s: %v",
+			podUID, globalmountPath, targetPath, err)
+		return false
+	}
+	return true
+}
+
+// recoverConsumerPod restarts the pod's containers in place so they re-bind the
+// (already re-bound) host mount path. Falls back to pod deletion when containers
+// won't restart (RestartPolicy=Never) or no processes are found.
 func (ns *NodeServer) recoverConsumerPod(pod *corev1.Pod) {
 	if pod.Spec.RestartPolicy != corev1.RestartPolicyNever {
 		if ns.restartPodContainers(pod) {
