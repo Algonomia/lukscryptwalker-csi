@@ -1,6 +1,46 @@
 package driver
 
-import "testing"
+import (
+	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+func TestPodStuckTerminating(t *testing.T) {
+	grace := int64(30)
+	mkPod := func(del *time.Time, g *int64) *corev1.Pod {
+		p := &corev1.Pod{}
+		if del != nil {
+			t := metav1.NewTime(*del)
+			p.DeletionTimestamp = &t
+			p.DeletionGracePeriodSeconds = g
+		}
+		return p
+	}
+	now := time.Now()
+	past := now.Add(-10 * time.Minute)
+	recent := now.Add(-5 * time.Second)
+
+	cases := []struct {
+		name string
+		pod  *corev1.Pod
+		want bool
+	}{
+		{"not terminating", mkPod(nil, nil), false},
+		{"terminating within grace", mkPod(&recent, &grace), false},
+		{"wedged past grace", mkPod(&past, &grace), true},
+		{"wedged, nil grace", mkPod(&past, nil), true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := podStuckTerminating(c.pod); got != c.want {
+				t.Errorf("podStuckTerminating() = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
 
 func TestCgroupBelongsToPod(t *testing.T) {
 	const uid = "50949d73-f8ea-4bd3-be1b-a395eeec3361"

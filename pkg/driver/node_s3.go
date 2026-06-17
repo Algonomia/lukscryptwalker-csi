@@ -547,6 +547,15 @@ func (ns *NodeServer) reconcileS3Mount(volumeID, globalmountPath string, volumeC
 
 	for i := range consumers {
 		pod := &consumers[i]
+
+		// Don't re-bind onto a dying pod; drop its stale bind so kubelet can
+		// finish teardown, then force-delete it if it's wedged.
+		if pod.DeletionTimestamp != nil {
+			ns.unbindTerminatingConsumer(string(pod.UID), pvName)
+			ns.deletePodByUID(string(pod.UID))
+			continue
+		}
+
 		// Re-point the consumer's stale bind at the fresh globalmount.
 		rebound := ns.rebindConsumerMount(globalmountPath, string(pod.UID), pvName, fsGroup)
 
@@ -590,6 +599,20 @@ func (ns *NodeServer) rebindConsumerMount(globalmountPath, podUID, pvName string
 		return false
 	}
 	return true
+}
+
+// unbindTerminatingConsumer lazily unmounts a terminating pod's CSI bind so a
+// dead FUSE doesn't wedge kubelet's teardown. No-op if not published here.
+func (ns *NodeServer) unbindTerminatingConsumer(podUID, pvName string) {
+	if pvName == "" {
+		return
+	}
+	targetPath := filepath.Join(resolveKubeletRoot(), "pods", podUID,
+		"volumes", "kubernetes.io~csi", pvName, "mount")
+	if _, err := os.Stat(filepath.Dir(targetPath)); err != nil {
+		return // not published on this node
+	}
+	_ = exec.Command("umount", "-l", targetPath).Run()
 }
 
 // recoverConsumerPod restarts the pod's containers in place so they re-bind the
@@ -844,7 +867,28 @@ func (ns *NodeServer) restartPodsWithStaleS3Mount(volumeID string) {
 	}
 }
 
-// deletePodByUID finds and deletes a pod by its UID
+// staleTerminationGrace is the slack past a pod's deletion grace period before
+// we treat it as wedged in termination.
+const staleTerminationGrace = 30 * time.Second
+
+// podStuckTerminating reports whether a pod has been terminating past its
+// deletion grace period (kubelet couldn't finish teardown).
+func podStuckTerminating(pod *corev1.Pod) bool {
+	if pod.DeletionTimestamp == nil {
+		return false
+	}
+	grace := int64(0)
+	if pod.DeletionGracePeriodSeconds != nil {
+		grace = *pod.DeletionGracePeriodSeconds
+	}
+	deadline := pod.DeletionTimestamp.Time.Add(time.Duration(grace)*time.Second + staleTerminationGrace)
+	return time.Now().After(deadline)
+}
+
+// deletePodByUID deletes a pod by UID to recover from a stale S3 mount, using
+// the least-invasive action: Succeeded pods are left alone, a controller-owned
+// pod wedged in termination is force-deleted (grace 0), and otherwise a normal
+// delete is issued (or skipped when its controller will handle recreation).
 func (ns *NodeServer) deletePodByUID(podUID string) {
 	if ns.clientset == nil {
 		klog.Warningf("Cannot delete pod %s: no kubernetes client", podUID)
@@ -860,39 +904,66 @@ func (ns *NodeServer) deletePodByUID(podUID string) {
 		return
 	}
 
-	for _, pod := range pods.Items {
-		if string(pod.UID) == podUID {
-			// Skip pods that are already in a terminal phase — they completed normally
-			// and should not be force-deleted (this would confuse StatefulSet/Job controllers
-			// and could prevent the backup pod from ever being rescheduled).
-			if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
-				klog.Infof("Pod %s/%s (UID: %s) is in terminal phase %s, skipping delete",
-					pod.Namespace, pod.Name, podUID, pod.Status.Phase)
-				return
-			}
-			// Skip pods already being deleted (DeletionTimestamp set) — kubelet is
-			// handling teardown; no need to race with it.
-			if pod.DeletionTimestamp != nil {
-				klog.Infof("Pod %s/%s (UID: %s) is already being deleted, skipping",
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if string(pod.UID) != podUID {
+			continue
+		}
+
+		switch {
+		case pod.Status.Phase == corev1.PodSucceeded:
+			// Completed (e.g. a finished backup Job); deleting it confuses its controller.
+			klog.Infof("Pod %s/%s (UID: %s) is Succeeded, skipping delete",
+				pod.Namespace, pod.Name, podUID)
+		case podStuckTerminating(pod):
+			// Wedged teardown blocks StatefulSet recreation; force-delete as a last resort.
+			if metav1.GetControllerOf(pod) == nil {
+				klog.Infof("Pod %s/%s (UID: %s) is stuck terminating but has no controller; not force-deleting",
 					pod.Namespace, pod.Name, podUID)
-				return
+			} else {
+				ns.forceDeletePod(ctx, pod)
 			}
-			klog.Infof("Deleting pod %s/%s (UID: %s) to recover from stale S3 mount", pod.Namespace, pod.Name, podUID)
+		case pod.DeletionTimestamp != nil:
+			klog.Infof("Pod %s/%s (UID: %s) is terminating within grace, leaving teardown to kubelet",
+				pod.Namespace, pod.Name, podUID)
+		case pod.Status.Phase == corev1.PodFailed:
+			klog.Infof("Pod %s/%s (UID: %s) is Failed; leaving recreation to its controller",
+				pod.Namespace, pod.Name, podUID)
+		default:
+			klog.Infof("Deleting pod %s/%s (UID: %s) to recover from stale S3 mount",
+				pod.Namespace, pod.Name, podUID)
 			if ns.recorder != nil {
-				ns.recorder.Event(&pod, corev1.EventTypeWarning, "StaleS3MountRecovery",
+				ns.recorder.Event(pod, corev1.EventTypeWarning, "StaleS3MountRecovery",
 					"Deleting pod: its S3-backed volume mount went stale and cannot self-heal via mount propagation")
 			}
-			err := ns.clientset.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
-			if err != nil {
+			if err := ns.clientset.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{}); err != nil {
 				klog.Errorf("Failed to delete pod %s/%s: %v", pod.Namespace, pod.Name, err)
 			} else {
-				klog.Infof("Successfully deleted pod %s/%s, it will be recreated by its controller", pod.Namespace, pod.Name)
+				klog.Infof("Successfully deleted pod %s/%s, it will be recreated by its controller",
+					pod.Namespace, pod.Name)
 			}
-			return
 		}
+		return
 	}
 
 	klog.Warningf("Could not find pod with UID %s to delete", podUID)
+}
+
+// forceDeletePod removes a pod object immediately (grace 0) so its controller
+// can recreate it — e.g. a StatefulSet blocked by a lingering ordinal.
+func (ns *NodeServer) forceDeletePod(ctx context.Context, pod *corev1.Pod) {
+	klog.Warningf("Force-deleting stuck-terminating pod %s/%s (UID: %s) so its controller can recreate it",
+		pod.Namespace, pod.Name, pod.UID)
+	if ns.recorder != nil {
+		ns.recorder.Event(pod, corev1.EventTypeWarning, "StaleS3MountRecovery",
+			"Force-deleting pod wedged in termination by a stale S3-backed volume mount so its controller can recreate it")
+	}
+	grace := int64(0)
+	if err := ns.clientset.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
+		GracePeriodSeconds: &grace,
+	}); err != nil && !k8serrors.IsNotFound(err) {
+		klog.Errorf("Failed to force-delete pod %s/%s: %v", pod.Namespace, pod.Name, err)
+	}
 }
 
 // mountVFSResponsive reports whether a FUSE mount can serve a directory read,
