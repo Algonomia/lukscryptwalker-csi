@@ -881,7 +881,7 @@ func podStuckTerminating(pod *corev1.Pod) bool {
 	if pod.DeletionGracePeriodSeconds != nil {
 		grace = *pod.DeletionGracePeriodSeconds
 	}
-	deadline := pod.DeletionTimestamp.Time.Add(time.Duration(grace)*time.Second + staleTerminationGrace)
+	deadline := pod.DeletionTimestamp.Add(time.Duration(grace)*time.Second + staleTerminationGrace)
 	return time.Now().After(deadline)
 }
 
