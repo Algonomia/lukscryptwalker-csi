@@ -241,13 +241,14 @@ func (ns *NodeServer) performVolumeExpansion(ctx context.Context, params *Expans
 	}
 	klog.Infof("Successfully expanded backing file %s", params.backingFile)
 
-	// Refresh loop device
+	// Refresh loop device. Must be fatal: without it, cryptsetup resize and the
+	// filesystem grow are silent no-ops against the old device size.
 	klog.Infof("Refreshing loop device for backing file %s", params.backingFile)
 	if err := ns.refreshLoopDevice(params.backingFile); err != nil {
-		klog.Warningf("Failed to refresh loop device for %s: %v", params.backingFile, err)
-	} else {
-		klog.Infof("Successfully refreshed loop device for backing file %s", params.backingFile)
+		klog.Errorf("Failed to refresh loop device for %s: %v", params.backingFile, err)
+		return status.Errorf(codes.Internal, "Failed to refresh loop device: %v", err)
 	}
+	klog.Infof("Successfully refreshed loop device for backing file %s", params.backingFile)
 
 	// Get passphrase and resize LUKS
 	klog.Infof("Retrieving passphrase for LUKS resize of device %s", params.mapperName)
@@ -264,6 +265,19 @@ func (ns *NodeServer) performVolumeExpansion(ctx context.Context, params *Expans
 		return status.Errorf(codes.Internal, "Failed to resize LUKS device: %v", err)
 	}
 	klog.Infof("Successfully resized LUKS device %s", params.mapperName)
+
+	// Verify the mapper reached the requested size (minus LUKS header, at most 16MiB
+	// for LUKS2) before growing the filesystem: catches any layer that no-opped.
+	const luksHeaderSlack = 64 << 20
+	mappedSize, err := ns.luksManager.GetLUKSDeviceSize(params.mappedDevice)
+	if err != nil {
+		return status.Errorf(codes.Internal, "Failed to verify mapped device size after LUKS resize: %v", err)
+	}
+	if mappedSize < params.requestedBytes-luksHeaderSlack {
+		return status.Errorf(codes.Internal,
+			"Mapped device %s is %d bytes after resize, expected ~%d: an underlying layer did not grow",
+			params.mappedDevice, mappedSize, params.requestedBytes)
+	}
 
 	// Resize filesystem
 	klog.Infof("Resizing filesystem on device %s (volume path: %s)", params.mappedDevice, params.volumePath)
@@ -306,24 +320,6 @@ func (ns *NodeServer) isVolumeStaged(volumeID, stagingTargetPath string) bool {
 
 	klog.Infof("Volume %s is already staged at %s", volumeID, stagingTargetPath)
 	return true
-}
-
-// isVolumeAlreadyExpanded checks if the backing file is already expanded to the requested size
-func (ns *NodeServer) isVolumeAlreadyExpanded(backingFile string, requestedBytes int64) bool {
-	fileInfo, err := os.Stat(backingFile)
-	if err != nil {
-		klog.Infof("Cannot stat backing file %s: %v", backingFile, err)
-		return false
-	}
-
-	currentSize := fileInfo.Size()
-	if currentSize >= requestedBytes {
-		klog.Infof("Backing file %s is already %d bytes (requested: %d bytes)", backingFile, currentSize, requestedBytes)
-		return true
-	}
-
-	klog.Infof("Backing file %s is %d bytes, needs expansion to %d bytes", backingFile, currentSize, requestedBytes)
-	return false
 }
 
 // =============================================================================
@@ -397,17 +393,19 @@ func (ns *NodeServer) formatDevice(devicePath string, capability *csi.VolumeCapa
 	var formatCmd *exec.Cmd
 	switch fsType {
 	case "ext4":
-		formatCmd = exec.Command("mkfs.ext4", "-F", devicePath)
+		// -e remount-ro: a write error must stop the volume, not be silently
+		// accumulated under the kernel default errors=continue.
+		formatCmd = exec.Command("mkfs.ext4", "-F", "-e", "remount-ro", devicePath)
 	case "ext3":
-		formatCmd = exec.Command("mkfs.ext3", "-F", devicePath)
+		formatCmd = exec.Command("mkfs.ext3", "-F", "-e", "remount-ro", devicePath)
 	case "xfs":
 		formatCmd = exec.Command("mkfs.xfs", "-f", devicePath)
 	default:
 		return fmt.Errorf("unsupported filesystem type: %s", fsType)
 	}
 
-	if err := formatCmd.Run(); err != nil {
-		return fmt.Errorf("failed to format device %s: %v", devicePath, err)
+	if out, err := formatCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to format device %s: %v: %s", devicePath, err, strings.TrimSpace(string(out)))
 	}
 
 	return nil
@@ -452,8 +450,10 @@ func (ns *NodeServer) mountDevice(devicePath, targetPath string, capability *csi
 	args = append(args, devicePath, targetPath)
 
 	cmd := exec.Command("mount", args...)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to mount device %s to %s: %v", devicePath, targetPath, err)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		// Fold mount's stderr into the error: an "exit status 32" alone hides the real
+		// cause (e.g. ENOSPC on the backing store surfacing as a failed ext4 journal replay).
+		return fmt.Errorf("failed to mount device %s to %s: %v: %s", devicePath, targetPath, err, strings.TrimSpace(string(out)))
 	}
 
 	return nil
@@ -488,8 +488,14 @@ func (ns *NodeServer) resizeFilesystem(devicePath, volumePath string) error {
 		return fmt.Errorf("unsupported filesystem type for resize: %s", fsType)
 	}
 
-	if err := resizeCmd.Run(); err != nil {
-		return fmt.Errorf("failed to resize %s filesystem on %s: %v", fsType, devicePath, err)
+	if out, err := resizeCmd.CombinedOutput(); err != nil {
+		msg := strings.TrimSpace(string(out))
+		// resize2fs reports EPERM this way when ext4 has its error flag set: the kernel
+		// refuses online resizing until an offline e2fsck clears it. Retrying cannot help.
+		if strings.Contains(msg, "Permission denied to resize filesystem") {
+			return fmt.Errorf("kernel refused online resize of %s (filesystem has recorded errors); unmount and run 'e2fsck -f' offline, then retry: %s", devicePath, msg)
+		}
+		return fmt.Errorf("failed to resize %s filesystem on %s: %v: %s", fsType, devicePath, err, msg)
 	}
 
 	klog.Infof("Successfully resized %s filesystem on device %s", fsType, devicePath)

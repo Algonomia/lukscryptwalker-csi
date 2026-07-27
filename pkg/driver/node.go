@@ -372,14 +372,8 @@ func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 		return nil, err
 	}
 
-	// Check if volume is already expanded (idempotency)
-	if ns.isVolumeAlreadyExpanded(expandParams.backingFile, expandParams.requestedBytes) {
-		klog.Infof("Volume %s is already expanded to %d bytes, returning success",
-			expandParams.volumeID, expandParams.requestedBytes)
-		return &csi.NodeExpandVolumeResponse{CapacityBytes: expandParams.requestedBytes}, nil
-	}
-
-	// Perform volume expansion
+	// Always run the full expansion chain: every step is idempotent, and the backing
+	// file alone being at size does not mean the loop/LUKS/filesystem layers followed.
 	if err := ns.performVolumeExpansion(ctx, expandParams); err != nil {
 		return nil, err
 	}
