@@ -442,8 +442,13 @@ func (ns *NodeServer) cleanupStaleS3Mounts() {
 			continue
 		}
 
-		// Check if it's a stale FUSE mount (transport endpoint not connected)
-		isStaleFUSE := errors.Is(statErr, syscall.ENOTCONN) || errors.Is(statErr, syscall.ESTALE)
+		// Stale: ENOTCONN/ESTALE from a dead FUSE daemon, or EIO from an
+		// aborted connection / zombie VFS. Other errnos (e.g. EINTR) don't
+		// justify a disruptive reconcile — log and leave the mount alone.
+		isStaleFUSE := isMountDeadErr(statErr)
+		if statErr != nil && !isStaleFUSE {
+			klog.Warningf("S3 mount %s: unexpected statfs error (not reconciling): %v", globalmountPath, statErr)
+		}
 
 		// Check if mount is missing (directory exists but no FUSE mount)
 		// This happens when the stale mount was already cleaned up but pods still need it
@@ -521,9 +526,6 @@ func (ns *NodeServer) reconcileS3Mount(volumeID, globalmountPath string, volumeC
 	consumers := ns.podsUsingPVC(pvcNamespace, pvcName)
 	fsGroup := fsGroupFromPods(consumers)
 
-	// Detach the dead FUSE mount (if any) so a fresh mount can take the path.
-	_ = exec.Command("umount", "-l", globalmountPath).Run()
-
 	// Drop any stale in-memory manager, stopping its cache monitor first so it
 	// doesn't keep evicting the cache dir the fresh mount is about to own.
 	ns.s3SyncMgr.mutex.Lock()
@@ -532,6 +534,12 @@ func (ns *NodeServer) reconcileS3Mount(volumeID, globalmountPath string, volumeC
 	}
 	delete(ns.s3SyncMgr.mountManagers, volumeID)
 	ns.s3SyncMgr.mutex.Unlock()
+
+	// Shut down the old librclone session (VFS.Shutdown) before the kernel
+	// detach: a bare umount -l leaves the old VFS alive in rclone's registry,
+	// writing the shared cache dir and able to unmount the fresh mount later.
+	rclone.UnmountDead(globalmountPath)
+	_ = exec.Command("umount", "-l", globalmountPath).Run()
 
 	if err := os.MkdirAll(globalmountPath, 0777); err != nil {
 		klog.Warningf("Volume %s: failed to ensure globalmount dir: %v", volumeID, err)
@@ -559,7 +567,7 @@ func (ns *NodeServer) reconcileS3Mount(volumeID, globalmountPath string, volumeC
 		// Re-point the consumer's stale bind at the fresh globalmount.
 		rebound := ns.rebindConsumerMount(globalmountPath, string(pod.UID), pvName, fsGroup)
 
-		if podSelfHealsViaPropagation(pod, pvcName) && ns.consumerMountHealthy(string(pod.UID), pvName) {
+		if podSelfHealsViaPropagation(pod, pvcName) && ns.consumerMountHealthy(string(pod.UID), pvName, globalmountPath) {
 			klog.Infof("Pod %s/%s self-healed via mount propagation for volume %s; left running",
 				pod.Namespace, pod.Name, volumeID)
 			continue
@@ -687,20 +695,28 @@ func cgroupBelongsToPod(cgroup, podUID string) bool {
 		strings.Contains(cgroup, "pod"+strings.ReplaceAll(podUID, "-", "_"))
 }
 
-// consumerMountHealthy reports whether the re-mount reached a consumer pod's CSI
-// mount path on the host (statfs not ENOTCONN/ESTALE), retrying briefly to let
-// mount propagation settle. ENOENT means the pod isn't published here.
-func (ns *NodeServer) consumerMountHealthy(podUID, pvName string) bool {
+// consumerMountHealthy reports whether the re-mount reached a consumer pod's
+// CSI mount path: the bind must be backed by the same superblock (st_dev) as
+// the repaired globalmount — statfs alone is FUSE-local and passes on a bind
+// still pointing at a detached dead mount. ENOENT means not published here.
+func (ns *NodeServer) consumerMountHealthy(podUID, pvName, globalmountPath string) bool {
 	if pvName == "" {
 		return false
 	}
 	mountPath := filepath.Join(resolveKubeletRoot(), "pods", podUID,
 		"volumes", "kubernetes.io~csi", pvName, "mount")
 
+	var want syscall.Stat_t
+	if err := syscall.Stat(globalmountPath, &want); err != nil {
+		return false
+	}
 	for attempt := 0; attempt < 6; attempt++ {
-		var st syscall.Statfs_t
-		err := syscall.Statfs(mountPath, &st)
-		if err == nil || errors.Is(err, syscall.ENOENT) {
+		var got syscall.Stat_t
+		err := syscall.Stat(mountPath, &got)
+		if errors.Is(err, syscall.ENOENT) {
+			return true
+		}
+		if err == nil && got.Dev == want.Dev {
 			return true
 		}
 		time.Sleep(250 * time.Millisecond)
@@ -966,7 +982,7 @@ func (ns *NodeServer) forceDeletePod(ctx context.Context, pod *corev1.Pod) {
 	}
 }
 
-// mountVFSResponsive reports whether a FUSE mount can serve a directory read,
+// mountVFSResponsive reports whether a FUSE mount can serve real reads,
 // catching a cancelled-VFS zombie that passes statfs but fails real ops. Times
 // out as healthy (slow backend), and runs one probe per path at a time.
 func (ns *NodeServer) mountVFSResponsive(globalmountPath string) bool {
@@ -977,25 +993,72 @@ func (ns *NodeServer) mountVFSResponsive(globalmountPath string) bool {
 	done := make(chan error, 1)
 	go func() {
 		defer ns.vfsProbesInFlight.Delete(globalmountPath)
-		f, err := os.Open(globalmountPath)
-		if err != nil {
-			done <- err
-			return
-		}
-		_, err = f.Readdirnames(1)
-		_ = f.Close()
-		if err == io.EOF { // empty directory is healthy
-			err = nil
-		}
-		done <- err
+		done <- probeMountReads(globalmountPath)
 	}()
 
 	select {
 	case err := <-done:
 		return err == nil
-	case <-time.After(3 * time.Second):
+	case <-time.After(5 * time.Second):
 		return true
 	}
+}
+
+// isMountDeadErr matches errnos that indicate a dead or zombie mount rather
+// than a normal filesystem condition.
+func isMountDeadErr(err error) bool {
+	return errors.Is(err, syscall.EIO) || errors.Is(err, syscall.ENOTCONN) || errors.Is(err, syscall.ESTALE)
+}
+
+// probeMountReads exercises a mount past the dir cache: lists directories
+// breadth-first (depth ≤3, bounded fan-out) and opens the first regular file
+// found — a cached listing can succeed while a zombie VFS fails every open.
+func probeMountReads(root string) error {
+	dirs := []string{root}
+	for depth := 0; depth < 3 && len(dirs) > 0; depth++ {
+		var next []string
+		for _, dir := range dirs {
+			d, err := os.Open(dir)
+			if err != nil {
+				if isMountDeadErr(err) {
+					return err
+				}
+				continue
+			}
+			entries, err := d.ReadDir(512)
+			_ = d.Close()
+			if err != nil && err != io.EOF {
+				if isMountDeadErr(err) {
+					return err
+				}
+				continue
+			}
+			for _, e := range entries {
+				p := filepath.Join(dir, e.Name())
+				if e.IsDir() {
+					if len(next) < 8 {
+						next = append(next, p)
+					}
+					continue
+				}
+				if !e.Type().IsRegular() {
+					continue
+				}
+				f, err := os.Open(p)
+				if err != nil {
+					if isMountDeadErr(err) {
+						return err
+					}
+					continue
+				}
+				_ = f.Close()
+				return nil
+			}
+		}
+		dirs = next
+	}
+	// No regular file reachable (e.g. empty volume): listings sufficed.
+	return nil
 }
 
 // isFUSEMountPoint checks if the path has a FUSE mount by reading /proc/mounts.

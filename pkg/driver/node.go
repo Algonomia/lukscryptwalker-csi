@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -585,9 +587,10 @@ func (ns *NodeServer) unmountPath(targetPath string) error {
 		return nil
 	}
 
-	// Check for stale FUSE mount (transport endpoint not connected)
-	isStale := statErr != nil && (strings.Contains(statErr.Error(), "transport endpoint is not connected") ||
-		strings.Contains(statErr.Error(), "stale file handle"))
+	// Stale FUSE mount: dead daemon (ENOTCONN/ESTALE) or aborted/zombie
+	// connection (EIO) — only a lazy unmount can detach it.
+	isStale := statErr != nil && (errors.Is(statErr, syscall.ENOTCONN) ||
+		errors.Is(statErr, syscall.ESTALE) || errors.Is(statErr, syscall.EIO))
 
 	if isStale {
 		klog.Warningf("Detected stale mount at %s, using lazy unmount", targetPath)

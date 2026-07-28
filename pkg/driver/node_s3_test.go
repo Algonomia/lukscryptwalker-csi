@@ -1,6 +1,9 @@
 package driver
 
 import (
+	"os"
+	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -40,6 +43,65 @@ func TestPodStuckTerminating(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestIsMountDeadErr(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"EIO", &os.PathError{Op: "open", Path: "/x", Err: syscall.EIO}, true},
+		{"ENOTCONN", &os.PathError{Op: "stat", Path: "/x", Err: syscall.ENOTCONN}, true},
+		{"ESTALE", &os.PathError{Op: "read", Path: "/x", Err: syscall.ESTALE}, true},
+		{"ENOENT", &os.PathError{Op: "open", Path: "/x", Err: syscall.ENOENT}, false},
+		{"EACCES", &os.PathError{Op: "open", Path: "/x", Err: syscall.EACCES}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isMountDeadErr(c.err); got != c.want {
+				t.Errorf("isMountDeadErr(%v) = %v, want %v", c.err, got, c.want)
+			}
+		})
+	}
+}
+
+func TestProbeMountReads(t *testing.T) {
+	t.Run("finds file at depth 2", func(t *testing.T) {
+		root := t.TempDir()
+		sub := filepath.Join(root, "archive", "db")
+		if err := os.MkdirAll(sub, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(sub, "archive.info"), []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := probeMountReads(root); err != nil {
+			t.Errorf("probeMountReads() = %v, want nil", err)
+		}
+	})
+
+	t.Run("empty volume is healthy", func(t *testing.T) {
+		if err := probeMountReads(t.TempDir()); err != nil {
+			t.Errorf("probeMountReads() = %v, want nil", err)
+		}
+	})
+
+	t.Run("dirs only, no regular file", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(root, "a", "b", "c", "d"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := probeMountReads(root); err != nil {
+			t.Errorf("probeMountReads() = %v, want nil", err)
+		}
+	})
+
+	t.Run("missing root is healthy (not a dead-mount errno)", func(t *testing.T) {
+		if err := probeMountReads(filepath.Join(t.TempDir(), "gone")); err != nil {
+			t.Errorf("probeMountReads() = %v, want nil", err)
+		}
+	})
 }
 
 func TestCgroupBelongsToPod(t *testing.T) {

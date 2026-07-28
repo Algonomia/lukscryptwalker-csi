@@ -4,14 +4,21 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"k8s.io/klog"
 )
+
+// mountGeneration makes each mount's VFS options unique so rclone's vfs.New
+// never reuses a leaked VFS (same fs + identical options) from an unclean
+// unmount — a reused cancelled VFS serves EIO on every open.
+var mountGeneration atomic.Int64
 
 // VFSCacheConfig holds VFS cache and directory-metadata configuration options
 type VFSCacheConfig struct {
@@ -186,6 +193,8 @@ func (mm *MountManager) Mount() error {
 	// Persist the vfsName mapping for orphan cleanup across restarts
 	SaveVFSName(mm.volumeID, mm.vfsName)
 
+	mm.warnOnDuplicateVFS()
+
 	mm.mounted = true
 	klog.Infof("Successfully mounted encrypted S3 volume %s at %s", mm.volumeID, mm.mountPoint)
 
@@ -258,12 +267,17 @@ func (mm *MountManager) buildVFSOpt() map[string]interface{} {
 		}
 	}
 
-	// Cache poll interval - how often to check for stale cache entries
+	// Cache poll interval - how often to check for stale cache entries.
+	// Always set, with a per-mount nanosecond uniquifier: identical options
+	// would make vfs.New reuse a leaked VFS from an unclean unmount, whose
+	// cancelled context serves EIO on every open.
+	pollNs := int64(60 * time.Second) // rclone default 1m
 	if mm.vfsConfig.CachePollInterval != "" {
 		if ns, err := parseDurationToNs(mm.vfsConfig.CachePollInterval); err == nil {
-			vfsOpt["CachePollInterval"] = ns
+			pollNs = ns
 		}
 	}
+	vfsOpt["CachePollInterval"] = pollNs + mountGeneration.Add(1)
 
 	return vfsOpt
 }
@@ -292,10 +306,12 @@ func (mm *MountManager) Unmount() error {
 			// rclone self-unmounted (e.g. VFS error); already gone, not a failure.
 			klog.Infof("Volume %s: mount already gone when calling mount/unmount — rclone self-unmounted", mm.volumeID)
 		} else {
-			klog.Warningf("mount/unmount RPC failed: %v", err)
-			_, err = RPC("mount/unmountall", map[string]interface{}{})
-			if err != nil {
-				klog.Warningf("Failed to unmount rclone: %v", err)
+			// The RPC ran VFS.Shutdown before the kernel unmount failed; only the
+			// kernel detach remains. Never fall back to mount/unmountall — it
+			// tears down every volume's mount on the node.
+			klog.Warningf("Volume %s: mount/unmount RPC failed: %v — detaching kernel mount directly", mm.volumeID, err)
+			if out, uerr := exec.Command("umount", "-l", mm.mountPoint).CombinedOutput(); uerr != nil {
+				klog.Warningf("Volume %s: umount -l %s failed: %v (%s)", mm.volumeID, mm.mountPoint, uerr, strings.TrimSpace(string(out)))
 			}
 		}
 	}
@@ -312,6 +328,22 @@ func (mm *MountManager) Unmount() error {
 
 	klog.Infof("Successfully unmounted encrypted S3 volume %s", mm.volumeID)
 	return nil
+}
+
+// UnmountDead tears down a dead/zombie librclone mount without a MountManager.
+// Unlike a bare `umount -l`, mount/unmount runs VFS.Shutdown, dropping the VFS
+// from rclone's active registry and stopping its cache writers.
+func UnmountDead(mountPoint string) {
+	if _, err := RPC("mount/unmount", map[string]interface{}{"mountPoint": mountPoint}); err != nil {
+		if strings.Contains(err.Error(), "mount not found") {
+			klog.V(4).Infof("UnmountDead %s: no live rclone mount entry", mountPoint)
+		} else {
+			// VFS.Shutdown still ran; the caller's umount -l completes the detach.
+			klog.Warningf("UnmountDead %s: mount/unmount RPC failed: %v", mountPoint, err)
+		}
+	} else {
+		klog.Infof("UnmountDead %s: old librclone session shut down cleanly", mountPoint)
+	}
 }
 
 // waitForPendingUploads polls vfs/stats until the write-back queue is empty.
@@ -357,6 +389,14 @@ func (mm *MountManager) waitForPendingUploads() bool {
 			if isNoVFSError(err) {
 				klog.Warningf("Volume %s: mount has no VFS in this driver instance (orphaned after a restart); "+
 					"stopping drain, preserving cache for re-mount", mm.volumeID)
+				return false
+			}
+			// Queue state unobservable while an orphaned VFS shares the name;
+			// retrying can't resolve it. Preserve the cache — the next mount's
+			// reload re-uploads anything still dirty.
+			if isAmbiguousVFSError(err) {
+				klog.Warningf("Volume %s: duplicate VFS registered for this fs (leaked orphan); "+
+					"stopping drain, preserving cache for re-mount: %v", mm.volumeID, err)
 				return false
 			}
 			consecutiveRPCFailures++
@@ -407,7 +447,9 @@ func (mm *MountManager) IsUploadQueueEmpty() bool {
 	if err != nil {
 		// Orphaned mount (no VFS in this instance): nothing to drain here, take
 		// the fast unmount path rather than starting an endless background drain.
-		if isNoVFSError(err) {
+		// Same for a duplicate-VFS name clash: the queue is unobservable, and the
+		// fast path's Unmount preserves the cache for reload to re-upload.
+		if isNoVFSError(err) || isAmbiguousVFSError(err) {
 			return true
 		}
 		return false // assume work pending on other RPC errors
@@ -708,6 +750,39 @@ func (mm *MountManager) IsMounted() bool {
 // by a previous driver instance, not a transient RPC failure.
 func isNoVFSError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "no VFS found")
+}
+
+// isAmbiguousVFSError reports whether an rclone RPC error means two VFSs share
+// the fs name — a leaked orphan alongside the live one. Terminal until a driver
+// restart clears the orphan; the live VFS itself keeps working.
+func isAmbiguousVFSError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "more than one VFS active")
+}
+
+// warnOnDuplicateVFS logs when rclone has more than one VFS registered under
+// this volume's fs name (listed as "name:[i]") — a leaked orphan from an
+// unclean unmount that makes vfs/* RPCs ambiguous until the driver restarts.
+func (mm *MountManager) warnOnDuplicateVFS() {
+	result, err := RPC("vfs/list", map[string]interface{}{})
+	if err != nil || result == nil || result.Output == nil {
+		return
+	}
+	names, ok := result.Output["vfses"].([]interface{})
+	if !ok {
+		return
+	}
+	prefix := mm.cryptConfigName + ":"
+	count := 0
+	for _, n := range names {
+		if s, ok := n.(string); ok && (s == prefix || strings.HasPrefix(s, prefix+"[")) {
+			count++
+		}
+	}
+	if count > 1 {
+		klog.Warningf("Volume %s: %d VFS instances registered for %s — leaked orphan from an unclean unmount; "+
+			"vfs/* RPCs for this volume are ambiguous until the driver restarts (dirty-cache upload resume is unaffected)",
+			mm.volumeID, count, prefix)
+	}
 }
 
 // durationOrDefault parses a duration string to nanoseconds, falling back to
