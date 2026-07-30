@@ -473,6 +473,27 @@ func (mm *MountManager) IsUploadQueueEmpty() bool {
 	return false
 }
 
+// uploadQueueConfirmedEmpty reports whether vfs/stats definitively shows an
+// empty upload queue. Any error (no VFS, duplicate VFS, RPC failure) or a
+// missing diskCache section is NOT confirmation — callers gating destructive
+// actions must treat the queue as pending.
+func (mm *MountManager) uploadQueueConfirmedEmpty() bool {
+	if !mm.isMountPoint() {
+		return false
+	}
+	result, err := RPC("vfs/stats", map[string]interface{}{"fs": mm.cryptConfigName + ":"})
+	if err != nil || result == nil || result.Output == nil {
+		return false
+	}
+	dc, ok := result.Output["diskCache"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	inProgress, ok1 := dc["uploadsInProgress"].(float64)
+	queued, ok2 := dc["uploadsQueued"].(float64)
+	return ok1 && ok2 && inProgress == 0 && queued == 0
+}
+
 func (mm *MountManager) isMountPoint() bool {
 	data, err := os.ReadFile("/proc/mounts")
 	if err != nil {
@@ -625,8 +646,10 @@ func (mm *MountManager) cacheMonitor() {
 // have no open file descriptors and are not actively being transferred.
 func (mm *MountManager) evictCacheIfNeeded(cacheDir string, maxBytes int64) {
 	// Never evict while anything is dirty: write-back-queued files aren't
-	// "transferring" yet but aren't on S3 either.
-	if mm.hasActiveTransfers() || !mm.IsUploadQueueEmpty() {
+	// "transferring" yet but aren't on S3 either. Requires a CONFIRMED empty
+	// queue — when vfs/stats can't answer (no VFS, duplicate VFS), evicting
+	// blind can delete dirty-but-closed cache files.
+	if mm.hasActiveTransfers() || !mm.uploadQueueConfirmedEmpty() {
 		return
 	}
 

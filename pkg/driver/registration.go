@@ -67,10 +67,15 @@ func (ns *NodeServer) RunRegistrationHealthServer(addr string) {
 		_, _ = w.Write([]byte("driver not registered with kubelet"))
 	})
 
+	// Retry forever: with hostNetwork a stuck-terminating predecessor pod can
+	// hold the port; self-heal the moment it dies instead of giving up.
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	klog.Infof("Registration health server listening on %s", addr)
-	if err := srv.ListenAndServe(); err != nil {
-		klog.Errorf("Registration health server stopped: %v", err)
+	for {
+		klog.Infof("Registration health server listening on %s", addr)
+		if err := srv.ListenAndServe(); err != nil {
+			klog.Errorf("Registration health server stopped: %v (retrying in 10s)", err)
+		}
+		time.Sleep(10 * time.Second)
 	}
 }
 

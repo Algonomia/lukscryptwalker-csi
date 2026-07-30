@@ -1115,6 +1115,58 @@ func abortFUSEConnection(mountPoint string) {
 	}
 }
 
+// abortOrphanedFUSEConnections aborts FUSE connections whose superblock is not
+// mounted in any mount namespace on the host — detached remnants of dead
+// mounts whose queued requests hold processes (typically a terminating
+// predecessor driver pod, which then wedges holding our ports) in
+// uninterruptible sleep. Runs once at startup; needs hostPID and writable /sys.
+func abortOrphanedFUSEConnections() {
+	conns, err := os.ReadDir("/sys/fs/fuse/connections")
+	if err != nil || len(conns) == 0 {
+		return
+	}
+
+	// Collect anon-device minors mounted in ANY mount namespace (deduped via
+	// ns links), so another container's private FUSE is never called orphaned.
+	mounted := map[string]bool{}
+	procs, _ := os.ReadDir("/proc")
+	seenNS := map[string]bool{}
+	for _, p := range procs {
+		if _, err := strconv.Atoi(p.Name()); err != nil {
+			continue
+		}
+		nsLink, err := os.Readlink("/proc/" + p.Name() + "/ns/mnt")
+		if err != nil || seenNS[nsLink] {
+			continue
+		}
+		seenNS[nsLink] = true
+		data, err := os.ReadFile("/proc/" + p.Name() + "/mountinfo")
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 3 {
+				continue
+			}
+			if maj, minor, ok := strings.Cut(fields[2], ":"); ok && maj == "0" {
+				mounted[minor] = true
+			}
+		}
+	}
+
+	for _, c := range conns {
+		if !c.IsDir() || mounted[c.Name()] {
+			continue
+		}
+		abortPath := "/sys/fs/fuse/connections/" + c.Name() + "/abort"
+		if err := os.WriteFile(abortPath, []byte("1"), 0200); err == nil {
+			klog.Warningf("Aborted orphaned FUSE connection %s (detached superblock, mounted in no namespace) — "+
+				"releases processes wedged on dead mounts", c.Name())
+		}
+	}
+}
+
 // statfsProbe is a single-flight statfs whose result later callers can await.
 type statfsProbe struct {
 	done chan struct{}

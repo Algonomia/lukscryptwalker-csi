@@ -82,6 +82,7 @@ func NewNodeServer(d *Driver) *NodeServer {
 
 	// Run startup cleanup asynchronously to avoid delaying CSI driver registration
 	go func() {
+		abortOrphanedFUSEConnections()
 		ns.cleanupStaleS3Mounts()
 		ns.cleanupOrphanedVFSCacheDirs()
 		ns.cleanupOrphanedVolumes()
@@ -98,7 +99,15 @@ func (ns *NodeServer) runStaleS3MountChecker() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
+	tick := 0
 	for range ticker.C {
+		// Every 5 minutes, release processes wedged on dead mounts — a stuck
+		// predecessor holding our sidecars' ports otherwise blocks pod
+		// recovery until a driver restart.
+		if tick%10 == 0 {
+			abortOrphanedFUSEConnections()
+		}
+		tick++
 		ns.cleanupStaleS3Mounts()
 	}
 }
