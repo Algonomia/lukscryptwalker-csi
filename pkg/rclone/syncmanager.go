@@ -332,18 +332,22 @@ func (mm *MountManager) Unmount() error {
 
 // UnmountDead tears down a dead/zombie librclone mount without a MountManager.
 // Unlike a bare `umount -l`, mount/unmount runs VFS.Shutdown, dropping the VFS
-// from rclone's active registry and stopping its cache writers.
-func UnmountDead(mountPoint string) {
+// from rclone's active registry and stopping its cache writers. Returns true
+// when a live session was found — its Wait() finalizer fires asynchronously
+// and will unmount whatever is at the path when it runs, so the caller must
+// let it fire against an empty path before mounting fresh.
+func UnmountDead(mountPoint string) bool {
 	if _, err := RPC("mount/unmount", map[string]interface{}{"mountPoint": mountPoint}); err != nil {
 		if strings.Contains(err.Error(), "mount not found") {
 			klog.V(4).Infof("UnmountDead %s: no live rclone mount entry", mountPoint)
-		} else {
-			// VFS.Shutdown still ran; the caller's umount -l completes the detach.
-			klog.Warningf("UnmountDead %s: mount/unmount RPC failed: %v", mountPoint, err)
+			return false
 		}
-	} else {
-		klog.Infof("UnmountDead %s: old librclone session shut down cleanly", mountPoint)
+		// VFS.Shutdown still ran; the caller's umount -l completes the detach.
+		klog.Warningf("UnmountDead %s: mount/unmount RPC failed: %v", mountPoint, err)
+		return true
 	}
+	klog.Infof("UnmountDead %s: old librclone session shut down cleanly", mountPoint)
+	return true
 }
 
 // waitForPendingUploads polls vfs/stats until the write-back queue is empty.

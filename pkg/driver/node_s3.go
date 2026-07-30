@@ -550,7 +550,7 @@ func (ns *NodeServer) reconcileS3Mount(volumeID, globalmountPath string, volumeC
 	// Shut down the old librclone session (VFS.Shutdown) before the kernel
 	// detach: a bare umount -l leaves the old VFS alive in rclone's registry,
 	// writing the shared cache dir and able to unmount the fresh mount later.
-	rclone.UnmountDead(globalmountPath)
+	hadSession := rclone.UnmountDead(globalmountPath)
 	// Abort the kernel FUSE connection: a wedged serve loop leaves stat/open
 	// callers in uninterruptible sleep, and only the abort releases them.
 	abortFUSEConnection(globalmountPath)
@@ -560,13 +560,46 @@ func (ns *NodeServer) reconcileS3Mount(volumeID, globalmountPath string, volumeC
 		klog.Warningf("Volume %s: failed to ensure globalmount dir: %v", volumeID, err)
 	}
 
-	if err := ns.setupS3Sync(volumeID, globalmountPath, volumeContext, nil, fsGroup); err != nil {
-		klog.Errorf("Volume %s: in-place re-mount failed (%v); falling back to remove + restart all consumers", volumeID, err)
-		_ = os.RemoveAll(globalmountPath)
-		ns.restartPodsWithStaleS3Mount(volumeID)
+	// The old session's Wait() finalizer fires asynchronously after its serve
+	// loop exits, and unmounts whatever it finds at the path ("Unmounted
+	// rclone mount"). Mount only after it has fired against the empty path,
+	// and verify the fresh mount survived before touching consumers.
+	mounted := false
+	for attempt := 0; attempt < 2; attempt++ {
+		if hadSession || attempt > 0 {
+			time.Sleep(2 * time.Second)
+		}
+		if err := ns.setupS3Sync(volumeID, globalmountPath, volumeContext, nil, fsGroup); err != nil {
+			klog.Errorf("Volume %s: in-place re-mount failed (%v); falling back to remove + restart all consumers", volumeID, err)
+			_ = os.RemoveAll(globalmountPath)
+			ns.restartPodsWithStaleS3Mount(volumeID)
+			return
+		}
+		time.Sleep(1 * time.Second)
+		if ns.isFUSEMountPoint(globalmountPath) {
+			mounted = true
+			break
+		}
+		klog.Warningf("Volume %s: fresh mount was unmounted from under us (previous session's finalizer); retrying",
+			volumeID)
+		ns.s3SyncMgr.mutex.Lock()
+		if old := ns.s3SyncMgr.mountManagers[volumeID]; old != nil {
+			old.StopCacheMonitor()
+		}
+		delete(ns.s3SyncMgr.mountManagers, volumeID)
+		ns.s3SyncMgr.mutex.Unlock()
+		hadSession = rclone.UnmountDead(globalmountPath)
+	}
+	if !mounted {
+		klog.Errorf("Volume %s: fresh mount did not survive; leaving consumers alone, next checker tick retries", volumeID)
 		return
 	}
 	klog.Infof("Volume %s: re-mounted in-process; re-attaching consumers", volumeID)
+
+	// Destructive recovery (container kills / pod deletes) at most once per
+	// cooldown per volume: a reconcile loop must degrade to log noise, never
+	// to repeatedly killing consumers.
+	restartBudget := ns.consumerRestartAllowed(volumeID)
 
 	for i := range consumers {
 		pod := &consumers[i]
@@ -587,6 +620,11 @@ func (ns *NodeServer) reconcileS3Mount(volumeID, globalmountPath string, volumeC
 				pod.Namespace, pod.Name, volumeID)
 			continue
 		}
+		if !restartBudget {
+			klog.Warningf("Pod %s/%s: needs restart for volume %s but consumers were restarted recently; skipping this cycle",
+				pod.Namespace, pod.Name, volumeID)
+			continue
+		}
 		// Re-bind failed: only a full re-publish (pod delete) can recover it.
 		if !rebound {
 			klog.Warningf("Pod %s/%s: re-bind failed for volume %s; deleting to force re-publish",
@@ -598,6 +636,24 @@ func (ns *NodeServer) reconcileS3Mount(volumeID, globalmountPath string, volumeC
 			pod.Namespace, pod.Name, volumeID)
 		ns.recoverConsumerPod(pod)
 	}
+}
+
+// consumerRestartCooldown bounds how often reconcile may destructively recover
+// a volume's consumers.
+const consumerRestartCooldown = 5 * time.Minute
+
+// consumerRestartAllowed reports whether destructive consumer recovery is
+// allowed for the volume, stamping the cooldown when it is.
+func (ns *NodeServer) consumerRestartAllowed(volumeID string) bool {
+	if t, ok := ns.consumerRestartTimes.Load(volumeID); ok {
+		if since := time.Since(t.(time.Time)); since < consumerRestartCooldown {
+			klog.Warningf("Volume %s: consumers were destructively recovered %s ago (cooldown %s)",
+				volumeID, since.Round(time.Second), consumerRestartCooldown)
+			return false
+		}
+	}
+	ns.consumerRestartTimes.Store(volumeID, time.Now())
+	return true
 }
 
 // rebindConsumerMount re-points a consumer's stale CSI bind mount at the freshly

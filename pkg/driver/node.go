@@ -57,6 +57,9 @@ type NodeServer struct {
 	// statfsProbesInFlight likewise caps the checker's statfs probe: a wedged
 	// FUSE blocks statfs in D-state, and an unbounded call freezes the checker.
 	statfsProbesInFlight sync.Map
+	// consumerRestartTimes (volumeID → time.Time) rate-limits destructive
+	// consumer recovery so a reconcile loop can never kill pods repeatedly.
+	consumerRestartTimes sync.Map
 }
 
 // NewNodeServer creates a new NodeServer instance
