@@ -7,9 +7,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"k8s.io/klog"
@@ -190,6 +192,12 @@ func (mm *MountManager) Mount() error {
 		return fmt.Errorf("failed to mount: %w", err)
 	}
 
+	// The /dev/fuse fd arrives from fusermount3 via SCM_RIGHTS without
+	// CLOEXEC: exec'd children (umount, nsenter…) inherit it, and one stuck
+	// child keeps the connection alive past our death — wedging the mount in
+	// D-state for every accessor instead of failing fast with ENOTCONN.
+	setFuseFdsCloexec()
+
 	// Persist the vfsName mapping for orphan cleanup across restarts
 	SaveVFSName(mm.volumeID, mm.vfsName)
 
@@ -328,6 +336,29 @@ func (mm *MountManager) Unmount() error {
 
 	klog.Infof("Successfully unmounted encrypted S3 volume %s", mm.volumeID)
 	return nil
+}
+
+// setFuseFdsCloexec marks every /dev/fuse fd in this process close-on-exec.
+// SCM_RIGHTS-received fds bypass Go's CLOEXEC convention; called after each
+// mount so no exec'd child can extend a FUSE connection past our death.
+func setFuseFdsCloexec() {
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		target, err := os.Readlink("/proc/self/fd/" + e.Name())
+		if err != nil || target != "/dev/fuse" {
+			continue
+		}
+		fd, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		if _, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd), syscall.F_SETFD, syscall.FD_CLOEXEC); errno != 0 {
+			klog.Warningf("Failed to set CLOEXEC on fuse fd %d: %v", fd, errno)
+		}
+	}
 }
 
 // UnmountDead tears down a dead/zombie librclone mount without a MountManager.
