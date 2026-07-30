@@ -416,6 +416,13 @@ func resolveKubeletRoot() string {
 // an unclean shutdown (e.g., OOM kill). For S3 volumes, it attempts to restore
 // the mount instead of just unmounting to keep existing pods working.
 func (ns *NodeServer) cleanupStaleS3Mounts() {
+	// During a node-wide I/O stall every mount looks dead; recovering them
+	// mid-stall kills healthy consumers and adds churn. Wait the wave out.
+	if pct, stalled := nodeIOStalled(); stalled {
+		klog.Warningf("Node I/O is stalling (PSI full avg10=%.0f%%); deferring stale-mount recovery this tick", pct)
+		return
+	}
+
 	kubeletRoot := resolveKubeletRoot()
 	csiPluginPath := kubeletRoot + "/plugins/kubernetes.io/csi/" + DriverName
 	klog.Infof("Checking for stale/missing S3 mounts in %s", csiPluginPath)
@@ -554,7 +561,7 @@ func (ns *NodeServer) reconcileS3Mount(volumeID, globalmountPath string, volumeC
 	// Abort the kernel FUSE connection: a wedged serve loop leaves stat/open
 	// callers in uninterruptible sleep, and only the abort releases them.
 	abortFUSEConnection(globalmountPath)
-	_ = exec.Command("umount", "-l", globalmountPath).Run()
+	_ = runCmdBounded(30*time.Second, "umount", "-l", globalmountPath)
 
 	if err := os.MkdirAll(globalmountPath, 0777); err != nil {
 		klog.Warningf("Volume %s: failed to ensure globalmount dir: %v", volumeID, err)
@@ -671,7 +678,7 @@ func (ns *NodeServer) rebindConsumerMount(globalmountPath, podUID, pvName string
 		return true // not published on this node; nothing stale to re-point
 	}
 
-	_ = exec.Command("umount", "-l", targetPath).Run()
+	_ = runCmdBounded(30*time.Second, "umount", "-l", targetPath)
 	if err := ns.bindMount(globalmountPath, targetPath, false, fsGroup); err != nil {
 		klog.Warningf("Pod %s: failed to re-bind CSI mount %s to %s: %v",
 			podUID, globalmountPath, targetPath, err)
@@ -691,7 +698,7 @@ func (ns *NodeServer) unbindTerminatingConsumer(podUID, pvName string) {
 	if _, err := os.Stat(filepath.Dir(targetPath)); err != nil {
 		return // not published on this node
 	}
-	_ = exec.Command("umount", "-l", targetPath).Run()
+	_ = runCmdBounded(30*time.Second, "umount", "-l", targetPath)
 }
 
 // recoverConsumerPod restarts the pod's containers in place so they re-bind the
@@ -943,8 +950,7 @@ func (ns *NodeServer) restartPodsWithStaleS3Mount(volumeID string) {
 			klog.Infof("Found pod %s using S3 volume %s, cleaning up mount and triggering restart", podUID, volumeID)
 
 			// Unmount the pod's bind mount (may be stale or pointing to old staging)
-			umountCmd := exec.Command("umount", "-l", mountPath)
-			if err := umountCmd.Run(); err != nil {
+			if err := runCmdBounded(30*time.Second, "umount", "-l", mountPath); err != nil {
 				klog.V(4).Infof("umount -l for pod mount %s: %v (may already be unmounted)", mountPath, err)
 			}
 
@@ -1113,6 +1119,57 @@ func abortFUSEConnection(mountPoint string) {
 		}
 		return
 	}
+}
+
+// runCmdBounded runs a command with a hard timeout, returning without waiting
+// on a child wedged in uninterruptible sleep (stalled disk, dead mount) — the
+// caller's goroutine must never hang on node-level I/O stalls.
+func runCmdBounded(timeout time.Duration, name string, arg ...string) error {
+	cmd := exec.Command(name, arg...)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		_ = cmd.Process.Kill()
+		return fmt.Errorf("%s %v timed out after %s", name, arg, timeout)
+	}
+}
+
+// ioStallThresholdPct is the PSI io "full avg10" percentage above which the
+// node is considered mid-stall.
+const ioStallThresholdPct = 40.0
+
+// nodeIOStalled reports whether the node is in an I/O stall wave: mounts
+// probed during a stall look dead, and destructive recovery then only adds
+// churn to a node that needs quiet.
+func nodeIOStalled() (float64, bool) {
+	data, err := os.ReadFile("/proc/pressure/io")
+	if err != nil {
+		return 0, false
+	}
+	return parseIOPressure(string(data))
+}
+
+// parseIOPressure extracts the "full avg10" percentage from PSI io content.
+func parseIOPressure(s string) (float64, bool) {
+	for _, line := range strings.Split(s, "\n") {
+		if !strings.HasPrefix(line, "full ") {
+			continue
+		}
+		for _, f := range strings.Fields(line) {
+			if v, ok := strings.CutPrefix(f, "avg10="); ok {
+				if pct, err := strconv.ParseFloat(v, 64); err == nil {
+					return pct, pct >= ioStallThresholdPct
+				}
+			}
+		}
+	}
+	return 0, false
 }
 
 // abortOrphanedFUSEConnections aborts FUSE connections whose superblock is not
@@ -1326,8 +1383,7 @@ func (ns *NodeServer) getS3VolumeContext(ctx context.Context, volumeID string) m
 
 // unmountStaleS3Mount unmounts a stale FUSE mount and cleans up the directory
 func (ns *NodeServer) unmountStaleS3Mount(mountPath string) {
-	umountCmd := exec.Command("umount", "-l", mountPath)
-	if err := umountCmd.Run(); err != nil {
+	if err := runCmdBounded(30*time.Second, "umount", "-l", mountPath); err != nil {
 		klog.Warningf("umount -l failed for %s: %v", mountPath, err)
 	}
 

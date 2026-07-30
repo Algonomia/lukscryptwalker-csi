@@ -4,11 +4,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	stdlog "log"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 
+	"github.com/lukscryptwalker-csi/pkg/asynclog"
 	"github.com/lukscryptwalker-csi/pkg/driver"
 	"github.com/lukscryptwalker-csi/pkg/rclone"
 	"github.com/lukscryptwalker-csi/pkg/secrets"
@@ -41,6 +43,14 @@ func main() {
 		fmt.Printf("lukscryptwalker-csi version: %s\n", driver.GetVersion())
 		os.Exit(0)
 	}
+
+	// Route all logging through a never-blocking writer: when node I/O stalls,
+	// containerd's log pipe freezes, and a blocking stderr write would hold the
+	// global log mutex and freeze every goroutine — gRPC, probes, recovery.
+	alog := asynclog.New(os.Stderr, 4096)
+	_ = flag.Set("logtostderr", "false")
+	klog.SetOutput(alog)
+	stdlog.SetOutput(alog)
 
 	if *nodeID == "" {
 		klog.Fatal("NodeID cannot be empty")

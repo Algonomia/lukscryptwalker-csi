@@ -104,6 +104,28 @@ func TestProbeMountReads(t *testing.T) {
 	})
 }
 
+func TestParseIOPressure(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		wantPct float64
+		want    bool
+	}{
+		{"stalled node", "some avg10=96.75 avg60=96.49 avg300=96.35 total=3623495088\nfull avg10=87.98 avg60=86.86 avg300=86.77 total=3259639999\n", 87.98, true},
+		{"healthy node", "some avg10=0.12 avg60=0.05 avg300=0.01 total=1000\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=29\n", 0, false},
+		{"at threshold", "full avg10=40.00 avg60=1.00 avg300=1.00 total=1\n", 40.0, true},
+		{"garbage", "not psi content", 0, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			pct, stalled := parseIOPressure(c.content)
+			if stalled != c.want || (c.want && pct != c.wantPct) {
+				t.Errorf("parseIOPressure() = (%v, %v), want (%v, %v)", pct, stalled, c.wantPct, c.want)
+			}
+		})
+	}
+}
+
 func TestCgroupBelongsToPod(t *testing.T) {
 	const uid = "50949d73-f8ea-4bd3-be1b-a395eeec3361"
 	cases := []struct {

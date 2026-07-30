@@ -128,6 +128,10 @@ func (mm *MountManager) Mount() error {
 
 	klog.Infof("Mounting encrypted S3 volume %s at %s", mm.volumeID, mm.mountPoint)
 
+	// Quarantine unloadable cache items before rclone can serve them: one
+	// corrupt item blocks its readers forever and can stall the whole node.
+	ValidateVFSCache(mm.vfsName)
+
 	// Check for stale mount and try to clean it up
 	if mm.isMountPoint() {
 		klog.Warningf("Found stale mount at %s, attempting to unmount first", mm.mountPoint)
