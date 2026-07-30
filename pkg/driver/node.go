@@ -54,6 +54,9 @@ type NodeServer struct {
 	// vfsProbesInFlight caps the zombie-mount readdir probe at one goroutine
 	// per mount path, so a wedged FUSE can't leak one on every checker tick.
 	vfsProbesInFlight sync.Map
+	// statfsProbesInFlight likewise caps the checker's statfs probe: a wedged
+	// FUSE blocks statfs in D-state, and an unbounded call freezes the checker.
+	statfsProbesInFlight sync.Map
 }
 
 // NewNodeServer creates a new NodeServer instance
@@ -560,10 +563,22 @@ func (ns *NodeServer) ensureVolumeStaged(ctx context.Context, req *csi.NodePubli
 // System Operations
 // =============================================================================
 
-// isMountPoint checks if the given path is a mount point
+// isMountPoint checks if the given path is a mount point by reading
+// /proc/mounts — never stats the path, so a wedged FUSE mount (stuck serve
+// loop, open fd) cannot hang CSI handlers in uninterruptible sleep.
 func (ns *NodeServer) isMountPoint(path string) bool {
-	cmd := exec.Command("mountpoint", "-q", path)
-	return cmd.Run() == nil
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		klog.Warningf("Failed to read /proc/mounts: %v", err)
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[1] == path {
+			return true
+		}
+	}
+	return false
 }
 
 // isMountedFrom checks if the given path is mounted from the specified device

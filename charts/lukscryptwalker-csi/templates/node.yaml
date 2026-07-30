@@ -54,13 +54,15 @@ spec:
         livenessProbe:
           # The driver's registration-health endpoint: a lost registration
           # restarts only this registrar, not the driver or its mounts.
+          # Generous timeout/threshold so a throttled driver doesn't flap the
+          # registrar into a deregistration loop.
           httpGet:
             path: /healthz
             port: 9810
           initialDelaySeconds: 30
           periodSeconds: 10
-          timeoutSeconds: 3
-          failureThreshold: 3
+          timeoutSeconds: 5
+          failureThreshold: 5
         volumeMounts:
         - name: plugin-dir
           mountPath: /csi/
@@ -72,6 +74,9 @@ spec:
         args:
         - "--csi-address=/csi/csi.sock"
         - "--health-port={{ .Values.node.sidecars.livenessProbe.healthPort }}"
+        # Tolerate a CPU-throttled driver during backup windows: crypt+upload
+        # runs in-process, and a killed driver takes every FUSE mount with it.
+        - "--probe-timeout=10s"
         volumeMounts:
         - name: plugin-dir
           mountPath: /csi/
@@ -122,20 +127,25 @@ spec:
         # Both probes go through the livenessprobe sidecar, which calls the
         # CSI Probe() RPC — verifying the gRPC server responds, not just that
         # the socket file exists.
+        # Startup does an API secret fetch, stale loop/LUKS cleanup, cryptsetup
+        # open (memory-hard KDF) and ext4 mount — slower after unclean kills.
+        # 60s grace caused kill-during-startup restart loops; allow 120s.
         startupProbe:
           httpGet:
             path: /healthz
             port: healthz
-          failureThreshold: 30
+          failureThreshold: 60
           periodSeconds: 2
+        # Liveness-killing this container tears down every FUSE mount on the
+        # node; tolerate throttled-but-alive (backup windows), catch truly hung.
         livenessProbe:
           httpGet:
             path: /healthz
             port: healthz
           initialDelaySeconds: 10
           periodSeconds: 30
-          timeoutSeconds: 5
-          failureThreshold: 3
+          timeoutSeconds: 10
+          failureThreshold: 5
         {{- with .Values.node.resources }}
         resources:
           {{- toYaml . | nindent 10 }}

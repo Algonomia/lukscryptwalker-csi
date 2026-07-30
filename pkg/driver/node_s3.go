@@ -109,17 +109,22 @@ func (sm *S3SyncManager) finishBackgroundDrain(volumeID string) {
 	rclone.ClearDrainPending(volumeID)
 }
 
-func (sm *S3SyncManager) waitForBackgroundDrain(volumeID string, timeout time.Duration) {
+// waitForBackgroundDrain waits for the volume's background drain to finish.
+// Returns false on timeout — callers in CSI RPCs must fail fast and retryable
+// rather than blocking past kubelet's deadline.
+func (sm *S3SyncManager) waitForBackgroundDrain(volumeID string, timeout time.Duration) bool {
 	sm.drainMu.Lock()
 	done, ok := sm.backgroundDrains[volumeID]
 	sm.drainMu.Unlock()
 	if !ok {
-		return
+		return true
 	}
 	select {
 	case <-done:
+		return true
 	case <-time.After(timeout):
 		klog.Warningf("Volume %s: timed out waiting for background drain", volumeID)
+		return false
 	}
 }
 
@@ -216,10 +221,14 @@ func (ns *NodeServer) setupS3Sync(volumeID, stagingPath string, volumeContext ma
 	s3PathPrefix := volumeContext[S3PathPrefixParam]
 
 	// If a background drain is still running (previous pod terminated with
-	// uploads in progress), wait for it to finish before remounting.
+	// uploads in progress), wait briefly for it to finish before remounting.
+	// Never block past kubelet's CSI deadline (~2min): return a retryable
+	// error and let the drain finish in the background.
 	if ns.s3SyncMgr.isBackgroundDraining(volumeID) {
 		klog.Infof("Volume %s: waiting for background drain before remounting", volumeID)
-		ns.s3SyncMgr.waitForBackgroundDrain(volumeID, 30*time.Minute)
+		if !ns.s3SyncMgr.waitForBackgroundDrain(volumeID, 45*time.Second) {
+			return fmt.Errorf("volume %s: background drain still in progress, retry later", volumeID)
+		}
 	}
 
 	// Post-restart: a drain was in progress when the driver was killed. The
@@ -434,19 +443,22 @@ func (ns *NodeServer) cleanupStaleS3Mounts() {
 
 		// Probe with statfs, not stat: statfs is served locally by the FUSE layer
 		// (no S3 ListObjects on a healthy mount), while a dead daemon still
-		// surfaces as ENOTCONN/ESTALE.
-		var st syscall.Statfs_t
-		statErr := syscall.Statfs(globalmountPath, &st)
-		if errors.Is(statErr, syscall.ENOENT) {
+		// surfaces as ENOTCONN/ESTALE. Bounded: a wedged FUSE (stuck serve
+		// loop, open fd) blocks statfs in D-state forever — that must mark the
+		// mount stale, not freeze this checker.
+		statErr, timedOut := ns.statfsBounded(globalmountPath, 5*time.Second)
+		if !timedOut && errors.Is(statErr, syscall.ENOENT) {
 			// globalmount directory does not exist yet - nothing to clean up
 			continue
 		}
 
-		// Stale: ENOTCONN/ESTALE from a dead FUSE daemon, or EIO from an
-		// aborted connection / zombie VFS. Other errnos (e.g. EINTR) don't
-		// justify a disruptive reconcile — log and leave the mount alone.
-		isStaleFUSE := isMountDeadErr(statErr)
-		if statErr != nil && !isStaleFUSE {
+		// Stale: statfs timeout (wedged FUSE), ENOTCONN/ESTALE (dead daemon),
+		// or EIO (aborted connection / zombie VFS). Other errnos (e.g. EINTR)
+		// don't justify a disruptive reconcile — log and leave the mount alone.
+		isStaleFUSE := timedOut || isMountDeadErr(statErr)
+		if timedOut {
+			klog.Warningf("S3 mount %s: statfs blocked >5s (wedged FUSE); treating as stale", globalmountPath)
+		} else if statErr != nil && !isStaleFUSE {
 			klog.Warningf("S3 mount %s: unexpected statfs error (not reconciling): %v", globalmountPath, statErr)
 		}
 
@@ -456,7 +468,7 @@ func (ns *NodeServer) cleanupStaleS3Mounts() {
 
 		// statfs is FUSE-local, so a healthy-looking mount can be a cancelled-VFS
 		// zombie (real ops return EIO); probe it and reconcile if unresponsive.
-		if statErr == nil && !isMissingMount && !ns.mountVFSResponsive(globalmountPath) {
+		if !isStaleFUSE && statErr == nil && !isMissingMount && !ns.mountVFSResponsive(globalmountPath) {
 			klog.Warningf("S3 mount %s passes statfs but fails directory reads (cancelled-VFS zombie); reconciling", globalmountPath)
 			isStaleFUSE = true
 		}
@@ -539,6 +551,9 @@ func (ns *NodeServer) reconcileS3Mount(volumeID, globalmountPath string, volumeC
 	// detach: a bare umount -l leaves the old VFS alive in rclone's registry,
 	// writing the shared cache dir and able to unmount the fresh mount later.
 	rclone.UnmountDead(globalmountPath)
+	// Abort the kernel FUSE connection: a wedged serve loop leaves stat/open
+	// callers in uninterruptible sleep, and only the abort releases them.
+	abortFUSEConnection(globalmountPath)
 	_ = exec.Command("umount", "-l", globalmountPath).Run()
 
 	if err := os.MkdirAll(globalmountPath, 0777); err != nil {
@@ -1001,6 +1016,74 @@ func (ns *NodeServer) mountVFSResponsive(globalmountPath string) bool {
 		return err == nil
 	case <-time.After(5 * time.Second):
 		return true
+	}
+}
+
+// abortFUSEConnection aborts the kernel FUSE connection backing mountPoint via
+// /sys/fs/fuse/connections/<dev-minor>/abort. Pending and future requests fail
+// with ECONNABORTED, releasing D-state waiters a wedged serve loop stranded.
+// The device id comes from /proc/self/mountinfo, which never stats the mount.
+func abortFUSEConnection(mountPoint string) {
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		klog.Warningf("abortFUSEConnection %s: cannot read mountinfo: %v", mountPoint, err)
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		// fields: id parentid major:minor root mountpoint ... - fstype source opts
+		if len(fields) < 5 || fields[4] != mountPoint {
+			continue
+		}
+		sep := 0
+		for i, f := range fields {
+			if f == "-" {
+				sep = i
+				break
+			}
+		}
+		if sep == 0 || sep+1 >= len(fields) || !strings.HasPrefix(fields[sep+1], "fuse") {
+			continue
+		}
+		_, minor, ok := strings.Cut(fields[2], ":")
+		if !ok {
+			continue
+		}
+		abortPath := "/sys/fs/fuse/connections/" + minor + "/abort"
+		if err := os.WriteFile(abortPath, []byte("1"), 0200); err != nil {
+			klog.Warningf("abortFUSEConnection %s: write %s failed: %v", mountPoint, abortPath, err)
+		} else {
+			klog.Infof("abortFUSEConnection %s: aborted FUSE connection %s", mountPoint, minor)
+		}
+		return
+	}
+}
+
+// statfsProbe is a single-flight statfs whose result later callers can await.
+type statfsProbe struct {
+	done chan struct{}
+	err  error
+}
+
+// statfsBounded runs statfs with a timeout. A wedged FUSE blocks statfs in
+// uninterruptible sleep; one probe goroutine per path is kept, and callers
+// finding it in flight await the same result — no per-tick goroutine leak.
+func (ns *NodeServer) statfsBounded(path string, timeout time.Duration) (error, bool) {
+	v, loaded := ns.statfsProbesInFlight.LoadOrStore(path, &statfsProbe{done: make(chan struct{})})
+	p := v.(*statfsProbe)
+	if !loaded {
+		go func() {
+			var st syscall.Statfs_t
+			p.err = syscall.Statfs(path, &st)
+			ns.statfsProbesInFlight.Delete(path)
+			close(p.done)
+		}()
+	}
+	select {
+	case <-p.done:
+		return p.err, false
+	case <-time.After(timeout):
+		return nil, true
 	}
 }
 
