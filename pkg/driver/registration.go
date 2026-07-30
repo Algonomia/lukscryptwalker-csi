@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -18,7 +19,9 @@ import (
 // RegistrationHealthPort is where the driver serves its registration-health
 // endpoint; the node-driver-registrar's liveness probe targets it so a lost
 // registration restarts only the registrar, not the driver or its mounts.
-const RegistrationHealthPort = ":9810"
+// Loopback only: with hostNetwork the pod IP is the node's (possibly public)
+// IP, where a firewall can silently eat probe traffic.
+const RegistrationHealthPort = "127.0.0.1:9810"
 
 // registrationStartupGrace lets initial registration complete before the
 // endpoint can report unhealthy.
@@ -28,18 +31,34 @@ const registrationStartupGrace = 90 * time.Second
 // it to re-register the driver before reporting unhealthy.
 const kubeletRehandshakeGrace = 90 * time.Second
 
+// registrationCheckInterval is how often the background refresher runs the
+// real registration check (API call + /proc scan).
+const registrationCheckInterval = 30 * time.Second
+
 var registrationHealthStart time.Time
 
 // RunRegistrationHealthServer serves GET /healthz: 200 while the driver is in
-// this node's CSINode, 503 otherwise. Blocks; run in a goroutine.
+// this node's CSINode, 503 otherwise. The real check (API call + /proc scan)
+// runs in a background refresher; the handler serves cached state so a busy
+// driver or slow API can never time out the probe. Blocks; run in a goroutine.
 func (ns *NodeServer) RunRegistrationHealthServer(addr string) {
 	registrationHealthStart = time.Now()
 
+	var regHealthy atomic.Bool
+	regHealthy.Store(true) // fail open until the first check completes
+	go func() {
+		ticker := time.NewTicker(registrationCheckInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			healthy := ns.isDriverRegistered()
+			ns.recordRegistrationTransition(healthy)
+			regHealthy.Store(healthy)
+		}
+	}()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		healthy := ns.isDriverRegistered()
-		ns.recordRegistrationTransition(healthy)
-		if healthy {
+		if regHealthy.Load() {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("registered"))
 			return
