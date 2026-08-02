@@ -31,6 +31,7 @@ type VFSCacheConfig struct {
 	WriteBack         string // e.g., "5s", "0" for immediate
 	DirCacheTime      string // cache directory listings, e.g. "5m", "1h"
 	AttrTimeout       string // cache file attributes (stat), e.g. "5m", "1h"
+	ChunkStreams      string // parallel chunk download streams per file, e.g. "2"
 }
 
 // DefaultVFSCacheConfig returns sensible defaults for VFS caching
@@ -235,8 +236,10 @@ func (mm *MountManager) buildVFSOpt() map[string]interface{} {
 	vfsOpt := map[string]interface{}{
 		"ReadChunkSize":      33554432, // 32M in bytes
 		"ReadChunkSizeLimit": -1,       // off
-		"BufferSize":         33554432, // 32M in bytes
-		"Links":              true,     // Enable symlink support
+		// 8M: the in-memory read-ahead is per OPEN FILE and mostly redundant
+		// with cache-mode=full's chunk cache — 32M OOMed multi-volume nodes.
+		"BufferSize": 8388608,
+		"Links":      true, // Enable symlink support
 	}
 
 	// Set VFS disk space total size to match the LUKS VFS cache volume size
@@ -276,6 +279,14 @@ func (mm *MountManager) buildVFSOpt() map[string]interface{} {
 	if mm.vfsConfig.WriteBack != "" {
 		if ns, err := parseDurationToNs(mm.vfsConfig.WriteBack); err == nil {
 			vfsOpt["WriteBack"] = ns
+		}
+	}
+
+	// Per-volume download-stream budget: caps how much memory and bandwidth
+	// one volume's reads can claim from the shared process.
+	if mm.vfsConfig.ChunkStreams != "" {
+		if n, err := strconv.Atoi(mm.vfsConfig.ChunkStreams); err == nil && n >= 0 {
+			vfsOpt["ChunkStreams"] = n
 		}
 	}
 
@@ -340,6 +351,16 @@ func (mm *MountManager) Unmount() error {
 
 	klog.Infof("Successfully unmounted encrypted S3 volume %s", mm.volumeID)
 	return nil
+}
+
+// cacheFSFreeFraction returns the free-space fraction of the shared VFS cache
+// filesystem, or ok=false when it cannot be determined.
+func cacheFSFreeFraction() (float64, bool) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(VFSCacheBasePath, &st); err != nil || st.Blocks == 0 {
+		return 0, false
+	}
+	return float64(st.Bavail) / float64(st.Blocks), true
 }
 
 // setFuseFdsCloexec marks every /dev/fuse fd in this process close-on-exec.
@@ -709,6 +730,17 @@ func (mm *MountManager) evictCacheIfNeeded(cacheDir string, maxBytes int64) {
 		files = append(files, cachedFile{path: path, size: info.Size(), modTime: info.ModTime()})
 		return nil
 	})
+
+	// Shared-disk pressure: per-volume quotas overcommit the cache disk, so
+	// when it is nearly full every volume sheds 30% of its cache — one hot
+	// volume must not starve its neighbors' cache writes.
+	if frac, ok := cacheFSFreeFraction(); ok && frac < 0.10 {
+		if shed := totalSize * 7 / 10; shed < maxBytes {
+			klog.Warningf("VFS cache disk is %.0f%% full; volume %s shedding cache from %d to %d bytes",
+				(1-frac)*100, mm.volumeID, totalSize, shed)
+			maxBytes = shed
+		}
+	}
 
 	if totalSize <= maxBytes {
 		return

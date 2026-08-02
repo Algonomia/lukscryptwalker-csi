@@ -38,6 +38,9 @@ const (
 	// metadata-heavy workloads on large directories (e.g. pgbackrest WAL).
 	DirCacheTimeParam = "rclone-dir-cache-time" // e.g., "5m", "1h"
 	AttrTimeoutParam  = "rclone-attr-timeout"   // e.g., "5m", "1h"
+	// Per-volume budget: parallel chunk download streams. Cap low (e.g. "2")
+	// for heavy volumes so one tenant can't monopolize memory and bandwidth.
+	ChunkStreamsParam = "rclone-vfs-read-chunk-streams"
 )
 
 // S3SyncManager holds mount managers for active S3 volumes
@@ -293,6 +296,10 @@ func (ns *NodeServer) getVFSCacheConfig(volumeContext map[string]string) *rclone
 
 	if attrTimeout, exists := volumeContext[AttrTimeoutParam]; exists && attrTimeout != "" {
 		config.AttrTimeout = attrTimeout
+	}
+
+	if chunkStreams, exists := volumeContext[ChunkStreamsParam]; exists && chunkStreams != "" {
+		config.ChunkStreams = chunkStreams
 	}
 
 	klog.V(4).Infof("VFS cache config: mode=%s, maxAge=%s, maxSize=%s, pollInterval=%s, writeBack=%s, dirCacheTime=%s, attrTimeout=%s",
