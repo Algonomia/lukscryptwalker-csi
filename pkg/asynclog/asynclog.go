@@ -28,7 +28,7 @@ func (w *Writer) run() {
 	for buf := range w.ch {
 		_, _ = w.out.Write(buf)
 		if n := w.dropped.Swap(0); n > 0 {
-			fmt.Fprintf(w.out, "asynclog: dropped %d log lines while output was stalled\n", n)
+			_, _ = fmt.Fprintf(w.out, "asynclog: dropped %d log lines while output was stalled\n", n)
 		}
 	}
 }
