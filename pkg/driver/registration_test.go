@@ -8,6 +8,52 @@ import (
 	"time"
 )
 
+func TestEndpointAddr(t *testing.T) {
+	cases := []struct {
+		name     string
+		endpoint string
+		want     string
+	}{
+		{"node endpoint", "unix:///csi/csi.sock", "/csi/csi.sock"},
+		{"controller endpoint", "unix:///var/lib/csi/sockets/pluginproxy/csi.sock", "/var/lib/csi/sockets/pluginproxy/csi.sock"},
+		{"bare path", "/tmp/csi.sock", "/tmp/csi.sock"},
+		{"empty", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := endpointAddr(c.endpoint); got != c.want {
+				t.Errorf("endpointAddr(%q) = %q, want %q", c.endpoint, got, c.want)
+			}
+		})
+	}
+}
+
+// A wedged driver keeps its listener bound but never accepts; an unroutable
+// endpoint must read as not-accepting so the registrar is spared.
+func TestCsiSocketAccepting(t *testing.T) {
+	sock := t.TempDir() + "/csi.sock"
+
+	ns := &NodeServer{driver: &Driver{endpoint: "unix://" + sock}}
+	if ns.csiSocketAccepting() {
+		t.Error("expected not-accepting when no socket exists")
+	}
+
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if !ns.csiSocketAccepting() {
+		t.Error("expected accepting when a listener is bound")
+	}
+
+	// Unknown endpoint must fail open rather than punish the registrar.
+	nsUnknown := &NodeServer{driver: &Driver{endpoint: ""}}
+	if !nsUnknown.csiSocketAccepting() {
+		t.Error("expected fail-open on an unparseable endpoint")
+	}
+}
+
 func TestIsKubeletCmdline(t *testing.T) {
 	cases := []struct {
 		name string

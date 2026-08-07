@@ -2,8 +2,11 @@ package driver
 
 import (
 	"context"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -96,6 +99,34 @@ func (ns *NodeServer) recordRegistrationTransition(healthy bool) {
 	}
 }
 
+// csiSocketAccepting reports whether our CSI gRPC socket accepts a connection.
+// A frozen driver keeps the listener bound while never accepting, so a short
+// dial timeout distinguishes "serving" from "wedged".
+func (ns *NodeServer) csiSocketAccepting() bool {
+	addr := endpointAddr(ns.driver.endpoint)
+	if addr == "" {
+		return true // unknown endpoint: don't punish the registrar on a guess
+	}
+	conn, err := net.DialTimeout("unix", addr, 2*time.Second)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+// endpointAddr extracts the filesystem path from a unix:// CSI endpoint.
+func endpointAddr(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return ""
+	}
+	if u.Host == "" {
+		return filepath.FromSlash(u.Path)
+	}
+	return path.Join(u.Host, filepath.FromSlash(u.Path))
+}
+
 // isDriverRegistered reports whether kubelet currently knows about the driver,
 // failing open during startup grace and on errors so the registrar is
 // restarted only on a confirmed absence.
@@ -123,6 +154,17 @@ func (ns *NodeServer) isDriverRegistered() bool {
 		}
 	}
 	if !found {
+		// Deadlock guard: restarting the registrar only helps if it can reach
+		// our gRPC socket. When the socket is unresponsive, reporting
+		// unhealthy kills the registrar every cycle, driving it into
+		// CrashLoopBackOff — so it is not even alive to register once the
+		// driver recovers. Fail open and let the driver's own liveness act.
+		if !ns.csiSocketAccepting() {
+			klog.Warningf("registration check: driver %s missing from CSINode %s, but our CSI socket is "+
+				"unresponsive — keeping the registrar alive (restarting it cannot register against a wedged driver)",
+				DriverName, ns.driver.nodeID)
+			return true
+		}
 		klog.Warningf("registration check: driver %s is NOT present in CSINode %s — "+
 			"registrar liveness will fail to force re-registration", DriverName, ns.driver.nodeID)
 		return false

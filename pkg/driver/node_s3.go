@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 	"sync"
+	"sync/atomic"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/lukscryptwalker-csi/pkg/rclone"
@@ -402,20 +403,31 @@ func (ns *NodeServer) restoreS3VolumeStaging(volumeID, stagingTargetPath string,
 	return nil
 }
 
+// kubeletRootCache memoizes the resolved kubelet root: the value cannot change
+// while we run, and it is read on every checker tick and CSI call.
+var kubeletRootCache atomic.Value // string
+
 // resolveKubeletRoot resolves /var/lib/kubelet to its real path on the host.
 // On microk8s, /var/lib/kubelet is a symlink to /var/snap/microk8s/common/var/lib/kubelet.
 // We resolve in the host namespace using nsenter so the path matches what kubelet
 // passes in CSI requests and what rclone uses for FUSE mounts.
+//
+// Resolved once and cached, with a hard timeout: an unbounded nsenter here
+// froze the whole checker when the host stalled.
 func resolveKubeletRoot() string {
-	cmd := exec.Command("nsenter", "-t", "1", "-m", "-u", "readlink", "-f", "/var/lib/kubelet")
-	output, err := cmd.Output()
+	if v, ok := kubeletRootCache.Load().(string); ok && v != "" {
+		return v
+	}
+
+	resolved := DefaultKubeletRoot
+	out, err := runCmdBoundedOutput(10*time.Second, "nsenter", "-t", "1", "-m", "-u", "readlink", "-f", DefaultKubeletRoot)
 	if err != nil {
-		return "/var/lib/kubelet"
+		klog.Warningf("Could not resolve kubelet root (%v); using %s", err, DefaultKubeletRoot)
+	} else if trimmed := strings.TrimSpace(out); trimmed != "" {
+		resolved = trimmed
 	}
-	resolved := strings.TrimSpace(string(output))
-	if resolved == "" {
-		return "/var/lib/kubelet"
-	}
+
+	kubeletRootCache.Store(resolved)
 	return resolved
 }
 
@@ -1132,18 +1144,26 @@ func abortFUSEConnection(mountPoint string) {
 // on a child wedged in uninterruptible sleep (stalled disk, dead mount) — the
 // caller's goroutine must never hang on node-level I/O stalls.
 func runCmdBounded(timeout time.Duration, name string, arg ...string) error {
+	_, err := runCmdBoundedOutput(timeout, name, arg...)
+	return err
+}
+
+// runCmdBoundedOutput is runCmdBounded returning the command's stdout.
+func runCmdBoundedOutput(timeout time.Duration, name string, arg ...string) (string, error) {
 	cmd := exec.Command(name, arg...)
+	var out strings.Builder
+	cmd.Stdout = &out
 	if err := cmd.Start(); err != nil {
-		return err
+		return "", err
 	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	select {
 	case err := <-done:
-		return err
+		return out.String(), err
 	case <-time.After(timeout):
 		_ = cmd.Process.Kill()
-		return fmt.Errorf("%s %v timed out after %s", name, arg, timeout)
+		return out.String(), fmt.Errorf("%s %v timed out after %s", name, arg, timeout)
 	}
 }
 

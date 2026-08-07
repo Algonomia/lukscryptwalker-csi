@@ -33,6 +33,9 @@ import (
 // Constants
 const (
 	DefaultLocalPath = "/opt/local-path-provisioner"
+	// DefaultKubeletRoot is the conventional kubelet root, and the fallback
+	// when it cannot be resolved in the host namespace.
+	DefaultKubeletRoot = "/var/lib/kubelet"
 )
 
 // NodeServer implements the CSI Node service
