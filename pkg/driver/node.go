@@ -82,6 +82,8 @@ func NewNodeServer(d *Driver) *NodeServer {
 
 	// Run startup cleanup asynchronously to avoid delaying CSI driver registration
 	go func() {
+		ns.reportWatchdogActions()
+		InstallHostWatchdog()
 		abortOrphanedFUSEConnections()
 		ns.cleanupStaleS3Mounts()
 		ns.cleanupOrphanedVFSCacheDirs()

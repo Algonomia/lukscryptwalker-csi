@@ -108,6 +108,12 @@ spec:
               fieldPath: spec.nodeName
         - name: CSI_LOCAL_PATH
           value: {{ .Values.storage.defaultPath | quote }}
+        # Host self-heal watchdog v2 (systemd timer installed by the driver):
+        # container-scoped ONLY — on the shim-zombie signature (runtime claims
+        # Running, no driver process, 10min) it stops our own dead sandbox so
+        # kubelet recreates it. Never touches runtime, control plane, or node.
+        - name: HOST_WATCHDOG
+          value: {{ .Values.node.hostWatchdog | default true | quote }}
         volumeMounts:
         - name: plugin-dir
           mountPath: /csi
@@ -125,10 +131,10 @@ spec:
         - name: vfs-cache-dir
           mountPath: /var/lib/lukscrypt-vfs-cache
           mountPropagation: "Bidirectional"
-        ports:
-        - name: healthz
-          containerPort: {{ .Values.node.sidecars.livenessProbe.healthPort }}
-          protocol: TCP
+        # No ports: block — with hostNetwork, declared containerPorts become
+        # hostPort claims, and a zombie predecessor's claim blocks replacement
+        # pods from being admitted (observed: Pending forever behind a wedged
+        # shim). Probes target the numeric port directly.
         # Both probes go through the livenessprobe sidecar, which calls the
         # CSI Probe() RPC — verifying the gRPC server responds, not just that
         # the socket file exists.
@@ -141,7 +147,7 @@ spec:
           httpGet:
             host: 127.0.0.1
             path: /healthz
-            port: healthz
+            port: {{ .Values.node.sidecars.livenessProbe.healthPort }}
           failureThreshold: 60
           periodSeconds: 2
         # Liveness-killing this container tears down every FUSE mount on the
@@ -150,7 +156,7 @@ spec:
           httpGet:
             host: 127.0.0.1
             path: /healthz
-            port: healthz
+            port: {{ .Values.node.sidecars.livenessProbe.healthPort }}
           initialDelaySeconds: 10
           periodSeconds: 30
           timeoutSeconds: 10
