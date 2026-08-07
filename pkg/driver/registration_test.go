@@ -42,7 +42,7 @@ func TestCsiSocketAccepting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	if !ns.csiSocketAccepting() {
 		t.Error("expected accepting when a listener is bound")
 	}
