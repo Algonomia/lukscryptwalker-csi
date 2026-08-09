@@ -71,10 +71,29 @@ rm -f "$RUNSTATE/zombie-count"
 
 POD=$($CR pods --name csi-node -q 2>/dev/null | head -1)
 [ -z "$POD" ] && exit 0
+
+# The dead driver left its FUSE mounts with no server. Unmounting those hangs
+# forever, so containerd cannot tear the sandbox down — stopp/rmp fail
+# silently and the zombie survives. Abort the connections first: their server
+# is gone, so they can only ever serve EIO, and aborting lets teardown finish.
+ABORTED=0
+for conn in $(grep fuse.rclone /proc/self/mountinfo 2>/dev/null | awk '{print $3}' | cut -d: -f2 | sort -u); do
+  [ -w "/sys/fs/fuse/connections/$conn/abort" ] || continue
+  echo 1 > "/sys/fs/fuse/connections/$conn/abort" 2>/dev/null && ABORTED=$((ABORTED + 1))
+done
+[ "$ABORTED" -gt 0 ] && logger -t lukscrypt-watchdog "aborted $ABORTED orphaned rclone FUSE connection(s) of the dead driver"
+
 logger -t lukscrypt-watchdog "removing zombie driver sandbox $POD so kubelet recreates it"
-echo "$(date -Is) removed zombie driver sandbox $POD (runtime claimed Running with no driver process)" >> "$LOG"
-timeout 60 $CR stopp "$POD" >/dev/null 2>&1
-timeout 60 $CR rmp -f "$POD" >/dev/null 2>&1
+OUT=$( { timeout 60 $CR stopp "$POD"; timeout 60 $CR rmp -f "$POD"; } 2>&1 )
+RC=$?
+if [ "$RC" -eq 0 ]; then
+  logger -t lukscrypt-watchdog "zombie driver sandbox $POD removed"
+  echo "$(date -Is) removed zombie driver sandbox $POD after aborting $ABORTED orphaned FUSE connection(s)" >> "$LOG"
+else
+  # Never silent: a cure that cannot work must say so, or it looks like healing.
+  logger -t lukscrypt-watchdog "FAILED to remove zombie sandbox $POD (rc=$RC): $OUT"
+  echo "$(date -Is) FAILED to remove zombie driver sandbox $POD (rc=$RC): $OUT" >> "$LOG"
+fi
 exit 0
 `
 
