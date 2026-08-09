@@ -73,14 +73,38 @@ func (ns *NodeServer) RunRegistrationHealthServer(addr string) {
 	// Retry forever: with hostNetwork a stuck-terminating predecessor pod can
 	// hold the port; self-heal the moment it dies instead of giving up.
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	failures := 0
 	for {
 		klog.Infof("Registration health server listening on %s", addr)
-		if err := srv.ListenAndServe(); err != nil {
-			klog.Errorf("Registration health server stopped: %v (retrying in 10s)", err)
+		err := srv.ListenAndServe()
+		if err == nil {
+			failures = 0
+			continue
+		}
+		failures++
+		klog.Errorf("Registration health server stopped: %v (retrying in 10s)", err)
+		// A port we cannot bind is a silent trap: nothing answers probes
+		// against it, so anything gated on it gets killed forever while our
+		// logs scroll by unread. An orphaned socket has no process to kill,
+		// so say so where an operator will see it.
+		if failures == bindFailureEventThreshold {
+			klog.Errorf("Registration health port %s has been unbindable for ~%ds — most likely an orphaned "+
+				"listener from a previous driver instance; it has no owning process and only a node reboot frees it",
+				addr, bindFailureEventThreshold*10)
+			if ns.recorder != nil {
+				nodeRef := &corev1.ObjectReference{Kind: "Node", Name: ns.driver.nodeID, UID: types.UID(ns.driver.nodeID)}
+				ns.recorder.Eventf(nodeRef, corev1.EventTypeWarning, "RegistrationHealthPortUnavailable",
+					"Cannot bind registration health endpoint %s (%v). Probes against it cannot succeed; "+
+						"if the socket has no owning process, the node must be rebooted to free it.", addr, err)
+			}
 		}
 		time.Sleep(10 * time.Second)
 	}
 }
+
+// bindFailureEventThreshold is how many consecutive 10s bind failures (~30s)
+// pass before we escalate the unbindable port to a Node event.
+const bindFailureEventThreshold = 3
 
 // recordRegistrationTransition emits a Node event when registration health
 // changes state, so a lost registration is visible without reading driver logs.
@@ -95,7 +119,8 @@ func (ns *NodeServer) recordRegistrationTransition(healthy bool) {
 			"CSI driver %s re-registered with kubelet", DriverName)
 	} else {
 		ns.recorder.Eventf(nodeRef, corev1.EventTypeWarning, "CSIRegistrationLost",
-			"CSI driver %s is not registered with kubelet; restarting the registrar to force re-registration", DriverName)
+			"CSI driver %s is not registered with kubelet — volume operations on this node will fail until the "+
+				"node-driver-registrar re-registers it", DriverName)
 	}
 }
 
@@ -128,8 +153,9 @@ func endpointAddr(endpoint string) string {
 }
 
 // isDriverRegistered reports whether kubelet currently knows about the driver,
-// failing open during startup grace and on errors so the registrar is
-// restarted only on a confirmed absence.
+// failing open during startup grace and on errors so a lost registration is
+// only ever reported on a confirmed absence. Advisory: it drives logs and Node
+// events, not a kill switch (see the registrar's liveness probe in the chart).
 func (ns *NodeServer) isDriverRegistered() bool {
 	if time.Since(registrationHealthStart) < registrationStartupGrace {
 		return true
@@ -154,19 +180,17 @@ func (ns *NodeServer) isDriverRegistered() bool {
 		}
 	}
 	if !found {
-		// Deadlock guard: restarting the registrar only helps if it can reach
-		// our gRPC socket. When the socket is unresponsive, reporting
-		// unhealthy kills the registrar every cycle, driving it into
-		// CrashLoopBackOff — so it is not even alive to register once the
-		// driver recovers. Fail open and let the driver's own liveness act.
+		// Absence is only meaningful when the registrar could actually have
+		// registered us: against a wedged gRPC socket it never can, so don't
+		// report a problem it cannot be the cause of.
 		if !ns.csiSocketAccepting() {
-			klog.Warningf("registration check: driver %s missing from CSINode %s, but our CSI socket is "+
-				"unresponsive — keeping the registrar alive (restarting it cannot register against a wedged driver)",
+			klog.Warningf("registration check: driver %s missing from CSINode %s, but our own CSI socket is "+
+				"unresponsive — the driver, not the registrar, is the problem",
 				DriverName, ns.driver.nodeID)
 			return true
 		}
 		klog.Warningf("registration check: driver %s is NOT present in CSINode %s — "+
-			"registrar liveness will fail to force re-registration", DriverName, ns.driver.nodeID)
+			"volume operations on this node will fail until it re-registers", DriverName, ns.driver.nodeID)
 		return false
 	}
 
@@ -191,7 +215,7 @@ func (ns *NodeServer) kubeletHandshakeCurrent() bool {
 		return true
 	}
 	klog.Warningf("registration check: kubelet started at %s but has not re-registered driver %s "+
-		"(no NodeGetInfo handshake since) — registrar liveness will fail to force re-registration",
+		"(no NodeGetInfo handshake since) — mounts will fail until it does",
 		kubeletStart.Format(time.RFC3339), DriverName)
 	return false
 }

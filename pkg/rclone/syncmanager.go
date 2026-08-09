@@ -167,19 +167,22 @@ func (mm *MountManager) Mount() error {
 		"AttrTimeout":   durationOrDefault(mm.vfsConfig.AttrTimeout, defaultCacheNs),
 	}
 
+	// Build VFS options
+	vfsOpt := mm.buildVFSOpt()
+
 	// Set UID/GID on the FUSE mount so files appear owned by the pod's fsGroup,
 	// allowing non-root containers to read, write, and delete files.
+	// UID/GID are VFS options: librclone silently drops unknown mountOpt keys,
+	// so setting them there leaves the mount root-owned (mode 0750) and any
+	// non-root pod gets EACCES.
 	if mm.uid != nil {
-		mountOpt["UID"] = uint32(*mm.uid)
+		vfsOpt["UID"] = uint32(*mm.uid)
 		klog.Infof("Setting FUSE mount UID to %d for volume %s", *mm.uid, mm.volumeID)
 	}
 	if mm.gid != nil {
-		mountOpt["GID"] = uint32(*mm.gid)
+		vfsOpt["GID"] = uint32(*mm.gid)
 		klog.Infof("Setting FUSE mount GID to %d for volume %s", *mm.gid, mm.volumeID)
 	}
-
-	// Build VFS options
-	vfsOpt := mm.buildVFSOpt()
 
 	// Call mount/mount RPC using the named crypt remote
 	params := map[string]interface{}{

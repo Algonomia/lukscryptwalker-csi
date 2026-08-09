@@ -83,6 +83,20 @@ for conn in $(grep fuse.rclone /proc/self/mountinfo 2>/dev/null | awk '{print $3
 done
 [ "$ABORTED" -gt 0 ] && logger -t lukscrypt-watchdog "aborted $ABORTED orphaned rclone FUSE connection(s) of the dead driver"
 
+# Removing the sandbox destroys the container's exit record and its final log
+# lines — the very evidence needed to explain why the driver died. Capture it
+# first, or every recovery erases the reason it was needed.
+CID=$($CR ps -a --name lukscryptwalker-csi -q 2>/dev/null | head -1)
+if [ -n "$CID" ]; then
+  {
+    echo "=== $(date -Is) driver container $CID state before sandbox removal ==="
+    timeout 20 $CR inspect "$CID" 2>&1 | grep -iE '"(exitCode|reason|message|startedAt|finishedAt|oomKilled)"' | head -20
+    echo "--- last log lines ---"
+    timeout 20 $CR logs --tail 40 "$CID" 2>&1 | tail -40
+  } >> "$LOG" 2>&1
+  logger -t lukscrypt-watchdog "captured dead driver container $CID state to $LOG"
+fi
+
 logger -t lukscrypt-watchdog "removing zombie driver sandbox $POD so kubelet recreates it"
 OUT=$( { timeout 60 $CR stopp "$POD"; timeout 60 $CR rmp -f "$POD"; } 2>&1 )
 RC=$?

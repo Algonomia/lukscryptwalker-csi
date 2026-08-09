@@ -41,7 +41,9 @@ spec:
         - "--v={{ .Values.logging.level }}"
         - "--csi-address=$(ADDRESS)"
         - "--kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)"
-        - "--health-port=9809"
+        # Loopback only: with hostNetwork this would otherwise listen on the
+        # node's (possibly public) IP.
+        - "--http-endpoint=127.0.0.1:9809"
         env:
         - name: ADDRESS
           value: /csi/csi.sock
@@ -54,10 +56,19 @@ spec:
         livenessProbe:
           # The driver's registration-health endpoint: a lost registration
           # restarts only this registrar, not the driver or its mounts.
-          # Generous timeout/threshold so a throttled driver doesn't flap the
-          # registrar into a deregistration loop.
           # host 127.0.0.1: with hostNetwork the default probe target is the
           # node's (possibly public, firewalled) IP.
+          #
+          # KNOWN RISK: this ties the registrar's life to a port the driver
+          # owns. If 9810 is held by an orphaned listener (a dead driver's
+          # socket with no owning process — only a node reboot frees it), the
+          # probe can never succeed and kubelet kills a registrar that is
+          # registering fine, clearing CSINode and stopping volume operations.
+          # The driver escalates that case as a RegistrationHealthPortUnavailable
+          # Node event; alert on it. To break the loop by hand, remove this
+          # probe (kubectl patch ds ... remove /containers/0/livenessProbe).
+          # Generous threshold so a throttled driver doesn't flap the
+          # registrar into a deregistration loop.
           httpGet:
             host: 127.0.0.1
             path: /healthz
