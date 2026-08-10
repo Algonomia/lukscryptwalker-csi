@@ -131,6 +131,17 @@ spec:
         - name: pods-mount-dir
           mountPath: /var/lib/kubelet
           mountPropagation: "Bidirectional"
+{{- if ne (.Values.node.kubeletDir | default "/var/lib/kubelet") "/var/lib/kubelet" }}
+        # The driver builds FUSE mount paths from the kubelet root RESOLVED ON
+        # THE HOST (microk8s: /var/lib/kubelet -> /var/snap/microk8s/...), and
+        # librclone mounts in-container. Without this second mount at the
+        # resolved path, those mounts land in the container's own filesystem:
+        # invisible to the host, so consumers bind the bare directory
+        # underneath and write unencrypted data to the node disk.
+        - name: pods-mount-dir
+          mountPath: {{ .Values.node.kubeletDir }}
+          mountPropagation: "Bidirectional"
+{{- end }}
         - name: device-dir
           mountPath: /dev
         - name: local-path-dir

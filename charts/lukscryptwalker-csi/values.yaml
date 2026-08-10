@@ -56,6 +56,17 @@ controller:
 
 # Node configuration
 node:
+  # Kubelet root AS RESOLVED ON THE HOST (follow symlinks). The driver derives
+  # FUSE mount paths from this, and librclone mounts inside the container, so
+  # the container must expose this exact path with Bidirectional propagation —
+  # otherwise its mounts never reach the host and consumers silently bind the
+  # unencrypted directory underneath.
+  #   default:  /var/lib/kubelet
+  #   microk8s: /var/snap/microk8s/common/var/lib/kubelet
+  #   k0s:      /var/lib/k0s/kubelet
+  # Check with: readlink -f /var/lib/kubelet
+  kubeletDir: /var/lib/kubelet
+
   # VFS cache configuration
   vfsCacheSize: "20G"  # Size of the encrypted LUKS volume for VFS cache
 
