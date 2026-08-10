@@ -3,6 +3,8 @@ package rclone
 import (
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"k8s.io/klog"
 )
@@ -20,9 +22,65 @@ const (
 	selfMountInfo = "/proc/self/mountinfo"
 )
 
+const (
+	// Reading a mount table takes the kernel's mount lock, which a wedged
+	// umount on a dead FUSE holds indefinitely — so this read CAN block
+	// forever. Cache it, single-flight it, and never let a caller wait on it:
+	// a stale table is recoverable, a hung checker is not.
+	mountsCacheTTL   = 5 * time.Second
+	mountsReadBudget = 5 * time.Second
+)
+
+var (
+	mountsMu       sync.Mutex
+	mountsCache    map[string]string
+	mountsReadAt   time.Time
+	mountsInFlight bool
+)
+
 // HostMounts returns mountpoint → filesystem type as seen in the host mount
-// namespace, falling back to our own namespace if the host view is unreadable.
+// namespace. Never blocks longer than mountsReadBudget: if the kernel mount
+// lock is held, it returns the last known table rather than hanging the caller.
 func HostMounts() map[string]string {
+	mountsMu.Lock()
+	fresh := mountsCache != nil && time.Since(mountsReadAt) < mountsCacheTTL
+	if fresh || mountsInFlight {
+		cached := mountsCache
+		mountsMu.Unlock()
+		return cached
+	}
+	mountsInFlight = true
+	mountsMu.Unlock()
+
+	done := make(chan map[string]string, 1)
+	go func() {
+		m := readHostMounts()
+		mountsMu.Lock()
+		if m != nil {
+			mountsCache = m
+			mountsReadAt = time.Now()
+		}
+		mountsInFlight = false
+		mountsMu.Unlock()
+		done <- m
+	}()
+
+	select {
+	case m := <-done:
+		return m
+	case <-time.After(mountsReadBudget):
+		mountsMu.Lock()
+		cached := mountsCache
+		mountsMu.Unlock()
+		klog.Warningf("Reading the host mount table blocked for %s (a wedged umount holds the kernel mount "+
+			"lock); serving the last known table with %d entries", mountsReadBudget, len(cached))
+		return cached
+	}
+}
+
+// readHostMounts reads and parses the host mount table, falling back to our own
+// namespace if the host view is unreadable.
+func readHostMounts() map[string]string {
 	data, err := os.ReadFile(hostMountInfo)
 	if err != nil {
 		if data, err = os.ReadFile(selfMountInfo); err != nil {

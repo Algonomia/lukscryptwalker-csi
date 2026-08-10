@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -23,6 +24,43 @@ const librcloneHangThreshold = 2 * time.Minute
 var lastLibrcloneOK atomic.Int64
 
 func init() { lastLibrcloneOK.Store(time.Now().UnixNano()) }
+
+// librcloneProbe is one in-flight core/version call. done is closed when it
+// returns; err is written before the close, so readers see it safely.
+type librcloneProbe struct {
+	done chan struct{}
+	err  error
+}
+
+var (
+	probeMu      sync.Mutex
+	probeCurrent *librcloneProbe
+)
+
+// startOrJoinLibrcloneProbe returns the in-flight probe, starting one only if
+// none is running. Single-flight matters because a wedged librclone never
+// returns: a goroutine per liveness call would leak one goroutine — and the OS
+// thread it blocks in CGO — every probe period, forever.
+func startOrJoinLibrcloneProbe() *librcloneProbe {
+	probeMu.Lock()
+	defer probeMu.Unlock()
+	if probeCurrent != nil {
+		return probeCurrent
+	}
+
+	p := &librcloneProbe{done: make(chan struct{})}
+	probeCurrent = p
+	go func() {
+		_, err := rclone.RPC("core/version", map[string]interface{}{})
+		p.err = err
+		close(p.done)
+
+		probeMu.Lock()
+		probeCurrent = nil
+		probeMu.Unlock()
+	}()
+	return p
+}
 
 type IdentityServer struct {
 	csi.UnimplementedIdentityServer
@@ -59,20 +97,16 @@ func (ids *IdentityServer) GetPluginInfo(ctx context.Context, req *csi.GetPlugin
 func (ids *IdentityServer) Probe(ctx context.Context, req *csi.ProbeRequest) (*csi.ProbeResponse, error) {
 	klog.V(5).Info("Probe called")
 
-	done := make(chan error, 1)
-	go func() {
-		_, err := rclone.RPC("core/version", map[string]interface{}{})
-		done <- err
-	}()
+	probe := startOrJoinLibrcloneProbe()
 
 	var reason string
 	select {
-	case err := <-done:
-		if err == nil {
+	case <-probe.done:
+		if probe.err == nil {
 			lastLibrcloneOK.Store(time.Now().UnixNano())
 			return &csi.ProbeResponse{}, nil
 		}
-		reason = "librclone unhealthy: " + err.Error()
+		reason = "librclone unhealthy: " + probe.err.Error()
 	case <-time.After(5 * time.Second):
 		reason = "librclone did not answer within 5s"
 	case <-ctx.Done():

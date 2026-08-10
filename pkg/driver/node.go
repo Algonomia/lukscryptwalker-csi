@@ -85,6 +85,10 @@ func NewNodeServer(d *Driver) *NodeServer {
 		ns.recorder = broadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "lukscryptwalker-csi", Host: d.nodeID})
 	}
 
+	// Continuous resource trend: the only record we have when the process
+	// disappears without a panic, a signal, or a kernel OOM entry.
+	go ns.runSelfMonitor()
+
 	// Run startup cleanup asynchronously to avoid delaying CSI driver registration
 	go func() {
 		ns.reportWatchdogActions()
@@ -139,8 +143,11 @@ func (ns *NodeServer) runCheckerTickWatched() {
 	case <-time.After(checkerTickStuckAfter):
 		buf := make([]byte, 1<<20)
 		n := runtime.Stack(buf, true)
-		klog.Errorf("Stale-mount checker tick has been running for %s — dumping goroutine stacks to find the "+
-			"blocked call:\n%s", checkerTickStuckAfter, buf[:n])
+		// Straight to stderr, not through klog/asynclog: a stuck tick often
+		// comes with a stalled log pipe, and a queued dump is dropped exactly
+		// when it is the only thing that could explain the freeze.
+		fmt.Fprintf(os.Stderr, "STUCK-TICK: stale-mount checker running for %s; goroutine dump follows\n%s\n",
+			checkerTickStuckAfter, buf[:n])
 		<-done // one dump per stuck tick; the next tick waits for this one
 		klog.Warning("Stale-mount checker tick finally completed after being reported stuck")
 	}

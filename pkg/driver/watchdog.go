@@ -59,8 +59,11 @@ fi
 N=$(cat "$RUNSTATE/zombie-count" 2>/dev/null || echo 0)
 N=$((N + 1))
 echo "$N" > "$RUNSTATE/zombie-count"
-logger -t lukscrypt-watchdog "shim-zombie signature: runtime reports driver Running, no process ($N/10)"
-[ "$N" -lt 10 ] && exit 0
+logger -t lukscrypt-watchdog "shim-zombie signature: runtime reports driver Running, no process ($N/3)"
+# 3 minutes, not 10: the original window existed to let kubelet act first,
+# but in this state containerd never records the exit, so kubelet never acts
+# at all — the extra 7 minutes were pure outage for every mount on the node.
+[ "$N" -lt 3 ] && exit 0
 
 # At most one sandbox kill per 15 minutes.
 now=$(date +%s)

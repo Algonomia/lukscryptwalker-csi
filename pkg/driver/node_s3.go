@@ -446,9 +446,13 @@ func (ns *NodeServer) cleanupStaleS3Mounts() {
 	csiPluginPath := kubeletRoot + "/plugins/kubernetes.io/csi/" + DriverName
 	klog.Infof("Checking for stale/missing S3 mounts in %s", csiPluginPath)
 
-	// Check if the CSI plugin directory exists
+	// A missing plugin path means this checker can never repair anything —
+	// usually the kubelet root resolved to a path the container does not
+	// expose (see node.kubeletDir). Warn: silently returning here makes a
+	// completely blind checker look identical to a working one.
 	if _, err := os.Stat(csiPluginPath); os.IsNotExist(err) {
-		klog.V(4).Infof("CSI plugin path %s does not exist, no cleanup needed", csiPluginPath)
+		klog.Warningf("CSI plugin path %s does not exist — stale-mount recovery is INACTIVE on this node; "+
+			"check that node.kubeletDir matches `readlink -f /var/lib/kubelet` on the host", csiPluginPath)
 		return
 	}
 
