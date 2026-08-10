@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/lukscryptwalker-csi/pkg/asynclog"
 	"github.com/lukscryptwalker-csi/pkg/driver"
@@ -123,8 +124,12 @@ func main() {
 	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		<-signalChan
-		klog.Info("Received shutdown signal, shutting down...")
+		sig := <-signalChan
+		// Synchronous and unbuffered: this line is the difference between
+		// "orderly shutdown" and "died silently" in a post-mortem, and a
+		// queued line does not survive the exit that follows it.
+		alog.WriteSync(fmt.Sprintf("SHUTDOWN: received signal %s, shutting down\n", sig))
+		klog.Infof("Received shutdown signal (%s), shutting down...", sig)
 		cancel()
 	}()
 
@@ -137,7 +142,14 @@ func main() {
 		d.StartRegistrationHealthServer(driver.RegistrationHealthPort)
 	}
 
-	if err := d.Run(ctx); err != nil {
+	err := d.Run(ctx)
+
+	// Drain queued log lines before the deferred teardown runs and the process
+	// exits, so the reason we are stopping actually reaches the log.
+	alog.WriteSync("SHUTDOWN: CSI driver Run() returned, tearing down\n")
+	alog.Flush(5 * time.Second)
+
+	if err != nil {
 		klog.Fatalf("Failed to run CSI driver: %v", err)
 	}
 }

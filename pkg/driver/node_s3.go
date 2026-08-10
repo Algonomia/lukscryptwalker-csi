@@ -1336,24 +1336,12 @@ func probeMountReads(root string) error {
 	return nil
 }
 
-// isFUSEMountPoint checks if the path has a FUSE mount by reading /proc/mounts.
+// isFUSEMountPoint reports whether path is served by FUSE in the HOST mount
+// namespace. Our own /proc/mounts can hold entries the host has dropped, and
+// trusting those makes the driver blind to a volume that is dead for every
+// consumer.
 func (ns *NodeServer) isFUSEMountPoint(path string) bool {
-	data, err := os.ReadFile("/proc/mounts")
-	if err != nil {
-		klog.Warningf("Failed to read /proc/mounts: %v", err)
-		return false
-	}
-
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 3 && fields[1] == path {
-			// Check if it's a FUSE mount
-			if strings.Contains(fields[2], "fuse") || strings.Contains(fields[0], "rclone") {
-				return true
-			}
-		}
-	}
-	return false
+	return rclone.IsHostFUSEMount(path)
 }
 
 // getVolumeIDFromVolData reads the volume ID from kubelet's vol_data.json file

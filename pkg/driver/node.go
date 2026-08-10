@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/lukscryptwalker-csi/pkg/luks"
+	"github.com/lukscryptwalker-csi/pkg/rclone"
 	"github.com/lukscryptwalker-csi/pkg/secrets"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -113,7 +115,34 @@ func (ns *NodeServer) runStaleS3MountChecker() {
 			abortOrphanedFUSEConnections()
 		}
 		tick++
+		ns.runCheckerTickWatched()
+	}
+}
+
+// checkerTickStuckAfter is how long a stale-mount tick may run before we treat
+// it as hung and dump stacks.
+const checkerTickStuckAfter = 3 * time.Minute
+
+// runCheckerTickWatched runs one stale-mount tick and, if it has not returned
+// in time, dumps every goroutine's stack. Every driver death so far has ended
+// mid-tick with no further output, and without stacks there is no way to see
+// which call is stuck.
+func (ns *NodeServer) runCheckerTickWatched() {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
 		ns.cleanupStaleS3Mounts()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(checkerTickStuckAfter):
+		buf := make([]byte, 1<<20)
+		n := runtime.Stack(buf, true)
+		klog.Errorf("Stale-mount checker tick has been running for %s — dumping goroutine stacks to find the "+
+			"blocked call:\n%s", checkerTickStuckAfter, buf[:n])
+		<-done // one dump per stuck tick; the next tick waits for this one
+		klog.Warning("Stale-mount checker tick finally completed after being reported stuck")
 	}
 }
 
@@ -580,22 +609,12 @@ func (ns *NodeServer) ensureVolumeStaged(ctx context.Context, req *csi.NodePubli
 // System Operations
 // =============================================================================
 
-// isMountPoint checks if the given path is a mount point by reading
-// /proc/mounts — never stats the path, so a wedged FUSE mount (stuck serve
-// loop, open fd) cannot hang CSI handlers in uninterruptible sleep.
+// isMountPoint checks if the given path is a mount point in the HOST mount
+// namespace — never stats the path, so a wedged FUSE mount (stuck serve loop,
+// open fd) cannot hang CSI handlers in uninterruptible sleep, and never trusts
+// our own namespace, which can retain mounts the host has already dropped.
 func (ns *NodeServer) isMountPoint(path string) bool {
-	data, err := os.ReadFile("/proc/mounts")
-	if err != nil {
-		klog.Warningf("Failed to read /proc/mounts: %v", err)
-		return false
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 2 && fields[1] == path {
-			return true
-		}
-	}
-	return false
+	return rclone.IsHostMountPoint(path)
 }
 
 // isMountedFrom checks if the given path is mounted from the specified device

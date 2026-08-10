@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"sync/atomic"
+	"time"
 )
 
 // Writer buffers log lines to a background goroutine; Write never blocks.
@@ -43,6 +44,23 @@ func (w *Writer) Write(p []byte) (int, error) {
 		w.dropped.Add(1)
 	}
 	return len(p), nil
+}
+
+// WriteSync writes straight to the output, bypassing the queue. For the last
+// words before exit: a queued line is lost if the process dies before the
+// drain goroutine runs, which makes an orderly shutdown look like a silent
+// death.
+func (w *Writer) WriteSync(s string) {
+	_, _ = w.out.Write([]byte(s))
+}
+
+// Flush waits (up to timeout) for queued lines to drain, so log output
+// survives process exit.
+func (w *Writer) Flush(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for len(w.ch) > 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // Dropped returns the number of lines dropped since the last drain report.

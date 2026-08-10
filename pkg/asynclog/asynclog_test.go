@@ -50,6 +50,26 @@ func TestPassthrough(t *testing.T) {
 	t.Fatalf("line never drained: %q", out.String())
 }
 
+// A queued line must survive process exit, and the last words before exit
+// must not depend on the drain goroutine getting scheduled.
+func TestFlushAndWriteSync(t *testing.T) {
+	out := &syncBuffer{}
+	w := New(out, 64)
+
+	for i := 0; i < 20; i++ {
+		_, _ = w.Write([]byte("queued\n"))
+	}
+	w.Flush(2 * time.Second)
+	if got := strings.Count(out.String(), "queued"); got != 20 {
+		t.Errorf("Flush drained %d of 20 queued lines", got)
+	}
+
+	w.WriteSync("SHUTDOWN: bye\n")
+	if !strings.Contains(out.String(), "SHUTDOWN: bye") {
+		t.Error("WriteSync did not reach the output")
+	}
+}
+
 func TestNeverBlocksAndCountsDrops(t *testing.T) {
 	bw := &blockingWriter{release: make(chan struct{})}
 	w := New(bw, 2)

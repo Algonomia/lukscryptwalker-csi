@@ -553,21 +553,16 @@ func (mm *MountManager) uploadQueueConfirmedEmpty() bool {
 	return ok1 && ok2 && inProgress == 0 && queued == 0
 }
 
+// isMountPoint reports whether our mount is live in the HOST namespace — the
+// only view that matches what consumers see. Our own /proc/mounts can retain
+// entries the host has dropped, which makes the driver believe dead volumes
+// are healthy and suppresses all self-healing.
 func (mm *MountManager) isMountPoint() bool {
-	data, err := os.ReadFile("/proc/mounts")
-	if err != nil {
-		klog.Infof("Failed to read /proc/mounts: %v", err)
-		return false
+	fsType, ok := HostMounts()[mm.mountPoint]
+	if ok {
+		klog.V(4).Infof("Found mount at %s (%s)", mm.mountPoint, fsType)
+		return true
 	}
-
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 2 && fields[1] == mm.mountPoint {
-			klog.Infof("Found mount at %s: %s", mm.mountPoint, line)
-			return true
-		}
-	}
-
 	return false
 }
 

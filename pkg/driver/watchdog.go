@@ -164,7 +164,15 @@ func InstallHostWatchdog() {
 // reportWatchdogActions surfaces actions the watchdog took while no driver was
 // alive to witness them — as logs and Node events — then clears the log.
 func (ns *NodeServer) reportWatchdogActions() {
-	out, err := runHostSh("cat /var/lib/lukscrypt-watchdog/actions.log 2>/dev/null; : > /var/lib/lukscrypt-watchdog/actions.log 2>/dev/null; true", "", 15*time.Second)
+	// Archive before truncating: Node events expire in ~1h, so reporting must
+	// not be the only copy — the captured cause of a death has to survive
+	// until someone looks for it.
+	const drainCmd = `L=/var/lib/lukscrypt-watchdog/actions.log
+cat "$L" 2>/dev/null
+cat "$L" >> /var/lib/lukscrypt-watchdog/actions-archive.log 2>/dev/null
+: > "$L" 2>/dev/null
+true`
+	out, err := runHostSh(drainCmd, "", 15*time.Second)
 	if err != nil || strings.TrimSpace(out) == "" {
 		return
 	}
