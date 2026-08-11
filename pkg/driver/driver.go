@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc"
@@ -17,6 +18,11 @@ import (
 
 const (
 	DriverName = "lukscryptwalker.csi.k8s.io"
+
+	// controllerSocketDir identifies the controller deployment by its CSI
+	// endpoint: the node DaemonSet serves unix:///csi/csi.sock, the controller
+	// serves the pluginproxy socket.
+	controllerSocketDir = "/var/lib/csi/sockets/pluginproxy/"
 )
 
 type Driver struct {
@@ -33,6 +39,13 @@ type Driver struct {
 
 func GetVersion() string {
 	return version.GetVersion()
+}
+
+// IsNodeMode reports whether this process is the node DaemonSet rather than
+// the controller. Only the node has kubelet mounts, host namespaces and
+// volumes to repair; node-only background work must not run in the controller.
+func (d *Driver) IsNodeMode() bool {
+	return !strings.Contains(d.endpoint, controllerSocketDir)
 }
 
 func NewDriver(endpoint, nodeID string) *Driver {

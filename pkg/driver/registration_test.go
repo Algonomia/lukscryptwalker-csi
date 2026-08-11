@@ -139,3 +139,25 @@ func TestKubeletProcessStartConsistency(t *testing.T) {
 		t.Errorf("kubelet start time %s is not sane", start)
 	}
 }
+
+// The controller pods construct a NodeServer too; node-only background work
+// (mount checker, host watchdog, FUSE aborts) must never run there.
+func TestIsNodeMode(t *testing.T) {
+	cases := []struct {
+		name     string
+		endpoint string
+		want     bool
+	}{
+		{"node daemonset", "unix:///csi/csi.sock", true},
+		{"controller deployment", "unix:///var/lib/csi/sockets/pluginproxy/csi.sock", false},
+		{"bare node path", "/csi/csi.sock", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			d := &Driver{endpoint: c.endpoint}
+			if got := d.IsNodeMode(); got != c.want {
+				t.Errorf("IsNodeMode(%q) = %v, want %v", c.endpoint, got, c.want)
+			}
+		})
+	}
+}

@@ -75,6 +75,11 @@ rm -f "$RUNSTATE/zombie-count"
 POD=$($CR pods --name csi-node -q 2>/dev/null | head -1)
 [ -z "$POD" ] && exit 0
 
+# Scope the container lookup to THIS sandbox: the controller pods run
+# containers with the same name on this node, and an unscoped lookup captured
+# a controller's logs as "evidence" for a dead node driver.
+CID=$($CR ps -a --pod "$POD" --name lukscryptwalker-csi -q 2>/dev/null | head -1)
+
 # The dead driver left its FUSE mounts with no server. Unmounting those hangs
 # forever, so containerd cannot tear the sandbox down — stopp/rmp fail
 # silently and the zombie survives. Abort the connections first: their server
@@ -89,7 +94,6 @@ done
 # Removing the sandbox destroys the container's exit record and its final log
 # lines — the very evidence needed to explain why the driver died. Capture it
 # first, or every recovery erases the reason it was needed.
-CID=$($CR ps -a --name lukscryptwalker-csi -q 2>/dev/null | head -1)
 if [ -n "$CID" ]; then
   {
     echo "=== $(date -Is) driver container $CID state before sandbox removal ==="

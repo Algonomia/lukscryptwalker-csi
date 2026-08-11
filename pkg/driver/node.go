@@ -85,6 +85,16 @@ func NewNodeServer(d *Driver) *NodeServer {
 		ns.recorder = broadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "lukscryptwalker-csi", Host: d.nodeID})
 	}
 
+	// Node-only background work. The controller pods construct a NodeServer
+	// too (for the gRPC registration), but they have no kubelet mounts, no
+	// host namespaces and no volumes to repair: running it there did nothing
+	// but log "stale-mount recovery is INACTIVE" every 30s and attempt host
+	// operations that can only fail.
+	if !d.IsNodeMode() {
+		klog.Info("Controller mode: skipping node-only background tasks (mount checker, watchdog, cache cleanup)")
+		return ns
+	}
+
 	// Continuous resource trend: the only record we have when the process
 	// disappears without a panic, a signal, or a kernel OOM entry.
 	go ns.runSelfMonitor()

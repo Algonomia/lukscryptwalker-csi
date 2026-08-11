@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/brice/go/pkg/mod/github.com/rclone/rclone@v1.74.3/vfs/**)",
+      "Read(//home/brice/go/pkg/mod/github.com/rclone/rclone@v1.74.3/cmd/mountlib/**)",
+      "Read(//home/brice/go/pkg/mod/github.com/rclone/rclone@v1.74.3/cmd/mount/**)",
+      "Read(//home/brice/go/pkg/mod/bazil.org/fuse@v0.0.0-20230120002735-62a210ff1fd5/**)",
+      "Bash(rtk golangci-lint *)"
+    ]
+  }
+}
