@@ -127,6 +127,10 @@ func (ns *NodeServer) runStaleS3MountChecker() {
 		// recovery until a driver restart.
 		if tick%10 == 0 {
 			abortOrphanedFUSEConnections()
+			// A consumer we deleted can wedge in termination and block its
+			// StatefulSet ordinal forever; reconcile never revisits it once
+			// the mount looks healthy again.
+			ns.sweepStuckTerminatingConsumers()
 		}
 		tick++
 		ns.runCheckerTickWatched()

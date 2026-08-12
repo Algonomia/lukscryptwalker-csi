@@ -127,3 +127,6 @@ cpu.prof
 
 # Fuzzing
 fuzz*/
+
+# claude
+.claude/

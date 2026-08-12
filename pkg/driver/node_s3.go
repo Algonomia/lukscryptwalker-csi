@@ -11,17 +11,17 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
-	"time"
 	"sync"
 	"sync/atomic"
+	"syscall"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/lukscryptwalker-csi/pkg/rclone"
 	"github.com/lukscryptwalker-csi/pkg/secrets"
+	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog"
 )
 
@@ -544,6 +544,18 @@ func (ns *NodeServer) cleanupStaleS3Mounts() {
 		if isStaleFUSE {
 			klog.Infof("Detected stale FUSE mount for S3 volume %s at %s", volumeID, globalmountPath)
 		} else {
+			// "Missing" is also what a NORMAL kubelet unstage looks like: the
+			// last consumer went away and kubelet tore the staging mount down.
+			// Re-mounting then fights kubelet — it unstages again, we re-mount
+			// again — and each cycle can escalate to deleting a consumer that
+			// was only restarting. With no consumer on this node there is
+			// nothing to heal, so leave it alone.
+			pvcNS, pvcName, _ := ns.resolveVolumeRefs(volumeID)
+			if len(ns.podsUsingPVC(pvcNS, pvcName)) == 0 {
+				klog.V(4).Infof("Volume %s is unmounted and has no consumer on this node — leaving it to kubelet",
+					volumeID)
+				continue
+			}
 			klog.Infof("Detected missing FUSE mount for S3 volume %s at %s", volumeID, globalmountPath)
 		}
 
@@ -986,6 +998,63 @@ func (ns *NodeServer) restartPodsWithStaleS3Mount(volumeID string) {
 // staleTerminationGrace is the slack past a pod's deletion grace period before
 // we treat it as wedged in termination.
 const staleTerminationGrace = 30 * time.Second
+
+// sweepStuckTerminatingConsumers force-deletes our volumes' consumers that are
+// wedged in termination. Recovery deletes a consumer to re-publish it; if its
+// volume teardown hangs, the pod object never goes away, and a StatefulSet
+// cannot recreate that ordinal — the workload stays down indefinitely.
+// Reconcile alone does not catch this, because once the mount looks healthy
+// the pod is never revisited.
+func (ns *NodeServer) sweepStuckTerminatingConsumers() {
+	if ns.clientset == nil {
+		return
+	}
+	ctx := context.Background()
+	pods, err := ns.clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{
+		FieldSelector: "spec.nodeName=" + ns.driver.nodeID,
+	})
+	if err != nil {
+		klog.V(4).Infof("stuck-terminating sweep: could not list pods: %v", err)
+		return
+	}
+
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.DeletionTimestamp == nil || !podStuckTerminating(pod) {
+			continue
+		}
+		// Only our own consumers, and only pods a controller will recreate.
+		if !ns.podUsesOurVolumes(ctx, pod) || metav1.GetControllerOf(pod) == nil {
+			continue
+		}
+		klog.Warningf("Pod %s/%s has been terminating since %s with a volume of ours — force-deleting so its "+
+			"controller can recreate it", pod.Namespace, pod.Name, pod.DeletionTimestamp.Time.Format(time.RFC3339))
+		ns.forceDeletePod(ctx, pod)
+	}
+}
+
+// podUsesOurVolumes reports whether any of the pod's PVCs is backed by a PV
+// belonging to this driver.
+func (ns *NodeServer) podUsesOurVolumes(ctx context.Context, pod *corev1.Pod) bool {
+	for _, v := range pod.Spec.Volumes {
+		if v.PersistentVolumeClaim == nil {
+			continue
+		}
+		pvc, err := ns.clientset.CoreV1().PersistentVolumeClaims(pod.Namespace).
+			Get(ctx, v.PersistentVolumeClaim.ClaimName, metav1.GetOptions{})
+		if err != nil || pvc.Spec.VolumeName == "" {
+			continue
+		}
+		pv, err := ns.clientset.CoreV1().PersistentVolumes().Get(ctx, pvc.Spec.VolumeName, metav1.GetOptions{})
+		if err != nil || pv.Spec.CSI == nil {
+			continue
+		}
+		if pv.Spec.CSI.Driver == DriverName {
+			return true
+		}
+	}
+	return false
+}
 
 // podStuckTerminating reports whether a pod has been terminating past its
 // deletion grace period (kubelet couldn't finish teardown).
@@ -1445,4 +1514,3 @@ func (ns *NodeServer) cleanupOrphanedVFSCacheDirs() {
 	rclone.CleanupOrphanedVFSCacheDirs(activeVolumeIDs)
 	klog.Infof("Orphaned VFS cache cleanup completed")
 }
-
