@@ -1028,7 +1028,7 @@ func (ns *NodeServer) sweepStuckTerminatingConsumers() {
 			continue
 		}
 		klog.Warningf("Pod %s/%s has been terminating since %s with a volume of ours — force-deleting so its "+
-			"controller can recreate it", pod.Namespace, pod.Name, pod.DeletionTimestamp.Time.Format(time.RFC3339))
+			"controller can recreate it", pod.Namespace, pod.Name, pod.DeletionTimestamp.Format(time.RFC3339))
 		ns.forceDeletePod(ctx, pod)
 	}
 }
