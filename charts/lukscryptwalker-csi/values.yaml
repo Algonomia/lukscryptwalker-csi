@@ -81,6 +81,12 @@ node:
   # PriorityClass name otherwise.
   priorityClassName: system-node-critical
 
+  # HOST ports (hostNetwork pod): these three share the node's port space and
+  # MUST be distinct — the chart refuses to render otherwise. The driver's
+  # registration-health endpoint, also passed to it via
+  # --registration-health-endpoint so probe and driver cannot drift apart.
+  registrationHealthPort: 9810
+
   # Sidecar images
   sidecars:
     nodeDriverRegistrar:
@@ -88,13 +94,15 @@ node:
         repository: registry.k8s.io/sig-storage/csi-node-driver-registrar
         tag: v2.13.0
         pullPolicy: IfNotPresent
+      # Port the registrar serves its own /healthz on.
+      healthPort: 9809
     livenessProbe:
       image:
         repository: registry.k8s.io/sig-storage/livenessprobe
         tag: v2.15.0
         pullPolicy: IfNotPresent
-      # Host port (hostNetwork pod); 9809/9810 are used by the registrar and
-      # the registration health endpoint.
+      # Port the livenessprobe sidecar serves /healthz on (the driver's own
+      # startup and liveness probes target it).
       healthPort: 9811
 
   resources:
@@ -140,38 +148,15 @@ storageClasses:
     volumeBindingMode: WaitForFirstConsumer
     # fsGroup: null  # Auto-detect from pod (default behavior)
     # fsMode: "0750"  # Recursive mode applied with fsGroup (default 0750).
-    #                 # 0750 works for PostgreSQL data dirs (0775 is rejected by PG);
-    #                 # set "0770" only if a non-owner container must group-write.
+    #                 # Set "0770" only if a non-owner container must group-write.
     secret:
       name: luks-secret
       namespace: kube-system
       passphraseKey: "passphrase"
 
-  # Example configurations for different database types
+  # Example: pin fsGroup instead of auto-detecting it from the pod.
   # Uncomment and customize as needed
-  
-  # - name: lukscryptwalker-postgres
-  #   isDefault: false
-  #   reclaimPolicy: Delete
-  #   allowVolumeExpansion: true
-  #   volumeBindingMode: WaitForFirstConsumer
-  #   fsGroup: 26  # PostgreSQL group
-  #   secret:
-  #     name: luks-secret
-  #     namespace: kube-system
-  #     passphraseKey: "passphrase"
-  
-  # - name: lukscryptwalker-mysql
-  #   isDefault: false
-  #   reclaimPolicy: Delete
-  #   allowVolumeExpansion: true
-  #   volumeBindingMode: WaitForFirstConsumer
-  #   fsGroup: 999  # MySQL group
-  #   secret:
-  #     name: luks-secret
-  #     namespace: kube-system
-  #     passphraseKey: "passphrase"
-  
+
   # - name: lukscryptwalker-custom
   #   isDefault: false
   #   reclaimPolicy: Delete
@@ -277,7 +262,7 @@ s3StorageClasses:
       pollInterval: "1m"  # How often rclone checks for stale cache entries
       writeBack: "5s"  # Time to wait before uploading modified files
       # Directory-metadata caching. Raise these for metadata-heavy workloads on
-      # large directories (e.g. pgbackrest WAL archives) so stat/readdir/exists
+      # large directories so stat/readdir/exists
       # checks don't trigger an S3 ListObjects + filename decryption every time.
       # Safe to set high for these RWO/single-writer volumes.
       # dirCacheTime: "1h"   # default: 1h

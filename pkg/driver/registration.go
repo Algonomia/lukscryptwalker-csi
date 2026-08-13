@@ -15,16 +15,15 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog"
 )
 
-// RegistrationHealthPort is where the driver serves its registration-health
-// endpoint; the node-driver-registrar's liveness probe targets it so a lost
-// registration restarts only the registrar, not the driver or its mounts.
-// Loopback only: with hostNetwork the pod IP is the node's (possibly public)
-// IP, where a firewall can silently eat probe traffic.
-const RegistrationHealthPort = "127.0.0.1:9810"
+// DefaultRegistrationHealthPort is where the driver serves registration health;
+// the registrar's liveness probe targets it, so a lost registration restarts
+// only the registrar. Loopback only (hostNetwork would otherwise expose the
+// node IP), and overridable: hostNetwork shares this port with everything else
+// on the node, and a hardcoded one cannot be moved out of a collision.
+const DefaultRegistrationHealthPort = "127.0.0.1:9810"
 
 // registrationStartupGrace lets initial registration complete before the
 // endpoint can report unhealthy.
@@ -83,19 +82,20 @@ func (ns *NodeServer) RunRegistrationHealthServer(addr string) {
 		}
 		failures++
 		klog.Errorf("Registration health server stopped: %v (retrying in 10s)", err)
-		// A port we cannot bind is a silent trap: nothing answers probes
-		// against it, so anything gated on it gets killed forever while our
-		// logs scroll by unread. An orphaned socket has no process to kill,
-		// so say so where an operator will see it.
+		// A port we cannot bind is a silent trap: probes gated on it fail
+		// forever. Name the holder — "address already in use" alone sends
+		// operators hunting for an orphan that may not exist.
 		if failures == bindFailureEventThreshold {
-			klog.Errorf("Registration health port %s has been unbindable for ~%ds — most likely an orphaned "+
-				"listener from a previous driver instance; it has no owning process and only a node reboot frees it",
-				addr, bindFailureEventThreshold*10)
+			holder := portHolderDescription(addr)
+			klog.Errorf("Registration health port %s has been unbindable for ~%ds — %s. Probes gated on this "+
+				"endpoint cannot succeed; move the driver with --registration-health-endpoint (chart: "+
+				"node.registrationHealthPort) or move whatever else is on this port",
+				addr, bindFailureEventThreshold*10, holder)
 			if ns.recorder != nil {
-				nodeRef := &corev1.ObjectReference{Kind: "Node", Name: ns.driver.nodeID, UID: types.UID(ns.driver.nodeID)}
-				ns.recorder.Eventf(nodeRef, corev1.EventTypeWarning, "RegistrationHealthPortUnavailable",
-					"Cannot bind registration health endpoint %s (%v). Probes against it cannot succeed; "+
-						"if the socket has no owning process, the node must be rebooted to free it.", addr, err)
+				ns.recorder.Eventf(ns.nodeRef(), corev1.EventTypeWarning, "RegistrationHealthPortUnavailable",
+					"Cannot bind registration health endpoint %s (%v): %s. Probes against it cannot succeed. "+
+						"Move the driver's endpoint (node.registrationHealthPort) or the conflicting listener.",
+					addr, err, holder)
 			}
 		}
 		time.Sleep(10 * time.Second)
@@ -106,6 +106,29 @@ func (ns *NodeServer) RunRegistrationHealthServer(addr string) {
 // pass before we escalate the unbindable port to a Node event.
 const bindFailureEventThreshold = 3
 
+// portHolderDescription names the process holding a listening address, so the
+// operator is told which container to move instead of guessing.
+func portHolderDescription(addr string) string {
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "could not parse the address to identify the holder"
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "could not parse the port to identify the holder"
+	}
+	pid, ok := pidListeningOn(port)
+	if !ok {
+		return "no process on this host holds a listening socket on it — an orphaned socket from a previous " +
+			"driver instance, which only a node reboot frees"
+	}
+	name := "unknown"
+	if cmdline, err := os.ReadFile("/proc/" + pid + "/cmdline"); err == nil {
+		name = strings.TrimSpace(strings.ReplaceAll(string(cmdline), "\x00", " "))
+	}
+	return "it is held by pid " + pid + " (" + name + ")"
+}
+
 // recordRegistrationTransition emits a Node event when registration health
 // changes state, so a lost registration is visible without reading driver logs.
 func (ns *NodeServer) recordRegistrationTransition(healthy bool) {
@@ -113,12 +136,11 @@ func (ns *NodeServer) recordRegistrationTransition(healthy bool) {
 	if ns.recorder == nil || was == !healthy {
 		return
 	}
-	nodeRef := &corev1.ObjectReference{Kind: "Node", Name: ns.driver.nodeID, UID: types.UID(ns.driver.nodeID)}
 	if healthy {
-		ns.recorder.Eventf(nodeRef, corev1.EventTypeNormal, "CSIRegistrationRecovered",
+		ns.recorder.Eventf(ns.nodeRef(), corev1.EventTypeNormal, "CSIRegistrationRecovered",
 			"CSI driver %s re-registered with kubelet", DriverName)
 	} else {
-		ns.recorder.Eventf(nodeRef, corev1.EventTypeWarning, "CSIRegistrationLost",
+		ns.recorder.Eventf(ns.nodeRef(), corev1.EventTypeWarning, "CSIRegistrationLost",
 			"CSI driver %s is not registered with kubelet — volume operations on this node will fail until the "+
 				"node-driver-registrar re-registers it", DriverName)
 	}

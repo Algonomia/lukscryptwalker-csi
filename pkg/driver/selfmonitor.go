@@ -8,6 +8,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lukscryptwalker-csi/pkg/asynclog"
+	"github.com/lukscryptwalker-csi/pkg/rclone"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog"
 )
 
@@ -34,6 +38,9 @@ func (ns *NodeServer) runSelfMonitor() {
 
 	var peakThreads, peakRSS int
 	for range ticker.C {
+		ns.reportLogStall()
+		ns.verifyCacheStillEncrypted()
+
 		goroutines := runtime.NumGoroutine()
 		threads := procStatusField("Threads")
 		rssKB := procStatusField("VmRSS")
@@ -50,14 +57,71 @@ func (ns *NodeServer) runSelfMonitor() {
 			goroutines, threads, peakThreads, rssKB/1024, peakRSS/1024, fds)
 
 		if threads >= threadWarnThreshold || goroutines >= goroutineWarnThreshold || rssKB >= rssWarnKB {
-			// Straight to stderr: if this is the run-up to the process dying,
-			// a queued line will not survive it.
+			// Straight to stderr and bounded: a queued line would not survive
+			// the death this is warning about.
 			buf := make([]byte, 1<<20)
 			n := runtime.Stack(buf, true)
-			fmt.Fprintf(os.Stderr, "RESOURCE-ALERT: goroutines=%d threads=%d rss=%dMi fds=%d; goroutine dump follows\n%s\n",
-				goroutines, threads, rssKB/1024, fds, buf[:n])
+			asynclog.WriteBounded(os.Stderr,
+				fmt.Sprintf("RESOURCE-ALERT: goroutines=%d threads=%d rss=%dMi fds=%d; goroutine dump follows\n%s\n",
+					goroutines, threads, rssKB/1024, fds, buf[:n]), 10*time.Second)
 		}
 	}
+}
+
+// verifyCacheStillEncrypted re-checks that the VFS cache is still its LUKS
+// volume: startup proves it once, but a later stray umount would send cached
+// contents to the node's disk in the clear. Reported, not fatal — exiting
+// would tear down every mount on the node, which is the operator's call.
+func (ns *NodeServer) verifyCacheStillEncrypted() {
+	err := rclone.VerifyCacheEncrypted()
+	wasBroken := ns.cacheUnencrypted.Swap(err != nil)
+
+	if err == nil {
+		if wasBroken && ns.recorder != nil {
+			ns.recorder.Eventf(ns.nodeRef(), corev1.EventTypeNormal, "VFSCacheEncryptionRestored",
+				"The VFS cache is mounted on its LUKS volume again")
+		}
+		return
+	}
+
+	klog.Errorf("PLAINTEXT RISK: %v", err)
+	if wasBroken || ns.recorder == nil {
+		return // one event per occurrence
+	}
+	ns.recorder.Eventf(ns.nodeRef(), corev1.EventTypeWarning, "VFSCacheNotEncrypted",
+		"The CSI driver's VFS cache is not on its encrypted volume: %v. Cached contents of S3-backed volumes "+
+			"are being written to this node's disk in plaintext. Restart the driver pod on this node.", err)
+}
+
+// logStallEventThreshold is how long output must be blocked to be worth an event.
+const logStallEventThreshold = 60 * time.Second
+
+// reportLogStall raises a Node event while the process cannot emit log lines:
+// a blocked log pipe silences everything once the buffer fills, so the driver
+// reads as frozen while it is serving fine. Events go via the API, not the pipe.
+func (ns *NodeServer) reportLogStall() {
+	stalled := asynclog.DefaultStalledFor()
+	wasStalled := ns.logStalled.Swap(stalled >= logStallEventThreshold)
+
+	if stalled < logStallEventThreshold {
+		if wasStalled && ns.recorder != nil {
+			ns.recorder.Eventf(ns.nodeRef(), corev1.EventTypeNormal, "DriverLogOutputRecovered",
+				"Driver log output is flowing again; the gap in the container log was blocked output, not inactivity")
+		}
+		return
+	}
+	if wasStalled || ns.recorder == nil {
+		return // one event per stall, not one per minute
+	}
+	ns.recorder.Eventf(ns.nodeRef(), corev1.EventTypeWarning, "DriverLogOutputStalled",
+		"The CSI driver has been unable to write a log line for %s (blocked container log pipe). The driver is "+
+			"still running and its mounts are still served — an empty container log is NOT evidence of a freeze.",
+		stalled.Round(time.Second))
+}
+
+// nodeRef is the object reference for events about this node.
+func (ns *NodeServer) nodeRef() *corev1.ObjectReference {
+	return &corev1.ObjectReference{Kind: "Node", Name: ns.driver.nodeID, UID: types.UID(ns.driver.nodeID)}
 }
 
 // procStatusField reads a numeric field (kB or count) from /proc/self/status.

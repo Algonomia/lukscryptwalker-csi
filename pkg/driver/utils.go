@@ -5,9 +5,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"k8s.io/klog"
 )
@@ -108,13 +110,81 @@ func GenerateBackingFilePath(localPath, volumeID string) string {
 	return filepath.Join(localPath, fmt.Sprintf("luks-%s.img", volumeID))
 }
 
+// loopDevicesFor returns the loop devices currently backed by backingFile.
+func loopDevicesFor(backingFile string) []string {
+	out, err := runCmdBoundedOutput(30*time.Second, "losetup", "-j", backingFile)
+	if err != nil {
+		klog.V(4).Infof("losetup -j %s: %v", backingFile, err)
+		return nil
+	}
+	return parseLosetupJ(out)
+}
+
+// parseLosetupJ extracts device paths from `losetup -j` output, whose lines
+// look like "/dev/loop3: [64769]:1234 (/path/to/backing.img (deleted))".
+func parseLosetupJ(out string) []string {
+	var devices []string
+	for _, line := range strings.Split(out, "\n") {
+		dev, _, ok := strings.Cut(strings.TrimSpace(line), ":")
+		if ok && strings.HasPrefix(dev, "/dev/") {
+			devices = append(devices, dev)
+		}
+	}
+	return devices
+}
+
+// detachLoopDevicesFor releases every loop device still holding backingFile.
+// Detaching one genuinely in use fails harmlessly; leaving it attached does not.
+func detachLoopDevicesFor(backingFile string) {
+	for _, dev := range loopDevicesFor(backingFile) {
+		if err := runCmdBounded(30*time.Second, "losetup", "-d", dev); err != nil {
+			klog.Warningf("Could not detach loop device %s for %s: %v", dev, backingFile, err)
+			continue
+		}
+		klog.Infof("Detached leaked loop device %s (backing file %s)", dev, backingFile)
+	}
+}
+
+// mountsBackedBy returns host mountpoints served by device, deepest first so a
+// pod's bind is released before the staging mount it points at.
+func mountsBackedBy(device string) []string {
+	out, err := runCmdBoundedOutput(30*time.Second,
+		"nsenter", "-t", "1", "-m", "findmnt", "-rn", "-o", "TARGET", "-S", device)
+	if err != nil {
+		// findmnt exits 1 when nothing matches, which is the common case.
+		klog.V(4).Infof("findmnt -S %s: %v", device, err)
+		return nil
+	}
+	return parseFindmntTargets(out)
+}
+
+// parseFindmntTargets turns `findmnt -rn -o TARGET` output into mountpoints.
+func parseFindmntTargets(out string) []string {
+	var targets []string
+	for _, line := range strings.Split(out, "\n") {
+		if t := strings.TrimSpace(line); t != "" {
+			targets = append(targets, unescapeMountTarget(t))
+		}
+	}
+	sort.Slice(targets, func(i, j int) bool { return len(targets[i]) > len(targets[j]) })
+	return targets
+}
+
+// unescapeMountTarget decodes the octal escapes findmnt's raw output uses.
+func unescapeMountTarget(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	return strings.NewReplacer(`\x20`, " ", `\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`).Replace(s)
+}
+
 // GetLocalPath determines the local path for a volume using environment variable
 func GetLocalPath(volumeID string) string {
 	// Use environment variable
 	if envPath := os.Getenv("CSI_LOCAL_PATH"); envPath != "" {
 		return filepath.Join(envPath, volumeID)
 	}
-	
+
 	// Fallback to default
 	return filepath.Join(DefaultLocalPath, volumeID)
 }

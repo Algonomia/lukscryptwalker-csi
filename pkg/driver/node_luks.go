@@ -77,6 +77,13 @@ func (ns *NodeServer) cleanupVolumeStaging(volumeID, stagingTargetPath string) e
 		return fmt.Errorf("failed to close LUKS device: %v", err)
 	}
 
+	// Detach any loop device still holding the backing file. cryptsetup arms
+	// autoclear on the loop it creates, but that only fires once the mapper is
+	// gone cleanly; a loop left armed-but-attached keeps the blocks of an
+	// already-deleted backing file allocated (df/du divergence on /mnt) until
+	// the node reboots, and eventually blocks new volumes from being created.
+	detachLoopDevicesFor(GenerateBackingFilePath(GetLocalPath(volumeID), volumeID))
+
 	// Clean up staging target directory (kubelet expects this to be removed)
 	if stagingTargetPath != "" {
 		if err := os.RemoveAll(stagingTargetPath); err != nil && !os.IsNotExist(err) {

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,8 +34,8 @@ const (
 	VFSCacheMaxSizeParam      = "rclone-vfs-cache-max-size"      // e.g., "10G", "100M"
 	VFSCachePollIntervalParam = "rclone-vfs-cache-poll-interval" // e.g., "1m", "5m"
 	VFSWriteBackParam         = "rclone-vfs-write-back"          // e.g., "5s", "0"
-	// Directory-metadata caching (mount options). Raise these for
-	// metadata-heavy workloads on large directories (e.g. pgbackrest WAL).
+	// Directory-metadata caching (mount options). Raise for metadata-heavy
+	// workloads on large directories.
 	DirCacheTimeParam = "rclone-dir-cache-time" // e.g., "5m", "1h"
 	AttrTimeoutParam  = "rclone-attr-timeout"   // e.g., "5m", "1h"
 	// Per-volume budget: parallel chunk download streams. Cap low (e.g. "2")
@@ -53,6 +52,19 @@ type S3SyncManager struct {
 	backgroundDrains map[string]chan struct{} // volumeID → closed when drain completes
 	pendingDrains    map[string]bool          // volumeIDs with drain pending from a previous driver instance
 	drainMu          sync.Mutex
+	// volumeLocks serializes mount/unmount work per volume: markVolumeSetupInProgress
+	// is advisory (only the checker consults it), so two mounts could otherwise
+	// interleave and register two VFSes under one name.
+	volumeLocks sync.Map // volumeID → *sync.Mutex
+}
+
+// lockVolume serializes mount lifecycle work for one volume. Take it in CSI
+// handlers and reconcile — never in setupS3Sync/cleanupS3Sync, which run under it.
+func (sm *S3SyncManager) lockVolume(volumeID string) func() {
+	v, _ := sm.volumeLocks.LoadOrStore(volumeID, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 // NewS3SyncManager creates a new S3 sync manager
@@ -253,9 +265,10 @@ func (ns *NodeServer) setupS3Sync(volumeID, stagingPath string, volumeContext ma
 		return fmt.Errorf("failed to create rclone mount manager: %v", err)
 	}
 
-	// Mount the encrypted S3 remote
+	// Mount the encrypted S3 remote. %w, not %v: callers distinguish a mount
+	// ripped out by a stale finalizer (retry now) from a real failure.
 	if err := mountMgr.Mount(); err != nil {
-		return fmt.Errorf("failed to mount S3 volume: %v", err)
+		return fmt.Errorf("failed to mount S3 volume: %w", err)
 	}
 
 	// Store mount manager
@@ -342,21 +355,22 @@ func (ns *NodeServer) cleanupS3Sync(volumeID string) (bool, error) {
 
 	ns.s3SyncMgr.mutex.Lock()
 	mountMgr, exists := ns.s3SyncMgr.mountManagers[volumeID]
+	ns.s3SyncMgr.mutex.Unlock()
 	if !exists {
-		ns.s3SyncMgr.mutex.Unlock()
 		return false, nil
 	}
 
-	// Fast path: nothing pending, unmount synchronously.
+	// Fast path, bounded and NOT under the manager-map lock: holding it through
+	// a long drain would stall every other S3 volume on the node.
 	if mountMgr.IsUploadQueueEmpty() {
-		defer ns.s3SyncMgr.mutex.Unlock()
-		if err := mountMgr.Unmount(); err != nil {
+		if err := mountMgr.UnmountWithin(rclone.ShortDrainWait); err != nil {
 			return false, err
 		}
+		ns.s3SyncMgr.mutex.Lock()
 		delete(ns.s3SyncMgr.mountManagers, volumeID)
+		ns.s3SyncMgr.mutex.Unlock()
 		return false, nil
 	}
-	ns.s3SyncMgr.mutex.Unlock()
 
 	// Uploads in progress: drain in the background so NodeUnstageVolume returns
 	// immediately, letting kubelet delete the pod and the StatefulSet schedule
@@ -439,6 +453,14 @@ func (ns *NodeServer) cleanupStaleS3Mounts() {
 	// mid-stall kills healthy consumers and adds churn. Wait the wave out.
 	if pct, stalled := nodeIOStalled(); stalled {
 		klog.Warningf("Node I/O is stalling (PSI full avg10=%.0f%%); deferring stale-mount recovery this tick", pct)
+		return
+	}
+
+	// Every decision below rests on the host mount table; unreadable makes
+	// "no mount" and "cannot tell" indistinguishable, so skip the tick.
+	if !rclone.HostMountsKnown() {
+		klog.Error("Host mount table is unreadable (a wedged umount holds the kernel mount lock); skipping this " +
+			"stale-mount tick — mount state cannot be distinguished from absence")
 		return
 	}
 
@@ -572,6 +594,9 @@ func (ns *NodeServer) cleanupStaleS3Mounts() {
 // those with HostToContainer/Bidirectional propagation are left running, the
 // rest are restarted. On re-mount failure it falls back to remove + restart all.
 func (ns *NodeServer) reconcileS3Mount(volumeID, globalmountPath string, volumeContext map[string]string) {
+	// Serialize against CSI handlers: the setup-in-progress flag is advisory.
+	defer ns.s3SyncMgr.lockVolume(volumeID)()
+
 	// Guard against the periodic checker racing with our own re-mount.
 	ns.s3SyncMgr.markVolumeSetupInProgress(volumeID)
 	defer ns.s3SyncMgr.markVolumeSetupComplete(volumeID)
@@ -598,32 +623,26 @@ func (ns *NodeServer) reconcileS3Mount(volumeID, globalmountPath string, volumeC
 	abortFUSEConnection(globalmountPath)
 	_ = runCmdBounded(30*time.Second, "umount", "-l", globalmountPath)
 
-	if err := os.MkdirAll(globalmountPath, 0777); err != nil {
+	if err := mkdirAllBounded(globalmountPath, 0777, 30*time.Second); err != nil {
 		klog.Warningf("Volume %s: failed to ensure globalmount dir: %v", volumeID, err)
 	}
 
-	// The old session's Wait() finalizer fires asynchronously after its serve
-	// loop exits, and unmounts whatever it finds at the path ("Unmounted
-	// rclone mount"). Mount only after it has fired against the empty path,
-	// and verify the fresh mount survived before touching consumers.
+	// An old session's finalizer fires seconds after its serve loop exits and
+	// unmounts whatever rclone mount it finds at the path. Retry here rather
+	// than next tick: each session rips out at most one successor, so this
+	// converges, whereas one attempt per tick just mounts the next victim.
 	mounted := false
-	for attempt := 0; attempt < 2; attempt++ {
-		if hadSession || attempt > 0 {
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		if hadSession && attempt == 0 {
 			time.Sleep(2 * time.Second)
 		}
-		if err := ns.setupS3Sync(volumeID, globalmountPath, volumeContext, nil, fsGroup); err != nil {
-			klog.Errorf("Volume %s: in-place re-mount failed (%v); falling back to remove + restart all consumers", volumeID, err)
-			_ = os.RemoveAll(globalmountPath)
-			ns.restartPodsWithStaleS3Mount(volumeID)
-			return
-		}
-		time.Sleep(1 * time.Second)
-		if ns.isFUSEMountPoint(globalmountPath) {
+		err := ns.setupS3Sync(volumeID, globalmountPath, volumeContext, nil, fsGroup)
+		if err == nil {
 			mounted = true
 			break
 		}
-		klog.Warningf("Volume %s: fresh mount was unmounted from under us (previous session's finalizer); retrying",
-			volumeID)
+		lastErr = err
 		ns.s3SyncMgr.mutex.Lock()
 		if old := ns.s3SyncMgr.mountManagers[volumeID]; old != nil {
 			old.StopCacheMonitor()
@@ -631,8 +650,26 @@ func (ns *NodeServer) reconcileS3Mount(volumeID, globalmountPath string, volumeC
 		delete(ns.s3SyncMgr.mountManagers, volumeID)
 		ns.s3SyncMgr.mutex.Unlock()
 		hadSession = rclone.UnmountDead(globalmountPath)
+
+		// Only a rip-out is worth retrying now; any other failure would burn the
+		// checker budget four times over. Next tick retries with backoff.
+		if !errors.Is(err, rclone.ErrMountRippedOut) {
+			klog.Errorf("Volume %s: in-place re-mount failed: %v", volumeID, err)
+			break
+		}
+		klog.Warningf("Volume %s: attempt %d was unmounted by a previous session's finalizer; that session has "+
+			"now spent its unmount, retrying immediately", volumeID, attempt+1)
 	}
 	if !mounted {
+		// Last resort, not the response to one failed mount: rate-limited like
+		// every other destructive recovery.
+		if lastErr != nil && ns.consumerRestartAllowed(volumeID) {
+			klog.Errorf("Volume %s: in-place re-mount keeps failing (%v); falling back to remove + restart all consumers",
+				volumeID, lastErr)
+			removeAllBounded(globalmountPath, 60*time.Second)
+			ns.restartPodsWithStaleS3Mount(volumeID)
+			return
+		}
 		klog.Errorf("Volume %s: fresh mount did not survive; leaving consumers alone, next checker tick retries", volumeID)
 		return
 	}
@@ -819,13 +856,12 @@ func (ns *NodeServer) consumerMountHealthy(podUID, pvName, globalmountPath strin
 	mountPath := filepath.Join(resolveKubeletRoot(), "pods", podUID,
 		"volumes", "kubernetes.io~csi", pvName, "mount")
 
-	var want syscall.Stat_t
-	if err := syscall.Stat(globalmountPath, &want); err != nil {
+	want, err := statBounded(globalmountPath, 5*time.Second)
+	if err != nil {
 		return false
 	}
 	for attempt := 0; attempt < 6; attempt++ {
-		var got syscall.Stat_t
-		err := syscall.Stat(mountPath, &got)
+		got, err := statBounded(mountPath, 5*time.Second)
 		if errors.Is(err, syscall.ENOENT) {
 			return true
 		}
@@ -1203,14 +1239,45 @@ func abortFUSEConnection(mountPoint string) {
 		if !ok {
 			continue
 		}
-		abortPath := "/sys/fs/fuse/connections/" + minor + "/abort"
-		if err := os.WriteFile(abortPath, []byte("1"), 0200); err != nil {
-			klog.Warningf("abortFUSEConnection %s: write %s failed: %v", mountPoint, abortPath, err)
+		if err := writeFUSEAbort(minor); err != nil {
+			klog.Warningf("abortFUSEConnection %s: aborting connection %s failed: %v", mountPoint, minor, err)
 		} else {
 			klog.Infof("abortFUSEConnection %s: aborted FUSE connection %s", mountPoint, minor)
 		}
 		return
 	}
+}
+
+// fusectl is a separate filesystem mounted only on the host, so this path
+// reads as empty in our container and every abort through it silently does
+// nothing. Fall back to the host mount namespace.
+const fuseConnectionsDir = "/sys/fs/fuse/connections"
+
+// writeFUSEAbort aborts a FUSE connection by device minor, ours then the host's.
+func writeFUSEAbort(minor string) error {
+	abortPath := fuseConnectionsDir + "/" + minor + "/abort"
+	if err := os.WriteFile(abortPath, []byte("1"), 0200); err == nil {
+		return nil
+	}
+	return runCmdBounded(15*time.Second, "nsenter", "-t", "1", "-m", "sh", "-c",
+		"echo 1 > "+abortPath)
+}
+
+// listFUSEConnections returns the kernel's FUSE connection minors.
+func listFUSEConnections() []string {
+	if entries, err := os.ReadDir(fuseConnectionsDir); err == nil && len(entries) > 0 {
+		conns := make([]string, 0, len(entries))
+		for _, e := range entries {
+			conns = append(conns, e.Name())
+		}
+		return conns
+	}
+	out, err := runCmdBoundedOutput(15*time.Second, "nsenter", "-t", "1", "-m", "ls", fuseConnectionsDir)
+	if err != nil {
+		klog.V(4).Infof("Could not list FUSE connections in the host namespace: %v", err)
+		return nil
+	}
+	return strings.Fields(out)
 }
 
 // runCmdBounded runs a command with a hard timeout, returning without waiting
@@ -1278,8 +1345,8 @@ func parseIOPressure(s string) (float64, bool) {
 // predecessor driver pod, which then wedges holding our ports) in
 // uninterruptible sleep. Runs once at startup; needs hostPID and writable /sys.
 func abortOrphanedFUSEConnections() {
-	conns, err := os.ReadDir("/sys/fs/fuse/connections")
-	if err != nil || len(conns) == 0 {
+	conns := listFUSEConnections()
+	if len(conns) == 0 {
 		return
 	}
 
@@ -1312,15 +1379,16 @@ func abortOrphanedFUSEConnections() {
 		}
 	}
 
-	for _, c := range conns {
-		if !c.IsDir() || mounted[c.Name()] {
+	for _, minor := range conns {
+		if mounted[minor] {
 			continue
 		}
-		abortPath := "/sys/fs/fuse/connections/" + c.Name() + "/abort"
-		if err := os.WriteFile(abortPath, []byte("1"), 0200); err == nil {
-			klog.Warningf("Aborted orphaned FUSE connection %s (detached superblock, mounted in no namespace) — "+
-				"releases processes wedged on dead mounts", c.Name())
+		if err := writeFUSEAbort(minor); err != nil {
+			klog.Warningf("Could not abort orphaned FUSE connection %s: %v", minor, err)
+			continue
 		}
+		klog.Warningf("Aborted orphaned FUSE connection %s (detached superblock, mounted in no namespace) — "+
+			"releases processes wedged on dead mounts", minor)
 	}
 }
 
@@ -1352,54 +1420,88 @@ func (ns *NodeServer) statfsBounded(path string, timeout time.Duration) (error, 
 	}
 }
 
+// statBounded stats a path without parking the caller on a wedged FUSE.
+func statBounded(path string, timeout time.Duration) (syscall.Stat_t, error) {
+	type result struct {
+		st  syscall.Stat_t
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		var r result
+		r.err = syscall.Stat(path, &r.st)
+		done <- r
+	}()
+	select {
+	case r := <-done:
+		return r.st, r.err
+	case <-time.After(timeout):
+		return syscall.Stat_t{}, fmt.Errorf("stat %s blocked for %s (wedged FUSE)", path, timeout)
+	}
+}
+
+// removeAllBounded removes a tree without blocking on a wedged mount under it.
+func removeAllBounded(path string, timeout time.Duration) {
+	done := make(chan error, 1)
+	go func() { done <- os.RemoveAll(path) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			klog.Warningf("Failed to remove %s: %v", path, err)
+		}
+	case <-time.After(timeout):
+		klog.Warningf("Removing %s blocked for %s (a wedged mount is still attached there); giving up", path, timeout)
+	}
+}
+
+// mkdirAllBounded creates a tree without blocking on a wedged mount there.
+func mkdirAllBounded(path string, perm os.FileMode, timeout time.Duration) error {
+	done := make(chan error, 1)
+	go func() { done <- os.MkdirAll(path, perm) }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("mkdir %s blocked for %s (a wedged mount is still attached there)", path, timeout)
+	}
+}
+
 // isMountDeadErr matches errnos that indicate a dead or zombie mount rather
 // than a normal filesystem condition.
 func isMountDeadErr(err error) bool {
 	return errors.Is(err, syscall.EIO) || errors.Is(err, syscall.ENOTCONN) || errors.Is(err, syscall.ESTALE)
 }
 
-// probeMountReads exercises a mount past the dir cache: lists directories
-// breadth-first (depth ≤3, bounded fan-out) and opens the first regular file
-// found — a cached listing can succeed while a zombie VFS fails every open.
+// probeMountReads exercises a mount past the dir cache: lists breadth-first
+// (depth ≤3) and opens the first regular file — a cached listing can succeed
+// while a zombie VFS fails every open. Raw syscalls only; see rclone.ReadDirRaw.
 func probeMountReads(root string) error {
 	dirs := []string{root}
 	for depth := 0; depth < 3 && len(dirs) > 0; depth++ {
 		var next []string
 		for _, dir := range dirs {
-			d, err := os.Open(dir)
-			if err != nil {
-				if isMountDeadErr(err) {
-					return err
-				}
-				continue
-			}
-			entries, err := d.ReadDir(512)
-			_ = d.Close()
-			if err != nil && err != io.EOF {
-				if isMountDeadErr(err) {
-					return err
-				}
-				continue
+			entries, err := rclone.ReadDirRaw(dir, 512)
+			if err != nil && isMountDeadErr(err) {
+				return err
 			}
 			for _, e := range entries {
-				p := filepath.Join(dir, e.Name())
-				if e.IsDir() {
+				p := filepath.Join(dir, e.Name)
+				if e.IsDir {
 					if len(next) < 8 {
 						next = append(next, p)
 					}
 					continue
 				}
-				if !e.Type().IsRegular() {
+				// DT_UNKNOWN is worth probing: the open decides what it is.
+				if !e.IsRegular && !e.Unknown {
 					continue
 				}
-				f, err := os.Open(p)
-				if err != nil {
+				if err := rclone.OpenProbeRaw(p); err != nil {
 					if isMountDeadErr(err) {
 						return err
 					}
 					continue
 				}
-				_ = f.Close()
 				return nil
 			}
 		}
@@ -1415,6 +1517,30 @@ func probeMountReads(root string) error {
 // consumer.
 func (ns *NodeServer) isFUSEMountPoint(path string) bool {
 	return rclone.IsHostFUSEMount(path)
+}
+
+// verifyS3StagingLive returns nil only when stagingPath is a host-visible
+// rclone FUSE mount that still answers. The gate before binding into a pod:
+// the directory under a missing mount is writable node-local storage.
+func (ns *NodeServer) verifyS3StagingLive(stagingPath string) error {
+	isFUSE, known := rclone.HostFUSEMountState(stagingPath)
+	if !known {
+		return fmt.Errorf("the host mount table is unreadable, so %s cannot be confirmed as a live FUSE mount", stagingPath)
+	}
+	if !isFUSE {
+		return fmt.Errorf("%s is not an rclone FUSE mount in the host namespace; binding it would expose the "+
+			"empty directory underneath and write plaintext to the node disk instead of S3", stagingPath)
+	}
+
+	// statfs is FUSE-local and surfaces ENOTCONN/ESTALE/EIO on a dead mount.
+	statErr, timedOut := ns.statfsBounded(stagingPath, 5*time.Second)
+	if timedOut {
+		return fmt.Errorf("statfs on %s blocked for 5s: the FUSE daemon is wedged", stagingPath)
+	}
+	if statErr != nil {
+		return fmt.Errorf("statfs on %s failed: %w", stagingPath, statErr)
+	}
+	return nil
 }
 
 // getVolumeIDFromVolData reads the volume ID from kubelet's vol_data.json file
@@ -1475,9 +1601,7 @@ func (ns *NodeServer) unmountStaleS3Mount(mountPath string) {
 		klog.Warningf("umount -l failed for %s: %v", mountPath, err)
 	}
 
-	if err := os.RemoveAll(mountPath); err != nil {
-		klog.Warningf("Failed to remove directory %s: %v", mountPath, err)
-	}
+	removeAllBounded(mountPath, 60*time.Second)
 }
 
 // cleanupOrphanedVFSCacheDirs removes VFS cache directories for volumes whose
@@ -1489,28 +1613,24 @@ func (ns *NodeServer) cleanupOrphanedVFSCacheDirs() {
 		return
 	}
 
-	nameMap := rclone.LoadVFSNameMap()
-	if len(nameMap) == 0 {
-		klog.V(4).Infof("No persisted VFS name mappings, skipping orphan cleanup")
-		return
-	}
-
-	klog.Infof("Checking %d persisted VFS name mappings for orphaned cache dirs", len(nameMap))
-
 	ctx := context.Background()
-	activeVolumeIDs := make(map[string]bool)
-
-	for volumeID := range nameMap {
+	memo := make(map[string]bool)
+	isActive := func(volumeID string) bool {
+		if known, ok := memo[volumeID]; ok {
+			return known
+		}
 		_, err := ns.clientset.CoreV1().PersistentVolumes().Get(ctx, volumeID, metav1.GetOptions{})
-		if err == nil {
-			activeVolumeIDs[volumeID] = true
-		} else if !k8serrors.IsNotFound(err) {
+		active := true
+		if k8serrors.IsNotFound(err) {
+			active = false
+		} else if err != nil {
 			// API error — treat as active to be safe
 			klog.Warningf("Error checking PV %s: %v, treating as active", volumeID, err)
-			activeVolumeIDs[volumeID] = true
 		}
+		memo[volumeID] = active
+		return active
 	}
 
-	rclone.CleanupOrphanedVFSCacheDirs(activeVolumeIDs)
+	rclone.CleanupOrphanedVFSCacheDirs(isActive)
 	klog.Infof("Orphaned VFS cache cleanup completed")
 }

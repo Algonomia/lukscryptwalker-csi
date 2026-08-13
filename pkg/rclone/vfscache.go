@@ -8,8 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/lukscryptwalker-csi/pkg/luks"
+	"github.com/rclone/rclone/fs/config"
 	"k8s.io/klog"
 )
 
@@ -34,9 +36,37 @@ const (
 	VFSCacheBackingFile = "/var/lib/lukscrypt-vfs-cache/vfs-cache.luks"
 )
 
+// vfsCacheNodeIDFile records the node ID the cache volume was formatted for.
+// The passphrase embeds the node ID, so without this a node rename orphans the
+// cache: cryptsetup reports only "No key available with this passphrase", the
+// driver exits, and every volume on the node goes down over a lost cache.
+// Overridable in tests.
+var vfsCacheNodeIDFile = "/var/lib/lukscrypt-vfs-cache/.node-id"
+
+// vfsCachePassphrase derives the cache passphrase, preferring the node ID the
+// volume was actually formatted with so renames stay recoverable.
+func vfsCachePassphrase(basePassphrase, nodeID string) string {
+	if recorded, err := os.ReadFile(vfsCacheNodeIDFile); err == nil {
+		if id := strings.TrimSpace(string(recorded)); id != "" && id != nodeID {
+			klog.Warningf("VFS cache was formatted for node %q but this node is now %q (renamed?) — "+
+				"using the recorded id so the existing cache still opens", id, nodeID)
+			return fmt.Sprintf("%s-%s", basePassphrase, id)
+		}
+	}
+	return fmt.Sprintf("%s-%s", basePassphrase, nodeID)
+}
+
+// recordVFSCacheNodeID stores the node ID used to format the cache volume.
+func recordVFSCacheNodeID(nodeID string) {
+	if err := os.WriteFile(vfsCacheNodeIDFile, []byte(nodeID+"\n"), 0600); err != nil {
+		klog.Warningf("Could not record VFS cache node id (a node rename will orphan the cache): %v", err)
+	}
+}
+
 // SetupVFSCache creates and mounts an encrypted LUKS volume for VFS cache
 // Returns the mount path or empty string if setup fails
-func SetupVFSCache(sizeStr string, passphrase string) (string, error) {
+func SetupVFSCache(sizeStr string, basePassphrase string, nodeID string) (string, error) {
+	passphrase := vfsCachePassphrase(basePassphrase, nodeID)
 	// Mount directly at the rclone cache base path
 	mountPath := VFSCacheBasePath
 
@@ -66,6 +96,9 @@ func SetupVFSCache(sizeStr string, passphrase string) (string, error) {
 			// Fall through to re-setup with the new size
 		} else {
 			klog.Infof("VFS cache already mounted at %s", mountPath)
+			if err := pinAndVerifyCacheDir(mountPath); err != nil {
+				return "", err
+			}
 			return mountPath, nil
 		}
 	}
@@ -121,6 +154,9 @@ func SetupVFSCache(sizeStr string, passphrase string) (string, error) {
 			_ = os.Remove(VFSCacheBackingFile)
 			return "", fmt.Errorf("failed to format VFS cache filesystem: %w", err)
 		}
+
+		// Remember which node ID this volume's passphrase was built from.
+		recordVFSCacheNodeID(nodeID)
 	} else {
 		// Backing file exists, just open it
 		loopDevice, err := setupLoopDevice(VFSCacheBackingFile)
@@ -130,7 +166,18 @@ func SetupVFSCache(sizeStr string, passphrase string) (string, error) {
 
 		if err := luksManager.OpenLUKS(loopDevice, VFSCacheMapperName, passphrase); err != nil {
 			_ = detachLoopDevice(loopDevice)
-			return "", fmt.Errorf("failed to open LUKS VFS cache: %w", err)
+			// cryptsetup only says "No key available with this passphrase",
+			// which explains nothing to whoever is paged at 3am. The
+			// passphrase is <luks-secret>-<nodeID>, so name both inputs and
+			// the way out.
+			return "", fmt.Errorf("failed to open the encrypted VFS cache at %s: %w.\n"+
+				"The passphrase is derived from the LUKS secret and this node's id (currently %q). "+
+				"It fails when the secret was regenerated (helm reinstall with secret.create=true), "+
+				"the node was renamed, or the chart now points at a different secret.\n"+
+				"To recover unuploaded writes, open it manually with the ORIGINAL passphrase "+
+				"(`printf '%%s-%%s' <secret> <old-node-id> | cryptsetup luksOpen %s tmp -`) and copy them out; "+
+				"otherwise move %s aside and the driver will recreate it — losing only data not yet uploaded to S3",
+				VFSCacheBackingFile, err, nodeID, VFSCacheBackingFile, VFSCacheBackingFile)
 		}
 
 		// Resize if the configured size grew (e.g. Helm value changed).
@@ -147,8 +194,48 @@ func SetupVFSCache(sizeStr string, passphrase string) (string, error) {
 		return "", fmt.Errorf("failed to mount VFS cache filesystem: %w", err)
 	}
 
+	if err := pinAndVerifyCacheDir(mountPath); err != nil {
+		return "", err
+	}
+
 	klog.Infof("Successfully set up encrypted VFS cache at %s", mountPath)
 	return mountPath, nil
+}
+
+// pinAndVerifyCacheDir points rclone's cache at the encrypted volume and proves
+// the volume is mounted there. Runs on every path out of SetupVFSCache.
+func pinAndVerifyCacheDir(mountPath string) error {
+	// Pin rather than inherit: rclone derives the cache dir from
+	// os.UserCacheDir() and silently falls back to os.TempDir() if HOME and
+	// XDG_CACHE_HOME are unset, putting plaintext outside this LUKS volume.
+	if err := config.SetCacheDir(mountPath); err != nil {
+		return fmt.Errorf("failed to pin rclone cache dir to %s: %w", mountPath, err)
+	}
+	if got := config.GetCacheDir(); got != mountPath {
+		return fmt.Errorf("rclone cache dir is %s, not the encrypted volume at %s", got, mountPath)
+	}
+	return VerifyCacheEncrypted()
+}
+
+// VerifyCacheEncrypted errors unless the cache path is a distinct mount from
+// its parent, i.e. the LUKS volume really is mounted there.
+func VerifyCacheEncrypted() error { return verifyCacheEncryptedAt(VFSCacheBasePath) }
+
+// verifyCacheEncryptedAt compares st_dev with the parent's: no mount table,
+// so a stale one cannot fool it.
+func verifyCacheEncryptedAt(path string) error {
+	var cache, parent syscall.Stat_t
+	if err := syscall.Stat(path, &cache); err != nil {
+		return fmt.Errorf("cannot stat the VFS cache dir %s: %w", path, err)
+	}
+	if err := syscall.Stat(filepath.Dir(path), &parent); err != nil {
+		return fmt.Errorf("cannot stat %s: %w", filepath.Dir(path), err)
+	}
+	if cache.Dev == parent.Dev {
+		return fmt.Errorf("the encrypted VFS cache is NOT mounted at %s (same device as its parent): "+
+			"cached file contents would be written to this node's disk in plaintext", path)
+	}
+	return nil
 }
 
 // TeardownVFSCache unmounts and closes the encrypted VFS cache
@@ -312,8 +399,6 @@ func unmountFilesystem(mountPath string) error {
 	return cmd.Run()
 }
 
-
-
 // GetVFSCacheSize returns the configured VFS cache size in bytes
 func GetVFSCacheSize() int64 {
 	return vfsCacheSize
@@ -419,36 +504,21 @@ func RemoveVFSName(volumeID string) {
 	klog.V(4).Infof("Removed VFS name mapping for volume %s", volumeID)
 }
 
-// CleanupOrphanedVFSCacheDirs removes VFS cache directories for volumes
-// that are no longer active. For each entry in the persisted map where the
-// volumeID is NOT in activeVolumeIDs, it removes the cache directory and
-// the map entry.
-func CleanupOrphanedVFSCacheDirs(activeVolumeIDs map[string]bool) {
+// CleanupOrphanedVFSCacheDirs removes cache dirs no live volume needs. isActive
+// is consulted per candidate, so the persisted map alone never causes a delete.
+func CleanupOrphanedVFSCacheDirs(isActive func(volumeID string) bool) {
 	vfsNameMapMu.Lock()
 	defer vfsNameMapMu.Unlock()
 
 	m := LoadVFSNameMap()
-	if len(m) == 0 {
-		return
-	}
 
 	changed := false
 	for volumeID, vfsName := range m {
-		if activeVolumeIDs[volumeID] {
+		if isActive(volumeID) {
 			continue
 		}
-
-		cacheDir := fmt.Sprintf("%s/vfs/%s", VFSCacheBasePath, vfsName)
-		metaDir := fmt.Sprintf("%s/vfsMeta/%s", VFSCacheBasePath, vfsName)
-		klog.Infof("Cleaning up orphaned VFS cache for volume %s: %s", volumeID, cacheDir)
-
-		if err := os.RemoveAll(cacheDir); err != nil {
-			klog.Warningf("Failed to remove orphaned VFS cache dir %s: %v", cacheDir, err)
-		}
-		if err := os.RemoveAll(metaDir); err != nil {
-			klog.Warningf("Failed to remove orphaned VFS meta dir %s: %v", metaDir, err)
-		}
-
+		klog.Infof("Cleaning up orphaned VFS cache for volume %s: %s/vfs/%s", volumeID, VFSCacheBasePath, vfsName)
+		removeVFSCacheDirsAt(VFSCacheBasePath, vfsName)
 		delete(m, volumeID)
 		changed = true
 		klog.Infof("Successfully removed orphaned VFS cache for volume %s", volumeID)
@@ -457,4 +527,86 @@ func CleanupOrphanedVFSCacheDirs(activeVolumeIDs map[string]bool) {
 	if changed {
 		writeVFSNameMap(m)
 	}
+
+	sweepUnmappedVFSCacheDirsAt(VFSCacheBasePath, m, isActive)
+}
+
+// removeVFSCacheDirsAt deletes a VFS name's data and metadata directories.
+func removeVFSCacheDirsAt(base, vfsName string) {
+	cacheDir := fmt.Sprintf("%s/vfs/%s", base, vfsName)
+	metaDir := fmt.Sprintf("%s/vfsMeta/%s", base, vfsName)
+	if err := os.RemoveAll(cacheDir); err != nil {
+		klog.Warningf("Failed to remove VFS cache dir %s: %v", cacheDir, err)
+	}
+	if err := os.RemoveAll(metaDir); err != nil {
+		klog.Warningf("Failed to remove VFS meta dir %s: %v", metaDir, err)
+	}
+}
+
+// sweepUnmappedVFSCacheDirsAt reclaims cache dirs the name map does not point
+// at: abandoned generations and leftovers from a lost map file. Dirs holding
+// unuploaded items are the only copy of those writes, so they are kept.
+func sweepUnmappedVFSCacheDirsAt(base string, m map[string]string, isActive func(volumeID string) bool) {
+	entries, err := os.ReadDir(filepath.Join(base, "vfs"))
+	if err != nil {
+		if !os.IsNotExist(err) {
+			klog.Warningf("Could not scan VFS cache dirs: %v", err)
+		}
+		return
+	}
+
+	mapped := make(map[string]bool, len(m))
+	for _, name := range m {
+		mapped[name] = true
+	}
+
+	for _, e := range entries {
+		if !e.IsDir() || mapped[e.Name()] {
+			continue
+		}
+		vfsName := e.Name()
+		volumeID := volumeIDOfVFSName(vfsName)
+		active := isActive(volumeID)
+
+		if active && vfsName == volumeID {
+			continue // live volume's current cache, just not in the map yet
+		}
+		if hasDirtyCacheItemsAt(base, vfsName) {
+			klog.Errorf("VFS cache dir %s/vfs/%s belongs to no live mount but still holds items that were never "+
+				"uploaded; keeping it. Recover them manually — nothing else will.", base, vfsName)
+			continue
+		}
+		if active {
+			klog.Infof("Reclaiming abandoned VFS cache generation %s of live volume %s (nothing unuploaded left)",
+				vfsName, volumeID)
+		} else {
+			klog.Infof("Reclaiming VFS cache dir %s of deleted volume %s", vfsName, volumeID)
+		}
+		removeVFSCacheDirsAt(base, vfsName)
+	}
+}
+
+// hasDirtyCacheItemsAt reports unuploaded writes, erring towards "dirty": an
+// unreadable metadata tree is no evidence the data reached S3.
+func hasDirtyCacheItemsAt(base, vfsName string) bool {
+	metaRoot := filepath.Join(base, "vfsMeta", vfsName)
+	dirty := false
+	err := filepath.WalkDir(metaRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if isCacheItemDirty(path) {
+			dirty = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		klog.Warningf("Could not check %s for unuploaded items (%v); treating it as dirty", metaRoot, err)
+		return true
+	}
+	return dirty
 }

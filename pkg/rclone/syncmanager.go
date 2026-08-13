@@ -1,6 +1,7 @@
 package rclone
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -21,6 +22,66 @@ import (
 // never reuses a leaked VFS (same fs + identical options) from an unclean
 // unmount — a reused cancelled VFS serves EIO on every open.
 var mountGeneration atomic.Int64
+
+// Budgets for librclone calls, which cannot be cancelled: past these we stop
+// waiting rather than block a CSI handler or the checker.
+const (
+	rpcMountTimeout   = 2 * time.Minute
+	rpcUnmountTimeout = 2 * time.Minute
+	rpcListTimeout    = 15 * time.Second
+
+	// VFS.Stats walks the cached directory tree holding every Dir lock, and
+	// those locks are held across backend listings — so this blocks for as long
+	// as a listing takes. Callers with a deadline clamp it to what they have left.
+	rpcStatsTimeout = 2 * time.Minute
+	// Fast-path probe: a slow answer is itself the answer, take the background path.
+	rpcStatsProbeTimeout = 15 * time.Second
+	// vfs/refresh re-lists the remote; minutes is normal. Nothing waits on it.
+	rpcRefreshTimeout = 30 * time.Minute
+)
+
+// maxVFSGenerations bounds the fresh names one mount attempt may try; past it
+// something leaks a VFS every cycle and the answer is a restart.
+const maxVFSGenerations = 16
+
+// vfsNamesFor returns a volume's rclone config names at a given generation.
+// Generation 0 is the bare volumeID so existing on-disk caches keep resuming;
+// later generations avoid colliding with a leaked VFS of the same name.
+func vfsNamesFor(volumeID string, generation int) (vfsName, s3ConfigName, cryptConfigName string) {
+	vfsName = volumeID
+	if generation > 0 {
+		vfsName = fmt.Sprintf("%s.g%d", volumeID, generation)
+	}
+	return vfsName, vfsName + "-s3", vfsName
+}
+
+// volumeIDOfVFSName strips any generation suffix. PV names carry no dots.
+func volumeIDOfVFSName(vfsName string) string {
+	i := strings.LastIndex(vfsName, ".g")
+	if i <= 0 {
+		return vfsName
+	}
+	if _, err := strconv.Atoi(vfsName[i+2:]); err != nil {
+		return vfsName
+	}
+	return vfsName[:i]
+}
+
+// generationOfVFSName recovers the generation from a persisted vfsName.
+func generationOfVFSName(volumeID, vfsName string) int {
+	if vfsName == "" || vfsName == volumeID {
+		return 0
+	}
+	suffix, ok := strings.CutPrefix(vfsName, volumeID+".g")
+	if !ok {
+		return 0
+	}
+	n, err := strconv.Atoi(suffix)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
 
 // VFSCacheConfig holds VFS cache and directory-metadata configuration options
 type VFSCacheConfig struct {
@@ -63,6 +124,7 @@ type MountManager struct {
 	cryptConfigName string        // Named rclone config for crypt layer
 	uid             *int64        // UID for FUSE mount (from fsGroup)
 	gid             *int64        // GID for FUSE mount (from fsGroup)
+	generation      int           // VFS name generation; bumped when a leaked VFS holds the current name
 	stopCacheMon    chan struct{} // Signals the background cache monitor to stop
 	stopMonOnce     sync.Once     // Guards stopCacheMon close so it is safe to call from both Unmount and reconcile
 	refreshMu       sync.Mutex    // Serializes refreshVFS calls to prevent concurrent forget/refresh races
@@ -101,6 +163,11 @@ func NewMountManager(s3Config *S3Config, volumeID, mountPoint string, vfsConfig 
 	}
 	cryptConfig := DeriveRcloneCryptConfig(luksPassphrase, salt)
 
+	// Resume on the name this volume last used: the VFS cache dir is derived
+	// from it, and picking a different one would strand unuploaded writes.
+	generation := generationOfVFSName(volumeID, LoadVFSNameMap()[volumeID])
+	vfsName, s3ConfigName, cryptConfigName := vfsNamesFor(volumeID, generation)
+
 	manager := &MountManager{
 		s3Config:        s3Config,
 		cryptConfig:     cryptConfig,
@@ -108,15 +175,108 @@ func NewMountManager(s3Config *S3Config, volumeID, mountPoint string, vfsConfig 
 		volumeID:        volumeID,
 		mountPoint:      mountPoint,
 		s3BasePath:      s3BasePath,
-		vfsName:         volumeID,
-		s3ConfigName:    volumeID + "-s3",
-		cryptConfigName: volumeID,
+		vfsName:         vfsName,
+		s3ConfigName:    s3ConfigName,
+		cryptConfigName: cryptConfigName,
+		generation:      generation,
 		uid:             fsGroup,
 		gid:             fsGroup,
 	}
 
-	klog.Infof("Created rclone mount manager for volume %s at %s (s3Path: %s)", volumeID, mountPoint, s3BasePath)
+	klog.Infof("Created rclone mount manager for volume %s at %s (s3Path: %s, vfs: %s)",
+		volumeID, mountPoint, s3BasePath, vfsName)
 	return manager, nil
+}
+
+// ensureExclusiveVFSName guarantees no other VFS holds the name this mount will
+// use: rclone only runs VFS.Shutdown on an explicit unmount, so a FUSE that died
+// by itself leaves an unreachable VFS that makes every vfs/* RPC for the volume
+// ambiguous. Reports whether a predecessor was found (its finalizer may still
+// fire); on error the caller must not mount.
+func (mm *MountManager) ensureExclusiveVFSName() (leaked bool, err error) {
+	for bumps := 0; ; bumps++ {
+		count, ok := mm.countRegisteredVFS()
+		if ok && count == 0 {
+			return leaked, nil
+		}
+
+		fsName := mm.cryptConfigName + ":"
+
+		if !ok {
+			// Cannot verify. Mounting blind is how the duplicate arises, and a
+			// duplicate is permanent until restart while a fresh name costs at
+			// most a cold cache. Bump once, then proceed: if vfs/list is broken
+			// for good, bumping forever helps nobody.
+			if bumps > 0 {
+				klog.Warningf("Volume %s: still cannot verify VFS name exclusivity; mounting as %q",
+					mm.volumeID, mm.cryptConfigName+":")
+				return leaked, nil
+			}
+			klog.Warningf("Volume %s: cannot verify whether %q is free; taking a fresh generation rather than "+
+				"risking a second VFS under the same name", mm.volumeID, fsName)
+			mm.bumpGeneration()
+			leaked = true
+			continue
+		}
+
+		// Reachable through the mount registry? Then unmounting runs
+		// VFS.Shutdown and the name is free again.
+		leaked = true
+		if UnmountDead(mm.mountPoint) {
+			time.Sleep(500 * time.Millisecond)
+			if count, ok = mm.countRegisteredVFS(); !ok || count == 0 {
+				klog.Infof("Volume %s: shut down the previous VFS instance of %q before re-mounting",
+					mm.volumeID, fsName)
+				return leaked, nil
+			}
+		}
+
+		if bumps >= maxVFSGenerations {
+			// Mounting anyway would register a second VFS under a name we know
+			// is taken, and every vfs/* RPC for this volume would answer "more
+			// than one VFS active" until the driver restarts — no drain, no
+			// queue observation, no safe eviction, forever. Refuse; the caller
+			// retries, and the RPC watchdog restarts us if this is terminal.
+			return leaked, fmt.Errorf("volume %s: %d VFS instances still registered for %q after %d generation "+
+				"bumps; refusing to mount a second one under a taken name", mm.volumeID, count, fsName, bumps)
+		}
+
+		old := mm.vfsName
+		mm.bumpGeneration()
+		klog.Warningf("Volume %s: %d VFS instance(s) leaked under %q with no live mount to shut them down "+
+			"through; mounting as %q instead so vfs/* RPCs stay unambiguous. The abandoned cache stays at "+
+			"%s/vfs/%s — it is reclaimed once nothing in it is still waiting to upload",
+			mm.volumeID, count, fsName, mm.cryptConfigName+":", VFSCacheBasePath, old)
+	}
+}
+
+// bumpGeneration moves this mount to the next VFS name generation.
+func (mm *MountManager) bumpGeneration() {
+	mm.generation++
+	mm.vfsName, mm.s3ConfigName, mm.cryptConfigName = vfsNamesFor(mm.volumeID, mm.generation)
+}
+
+// countRegisteredVFS returns how many VFSes rclone has under this fs name, and
+// whether the answer could be obtained at all.
+func (mm *MountManager) countRegisteredVFS() (int, bool) {
+	result, err := RPCWithTimeout("vfs/list", map[string]interface{}{}, rpcListTimeout)
+	if err != nil || result == nil || result.Output == nil {
+		klog.Warningf("Volume %s: could not list active VFSes (%v); cannot verify name exclusivity", mm.volumeID, err)
+		return 0, false
+	}
+	names, ok := result.Output["vfses"].([]interface{})
+	if !ok {
+		return 0, false
+	}
+	// Duplicates are listed as "name:[i]", singletons as "name:".
+	prefix := mm.cryptConfigName + ":"
+	count := 0
+	for _, n := range names {
+		if s, ok := n.(string); ok && (s == prefix || strings.HasPrefix(s, prefix+"[")) {
+			count++
+		}
+	}
+	return count, true
 }
 
 // Mount mounts the encrypted S3 remote at the mount point using librclone
@@ -129,20 +289,32 @@ func (mm *MountManager) Mount() error {
 
 	klog.Infof("Mounting encrypted S3 volume %s at %s", mm.volumeID, mm.mountPoint)
 
-	// Quarantine unloadable cache items before rclone can serve them: one
-	// corrupt item blocks its readers forever and can stall the whole node.
-	ValidateVFSCache(mm.vfsName)
-
-	// Check for stale mount and try to clean it up
-	if mm.isMountPoint() {
+	// Clean up a stale mount, with a bounded drain: this runs inside CSI handlers
+	// and the checker. hadPredecessor drives the settle window below — a session
+	// torn down here can still run its unmount-by-path finalizer minutes later.
+	hadPredecessor := mm.isMountPoint()
+	if hadPredecessor {
 		klog.Warningf("Found stale mount at %s, attempting to unmount first", mm.mountPoint)
-		if err := mm.Unmount(); err != nil {
+		if err := mm.unmount(ShortDrainWait); err != nil {
 			klog.Warningf("Unmount failed: %v, will try mounting anyway with AllowNonEmpty", err)
 		}
 	}
 
-	// Ensure mount point exists
-	if err := os.MkdirAll(mm.mountPoint, 0755); err != nil {
+	// Must precede everything keyed on the VFS name: it can move this mount to
+	// a fresh generation when a leaked instance still holds the current one.
+	if leaked, err := mm.ensureExclusiveVFSName(); err != nil {
+		return err
+	} else if leaked {
+		hadPredecessor = true
+	}
+
+	// Quarantine unloadable cache items before rclone can serve them: one
+	// corrupt item blocks its readers forever and can stall the whole node.
+	ValidateVFSCache(mm.vfsName)
+
+	// Ensure mount point exists. Bounded: MkdirAll stats the path, and if the
+	// unmount above failed to detach a wedged FUSE that stat never returns.
+	if err := mkdirAllBounded(mm.mountPoint, 0755, 30*time.Second); err != nil {
 		return fmt.Errorf("failed to create mount point: %w", err)
 	}
 
@@ -194,9 +366,16 @@ func (mm *MountManager) Mount() error {
 
 	klog.Infof("Calling mount/mount RPC for volume %s", mm.volumeID)
 
-	_, err := RPC("mount/mount", params)
+	_, err := RPCWithTimeout("mount/mount", params, rpcMountTimeout)
 	if err != nil {
 		DeleteNamedConfigs(mm.cryptConfigName, mm.s3ConfigName)
+		if IsRPCTimeout(err) {
+			// The call holds rclone's global mount lock and is still running:
+			// nothing here can mount or unmount until it returns. Say so — the
+			// RPC watchdog restarts the plugin if it never does.
+			return fmt.Errorf("mount of volume %s did not complete within %s and still holds rclone's global "+
+				"mount lock: %w", mm.volumeID, rpcMountTimeout, err)
+		}
 		return fmt.Errorf("failed to mount: %w", err)
 	}
 
@@ -211,15 +390,24 @@ func (mm *MountManager) Mount() error {
 
 	mm.warnOnDuplicateVFS()
 
+	// Verify the FUSE mount is live and responding BEFORE declaring success.
+	// A mount RPC can return while the FUSE daemon is not serving yet, or land
+	// somewhere the host cannot see; treating either as success is what let
+	// consumers bind the empty staging directory underneath and write plaintext
+	// to the node's root disk. Fail instead — the caller retries.
+	if err := mm.waitForMountReady(hadPredecessor); err != nil {
+		klog.Errorf("Volume %s: mount did not become usable, tearing it back down: %v", mm.volumeID, err)
+		// Unconditionally through the mount registry, not mm.unmount: the whole
+		// point is to run VFS.Shutdown so this half-mount does not leak a VFS
+		// under our name and make the retry ambiguous.
+		mm.StopCacheMonitor()
+		UnmountDead(mm.mountPoint)
+		DeleteNamedConfigs(mm.cryptConfigName, mm.s3ConfigName)
+		return fmt.Errorf("mount of volume %s did not become usable: %w", mm.volumeID, err)
+	}
+
 	mm.mounted = true
 	klog.Infof("Successfully mounted encrypted S3 volume %s at %s", mm.volumeID, mm.mountPoint)
-
-	// Verify the FUSE mount is actually responding before declaring success.
-	// The mount RPC may return before the FUSE daemon is fully initialized,
-	// causing pods to see "transport endpoint not connected" errors.
-	if err := mm.waitForMountReady(); err != nil {
-		klog.Warningf("Mount readiness check failed for volume %s: %v (mount may still work)", mm.volumeID, err)
-	}
 
 	mm.stopCacheMon = make(chan struct{})
 	go mm.cacheMonitor()
@@ -308,8 +496,29 @@ func (mm *MountManager) buildVFSOpt() map[string]interface{} {
 	return vfsOpt
 }
 
-// Unmount unmounts the S3 volume using librclone
+// Drain budgets: teardown may wait to avoid aborting uploads mid-stream, but
+// pre-mount cleanup runs inside CSI handlers and must not stall for hours.
+const (
+	maxDrainWait = 6 * time.Hour
+	// ShortDrainWait is the budget for callers that already know the queue is
+	// empty, or that must not block whatever else is waiting on them.
+	ShortDrainWait = 60 * time.Second
+)
+
+// Unmount unmounts the S3 volume using librclone, waiting for pending uploads
+// to drain first.
 func (mm *MountManager) Unmount() error {
+	return mm.unmount(maxDrainWait)
+}
+
+// UnmountWithin unmounts, waiting at most budget for the write-back queue.
+func (mm *MountManager) UnmountWithin(budget time.Duration) error {
+	return mm.unmount(budget)
+}
+
+// unmount unmounts the volume, spending at most drainBudget waiting for the
+// write-back queue to empty.
+func (mm *MountManager) unmount(drainBudget time.Duration) error {
 
 	if !mm.mounted && !mm.isMountPoint() {
 		klog.Infof("Volume %s not mounted, skipping unmount", mm.volumeID)
@@ -323,10 +532,10 @@ func (mm *MountManager) Unmount() error {
 	// Drain before unmounting: mount/unmount cancels rclone's VFS context, which
 	// aborts all in-flight uploads mid-stream and leaves partial objects in S3.
 	// false → drain unconfirmed; keep VFS cache so rclone can retry on next mount.
-	drained := mm.waitForPendingUploads()
+	drained := mm.waitForPendingUploads(drainBudget)
 
 	params := map[string]interface{}{"mountPoint": mm.mountPoint}
-	_, err := RPC("mount/unmount", params)
+	_, err := RPCWithTimeout("mount/unmount", params, rpcUnmountTimeout)
 	if err != nil {
 		if strings.Contains(err.Error(), "mount not found") {
 			// rclone self-unmounted (e.g. VFS error); already gone, not a failure.
@@ -396,7 +605,7 @@ func setFuseFdsCloexec() {
 // and will unmount whatever is at the path when it runs, so the caller must
 // let it fire against an empty path before mounting fresh.
 func UnmountDead(mountPoint string) bool {
-	if _, err := RPC("mount/unmount", map[string]interface{}{"mountPoint": mountPoint}); err != nil {
+	if _, err := RPCWithTimeout("mount/unmount", map[string]interface{}{"mountPoint": mountPoint}, rpcUnmountTimeout); err != nil {
 		if strings.Contains(err.Error(), "mount not found") {
 			klog.V(4).Infof("UnmountDead %s: no live rclone mount entry", mountPoint)
 			return false
@@ -409,13 +618,18 @@ func UnmountDead(mountPoint string) bool {
 	return true
 }
 
-// waitForPendingUploads polls vfs/stats until the write-back queue is empty.
-// Returns true only when the queue is confirmed empty; false otherwise (the
-// caller must preserve the local VFS cache for retry on next mount).
-// RPC failures are retried indefinitely while the FUSE mount is alive — a
-// lost RC connection is not evidence the queue is empty.
-func (mm *MountManager) waitForPendingUploads() bool {
-	klog.Infof("Waiting for pending uploads to complete for volume %s", mm.volumeID)
+// waitForPendingUploads polls vfs/stats until the write-back queue is empty or
+// maxWait elapses. Returns true only when the queue is confirmed empty; false
+// otherwise (the caller must preserve the local VFS cache for retry on next
+// mount). RPC failures are retried while the FUSE mount is alive — a lost RC
+// connection is not evidence the queue is empty.
+func (mm *MountManager) waitForPendingUploads(maxWait time.Duration) bool {
+	if maxWait <= 0 {
+		return false
+	}
+	klog.Infof("Waiting for pending uploads to complete for volume %s (budget %s)", mm.volumeID, maxWait)
+
+	deadline := time.Now().Add(maxWait)
 
 	writeBackWait := 5
 	if mm.vfsConfig.WriteBack != "" {
@@ -424,13 +638,12 @@ func (mm *MountManager) waitForPendingUploads() bool {
 		}
 	}
 	writeBackWait += 2
-	klog.Infof("Waiting %d seconds for write-back to flush for volume %s", writeBackWait, mm.volumeID)
-	time.Sleep(time.Duration(writeBackWait) * time.Second)
+	flush := min(time.Duration(writeBackWait)*time.Second, maxWait)
+	klog.Infof("Waiting %s for write-back to flush for volume %s", flush, mm.volumeID)
+	time.Sleep(flush)
 
-	maxWait := 6 * time.Hour
 	pollInterval := 2 * time.Second
 	logInterval := 30 * time.Second
-	deadline := time.Now().Add(maxWait)
 	lastLog := time.Now()
 	consecutiveRPCFailures := 0
 
@@ -443,7 +656,14 @@ func (mm *MountManager) waitForPendingUploads() bool {
 			return false
 		}
 
-		result, err := RPC("vfs/stats", map[string]interface{}{"fs": fsName})
+		// Never let one stats call outlive the drain budget the caller was
+		// given: ShortDrainWait exists so CSI handlers and the checker are not
+		// held up, and a 2-minute ceiling would quietly break that promise.
+		budget := min(rpcStatsTimeout, time.Until(deadline))
+		if budget <= 0 {
+			break
+		}
+		result, err := RPCWithTimeout("vfs/stats", map[string]interface{}{"fs": fsName}, budget)
 		if err != nil {
 			// "no VFS found" is terminal, not transient: the kernel mount exists
 			// but this librclone instance never created its VFS (orphaned after a
@@ -506,7 +726,11 @@ func (mm *MountManager) IsUploadQueueEmpty() bool {
 	if !mm.isMountPoint() {
 		return true
 	}
-	result, err := RPC("vfs/stats", map[string]interface{}{"fs": mm.cryptConfigName + ":"})
+	// Deliberately the short budget: this runs inside NodeUnstageVolume to
+	// decide whether the fast path is available. If stats cannot answer
+	// promptly the volume is busy enough that the background drain is the
+	// right call anyway — waiting longer would only delay kubelet.
+	result, err := RPCWithTimeout("vfs/stats", map[string]interface{}{"fs": mm.cryptConfigName + ":"}, rpcStatsProbeTimeout)
 	if err != nil {
 		// Orphaned mount (no VFS in this instance): nothing to drain here, take
 		// the fast unmount path rather than starting an endless background drain.
@@ -540,7 +764,10 @@ func (mm *MountManager) uploadQueueConfirmedEmpty() bool {
 	if !mm.isMountPoint() {
 		return false
 	}
-	result, err := RPC("vfs/stats", map[string]interface{}{"fs": mm.cryptConfigName + ":"})
+	// The full budget: this gates cache eviction from a background monitor, so
+	// nothing is waiting on it, and a premature "cannot confirm" means the
+	// cache is never evicted and grows until the disk-pressure shedding fires.
+	result, err := RPCWithTimeout("vfs/stats", map[string]interface{}{"fs": mm.cryptConfigName + ":"}, rpcStatsTimeout)
 	if err != nil || result == nil || result.Output == nil {
 		return false
 	}
@@ -589,7 +816,7 @@ func (mm *MountManager) refreshVFS() {
 	fs := mm.cryptConfigName + ":"
 
 	// Forget in-memory directory cache so rclone drops any stale Items
-	if _, err := RPC("vfs/forget", map[string]interface{}{"fs": fs}); err != nil {
+	if _, err := RPCWithTimeout("vfs/forget", map[string]interface{}{"fs": fs}, rpcRefreshTimeout); err != nil {
 		klog.Warningf("vfs/forget failed for volume %s: %v", mm.volumeID, err)
 	}
 
@@ -599,30 +826,112 @@ func (mm *MountManager) refreshVFS() {
 		"dir":       "",
 		"recursive": "true",
 	}
-	if _, err := RPC("vfs/refresh", refreshParams); err != nil {
+	if _, err := RPCWithTimeout("vfs/refresh", refreshParams, rpcRefreshTimeout); err != nil {
 		klog.Warningf("vfs/refresh failed for volume %s: %v", mm.volumeID, err)
 	}
 }
 
-// waitForMountReady verifies the FUSE mount is responding by stat-ing the
-// mount point. Retries for up to 5 seconds to allow the FUSE daemon to
-// fully initialize after the mount RPC returns.
-func (mm *MountManager) waitForMountReady() error {
-	deadline := time.Now().Add(5 * time.Second)
+const (
+	// mountReadyTimeout bounds how long a fresh mount may take to become usable.
+	mountReadyTimeout = 20 * time.Second
+	// How long a fresh mount must survive when a previous session existed here.
+	// rclone's teardown finalizer unmounts BY PATH with no identity check and
+	// fires whenever the old serve loop exits, so it can rip out our new mount.
+	// Each session does this at most once, so observing it and remounting
+	// converges. An accelerator, not a guarantee — the checker catches the rest.
+	mountSettleWindow = 14 * time.Second
+	// Must exceed the host mount-table cache TTL or every poll rereads one snapshot.
+	mountSettlePoll = 2 * time.Second
+)
+
+// ErrMountRippedOut means the mount came up and was then unmounted from under
+// us by a previous rclone session's teardown finalizer. Retrying is correct:
+// that session has spent its one unmount.
+var ErrMountRippedOut = errors.New("fresh mount was unmounted by a previous session's finalizer")
+
+// waitForMountReady verifies the mount is visible to the host AND serving, and
+// with settle, that it stays so. Invisible means consumers bind the empty
+// directory underneath; visible-but-dead means they bind a dead endpoint.
+func (mm *MountManager) waitForMountReady(settle bool) error {
+	deadline := time.Now().Add(mountReadyTimeout)
 	var lastErr error
 
 	for time.Now().Before(deadline) {
-		_, err := os.ReadDir(mm.mountPoint)
-		if err == nil {
-			klog.Infof("FUSE mount verified ready for volume %s at %s", mm.volumeID, mm.mountPoint)
+		if err := mm.mountUsable(); err != nil {
+			lastErr = err
+			klog.Infof("FUSE mount not ready yet for volume %s: %v, retrying...", mm.volumeID, err)
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		klog.Infof("FUSE mount verified ready for volume %s at %s", mm.volumeID, mm.mountPoint)
+		if !settle {
 			return nil
 		}
-		lastErr = err
-		klog.Infof("FUSE mount not ready yet for volume %s: %v, retrying...", mm.volumeID, err)
-		time.Sleep(250 * time.Millisecond)
+		return mm.waitForMountToSettle()
 	}
 
-	return fmt.Errorf("FUSE mount not ready after 5s for volume %s: %v", mm.volumeID, lastErr)
+	return fmt.Errorf("FUSE mount not ready after %s for volume %s: %v", mountReadyTimeout, mm.volumeID, lastErr)
+}
+
+// waitForMountToSettle reports ErrMountRippedOut if a previous session's
+// finalizer takes the fresh mount away within mountSettleWindow.
+func (mm *MountManager) waitForMountToSettle() error {
+	klog.Infof("Volume %s: watching the fresh mount for %s before declaring it good", mm.volumeID, mountSettleWindow)
+	deadline := time.Now().Add(mountSettleWindow)
+	for time.Now().Before(deadline) {
+		time.Sleep(mountSettlePoll)
+		isFUSE, known := HostFUSEMountState(mm.mountPoint)
+		if known && !isFUSE {
+			return fmt.Errorf("%w (at %s)", ErrMountRippedOut, mm.mountPoint)
+		}
+	}
+	klog.Infof("Volume %s: mount survived the settle window", mm.volumeID)
+	return nil
+}
+
+// mountUsable reports why the mount is not yet usable, or nil when it is.
+func (mm *MountManager) mountUsable() error {
+	isFUSE, known := HostFUSEMountState(mm.mountPoint)
+	switch {
+	case !known:
+		return fmt.Errorf("host mount table is unreadable, cannot confirm the mount is visible to consumers")
+	case !isFUSE:
+		// Almost always mount propagation: the mount landed in our own
+		// namespace only, so consumers would bind the empty directory
+		// underneath it. Name the knob, this is otherwise unguessable.
+		return fmt.Errorf("no FUSE mount at %s in the host namespace — the mount is not propagating to the "+
+			"host; check that node.kubeletDir matches `readlink -f /var/lib/kubelet` on this node and that its "+
+			"volumeMount is Bidirectional", mm.mountPoint)
+	}
+	return readDirBounded(mm.mountPoint, 5*time.Second)
+}
+
+// readDirBounded lists a directory without blocking the caller past timeout.
+// Raw syscalls, not os.ReadDir — see ReadDirRaw.
+func readDirBounded(path string, timeout time.Duration) error {
+	done := make(chan error, 1)
+	go func() {
+		_, err := ReadDirRaw(path, 1)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("reading %s blocked for %s (wedged FUSE)", path, timeout)
+	}
+}
+
+// mkdirAllBounded creates a tree without blocking on a wedged mount at the path.
+func mkdirAllBounded(path string, perm os.FileMode, timeout time.Duration) error {
+	done := make(chan error, 1)
+	go func() { done <- os.MkdirAll(path, perm) }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("mkdir %s blocked for %s (a wedged mount is still attached there)", path, timeout)
+	}
 }
 
 // cleanupVFSCacheDir removes the on-disk VFS cache directories after unmount.
@@ -812,7 +1121,7 @@ func isCacheFileOpen(path string) bool {
 
 // hasActiveTransfers returns true if rclone is currently uploading files
 func (mm *MountManager) hasActiveTransfers() bool {
-	result, err := RPC("core/stats", map[string]interface{}{})
+	result, err := RPCWithTimeout("core/stats", map[string]interface{}{}, rpcStatsTimeout)
 	if err != nil {
 		return true // Assume busy on error
 	}
@@ -855,7 +1164,7 @@ func isAmbiguousVFSError(err error) bool {
 // this volume's fs name (listed as "name:[i]") — a leaked orphan from an
 // unclean unmount that makes vfs/* RPCs ambiguous until the driver restarts.
 func (mm *MountManager) warnOnDuplicateVFS() {
-	result, err := RPC("vfs/list", map[string]interface{}{})
+	result, err := RPCWithTimeout("vfs/list", map[string]interface{}{}, rpcListTimeout)
 	if err != nil || result == nil || result.Output == nil {
 		return
 	}

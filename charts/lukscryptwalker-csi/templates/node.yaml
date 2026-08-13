@@ -1,3 +1,15 @@
+{{/*
+The node pod is hostNetwork: all three listeners share one port space. A
+collision only shows up in the field as "address already in use" plus a
+container kubelet kills forever on a probe that can never succeed — so refuse
+to render instead.
+*/}}
+{{/* Compared as strings: --set yields int64 where values.yaml yields int, and
+     uniq is type-sensitive, so a real collision would slip through untyped. */}}
+{{- $ports := list (toString .Values.node.registrationHealthPort) (toString .Values.node.sidecars.nodeDriverRegistrar.healthPort) (toString .Values.node.sidecars.livenessProbe.healthPort) -}}
+{{- if ne (len $ports) (len (uniq $ports)) -}}
+{{- fail (printf "node host ports must be distinct (hostNetwork pod), got registrationHealthPort=%v nodeDriverRegistrar.healthPort=%v livenessProbe.healthPort=%v" .Values.node.registrationHealthPort .Values.node.sidecars.nodeDriverRegistrar.healthPort .Values.node.sidecars.livenessProbe.healthPort) -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -43,7 +55,7 @@ spec:
         - "--kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)"
         # Loopback only: with hostNetwork this would otherwise listen on the
         # node's (possibly public) IP.
-        - "--http-endpoint=127.0.0.1:9809"
+        - "--http-endpoint=127.0.0.1:{{ .Values.node.sidecars.nodeDriverRegistrar.healthPort }}"
         env:
         - name: ADDRESS
           value: /csi/csi.sock
@@ -60,19 +72,23 @@ spec:
           # node's (possibly public, firewalled) IP.
           #
           # KNOWN RISK: this ties the registrar's life to a port the driver
-          # owns. If 9810 is held by an orphaned listener (a dead driver's
-          # socket with no owning process — only a node reboot frees it), the
-          # probe can never succeed and kubelet kills a registrar that is
-          # registering fine, clearing CSINode and stopping volume operations.
-          # The driver escalates that case as a RegistrationHealthPortUnavailable
-          # Node event; alert on it. To break the loop by hand, remove this
-          # probe (kubectl patch ds ... remove /containers/0/livenessProbe).
+          # owns. If the port is held by anything else (an orphaned listener
+          # from a dead driver, or another container configured on it — the pod
+          # is hostNetwork, so the whole node shares one port space), the probe
+          # can never succeed and kubelet kills a registrar that is registering
+          # fine, clearing CSINode and stopping volume operations. The driver
+          # escalates that case as a RegistrationHealthPortUnavailable Node
+          # event naming the process holding the port; alert on it. To break the
+          # loop by hand, remove this probe (kubectl patch ds ... remove
+          # /containers/0/livenessProbe).
+          # Both this probe and the driver's --registration-health-endpoint come
+          # from one value, so they cannot drift apart.
           # Generous threshold so a throttled driver doesn't flap the
           # registrar into a deregistration loop.
           httpGet:
             host: 127.0.0.1
             path: /healthz
-            port: 9810
+            port: {{ .Values.node.registrationHealthPort }}
           initialDelaySeconds: 30
           periodSeconds: 10
           timeoutSeconds: 5
@@ -110,6 +126,8 @@ spec:
         - "--luks-secret-name={{ .Values.secret.name }}"
         - "--luks-secret-namespace={{ .Values.secret.namespace }}"
         - "--luks-secret-key={{ .Values.secret.passphraseKey }}"
+        # Same value as the registrar's livenessProbe port above.
+        - "--registration-health-endpoint=127.0.0.1:{{ .Values.node.registrationHealthPort }}"
         env:
         - name: CSI_ENDPOINT
           value: unix:///csi/csi.sock

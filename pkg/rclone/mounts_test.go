@@ -1,6 +1,9 @@
 package rclone
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 func TestParseMountInfo(t *testing.T) {
 	const data = `25 30 0:23 / /sys rw,nosuid,relatime shared:7 - sysfs sysfs rw
@@ -43,5 +46,31 @@ func TestFUSEDetectionRejectsShadowedMount(t *testing.T) {
 	}
 	if fsType == "fuse.rclone" {
 		t.Fatalf("ext4 shadow mount reported as FUSE")
+	}
+}
+
+// A node rename must not orphan the cache: the passphrase embeds the node id,
+// so the id recorded at format time wins over the current one.
+func TestVFSCachePassphrase(t *testing.T) {
+	// No marker (fresh install or pre-existing deployment): use the current id.
+	if got, want := vfsCachePassphrase("secret", "node-a"), "secret-node-a"; got != want {
+		t.Errorf("without marker = %q, want %q", got, want)
+	}
+
+	dir := t.TempDir()
+	orig := vfsCacheNodeIDFile
+	vfsCacheNodeIDFile = dir + "/.node-id"
+	defer func() { vfsCacheNodeIDFile = orig }()
+
+	if err := os.WriteFile(vfsCacheNodeIDFile, []byte("node-a\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Node renamed to node-b: still derive from the recorded node-a.
+	if got, want := vfsCachePassphrase("secret", "node-b"), "secret-node-a"; got != want {
+		t.Errorf("after rename = %q, want %q", got, want)
+	}
+	// Same node: unchanged.
+	if got, want := vfsCachePassphrase("secret", "node-a"), "secret-node-a"; got != want {
+		t.Errorf("same node = %q, want %q", got, want)
 	}
 }

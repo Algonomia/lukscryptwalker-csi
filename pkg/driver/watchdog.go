@@ -8,7 +8,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog"
 )
 
@@ -28,9 +27,11 @@ LOG=/var/lib/lukscrypt-watchdog/actions.log
 mkdir -p "$RUNSTATE" /var/lib/lukscrypt-watchdog
 
 crictl_cmd() {
-  for c in crictl /var/lib/rancher/rke2/bin/crictl /var/lib/rancher/k3s/data/current/bin/crictl; do
+  for c in crictl /var/lib/rancher/rke2/bin/crictl /var/lib/rancher/k3s/data/current/bin/crictl \
+           /snap/microk8s/current/usr/bin/crictl /var/snap/microk8s/current/bin/crictl; do
     { command -v "$c" >/dev/null 2>&1 || [ -x "$c" ]; } || continue
-    for ep in unix:///run/containerd/containerd.sock unix:///run/k3s/containerd/containerd.sock; do
+    for ep in unix:///run/containerd/containerd.sock unix:///run/k3s/containerd/containerd.sock \
+              unix:///var/snap/microk8s/common/run/containerd.sock; do
       if "$c" --runtime-endpoint "$ep" version >/dev/null 2>&1; then
         echo "$c --runtime-endpoint $ep"
         return 0
@@ -40,12 +41,28 @@ crictl_cmd() {
   return 1
 }
 
+# A watchdog that cannot act must SAY so: exiting 0 here made an inert script
+# indistinguishable from a healthy one, silently, for months.
+report_no_runtime() {
+  # Rate-limited to hourly so the journal stays readable.
+  now=$(date +%s)
+  last=$(cat "$RUNSTATE/last-noruntime" 2>/dev/null || echo 0)
+  [ $((now - last)) -lt 3600 ] && return 0
+  echo "$now" > "$RUNSTATE/last-noruntime"
+  msg="CANNOT SELF-HEAL: driver process absent while the runtime still claims it Running (shim-zombie), but no
+usable crictl/containerd endpoint was found on this node, so the sandbox cannot be removed automatically.
+Remediate by hand: kubectl -n kube-system delete pod <csi-node-pod-on-this-node> --force --grace-period=0
+(the dead driver's registration-health socket stays orphaned until its sandbox is gone)."
+  logger -t lukscrypt-watchdog "$msg"
+  echo "$(date -Is) $msg" >> "$LOG"
+}
+
 # Healthy or legitimately absent: not our business.
 if pgrep -f 'lukscryptwalker-csi --endpoint=unix:///csi/csi.sock' >/dev/null 2>&1; then
   rm -f "$RUNSTATE/zombie-count"
   exit 0
 fi
-CR=$(crictl_cmd) || exit 0
+CR=$(crictl_cmd) || { report_no_runtime; exit 0; }
 RUNNING=$($CR ps --name lukscryptwalker-csi -q 2>/dev/null)
 if [ -z "$RUNNING" ]; then
   # No process AND no Running claim: normal crashloop/startup/uninstall —
@@ -186,8 +203,7 @@ true`
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		klog.Warningf("Host watchdog acted while the driver was down: %s", line)
 		if ns.recorder != nil {
-			nodeRef := &corev1.ObjectReference{Kind: "Node", Name: ns.driver.nodeID, UID: types.UID(ns.driver.nodeID)}
-			ns.recorder.Eventf(nodeRef, corev1.EventTypeWarning, "HostWatchdogRecovery", "%s", line)
+			ns.recorder.Eventf(ns.nodeRef(), corev1.EventTypeWarning, "HostWatchdogRecovery", "%s", line)
 		}
 	}
 }

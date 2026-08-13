@@ -28,6 +28,10 @@ var (
 	luksSecretName      = flag.String("luks-secret-name", "luks-secret", "Name of the Kubernetes secret containing LUKS passphrase")
 	luksSecretNamespace = flag.String("luks-secret-namespace", "kube-system", "Namespace of the LUKS secret")
 	luksSecretKey = flag.String("luks-secret-key", "passphrase", "Key within the secret containing the passphrase")
+	// The node pod runs with hostNetwork, so this listener shares the node's
+	// port space with every sidecar. It must be movable without a new image.
+	registrationHealthEndpoint = flag.String("registration-health-endpoint", driver.DefaultRegistrationHealthPort,
+		"host:port for the driver's registration-health endpoint (the node-driver-registrar's liveness probe target)")
 )
 
 // isControllerMode detects if we're running in controller mode based on the endpoint path
@@ -49,6 +53,7 @@ func main() {
 	// containerd's log pipe freezes, and a blocking stderr write would hold the
 	// global log mutex and freeze every goroutine — gRPC, probes, recovery.
 	alog := asynclog.New(os.Stderr, 4096)
+	asynclog.SetDefault(alog)
 	_ = flag.Set("logtostderr", "false")
 	klog.SetOutput(alog)
 	stdlog.SetOutput(alog)
@@ -91,8 +96,7 @@ func main() {
 		}
 
 		// Combine with node ID to ensure uniqueness per node
-		vfsCachePassphrase := fmt.Sprintf("%s-%s", volSecrets.Passphrase, *nodeID)
-		vfsCachePath, err := rclone.SetupVFSCache(*vfsCacheSize, vfsCachePassphrase)
+		vfsCachePath, err := rclone.SetupVFSCache(*vfsCacheSize, volSecrets.Passphrase, *nodeID)
 		if err != nil {
 			klog.Fatalf("Failed to set up encrypted VFS cache: %v", err)
 		}
@@ -139,7 +143,7 @@ func main() {
 	// Node mode: serve the registration-health endpoint the registrar's
 	// liveness probe targets.
 	if !isControllerMode(*endpoint) {
-		d.StartRegistrationHealthServer(driver.RegistrationHealthPort)
+		d.StartRegistrationHealthServer(*registrationHealthEndpoint)
 	}
 
 	err := d.Run(ctx)

@@ -29,27 +29,45 @@ const (
 	// a stale table is recoverable, a hung checker is not.
 	mountsCacheTTL   = 5 * time.Second
 	mountsReadBudget = 5 * time.Second
+	// How long the last known table may be served once reads stop completing.
+	// Past it it is reported UNKNOWN: a wedged reader otherwise pins a healthy
+	// snapshot and every dead mount reads as live forever.
+	mountsMaxStale = 90 * time.Second
 )
 
 var (
-	mountsMu       sync.Mutex
-	mountsCache    map[string]string
-	mountsReadAt   time.Time
-	mountsInFlight bool
+	mountsMu        sync.Mutex
+	mountsCache     map[string]string
+	mountsReadAt    time.Time
+	mountsInFlight  bool
+	mountsBlockedAt time.Time // when the currently in-flight read started
 )
 
 // HostMounts returns mountpoint → filesystem type as seen in the host mount
-// namespace. Never blocks longer than mountsReadBudget: if the kernel mount
-// lock is held, it returns the last known table rather than hanging the caller.
+// namespace, or nil when the table cannot be established (see HostMountsOK).
 func HostMounts() map[string]string {
+	m, _ := HostMountsOK()
+	return m
+}
+
+// HostMountsOK returns the host mount table and whether it is trustworthy,
+// never blocking past mountsReadBudget. Callers taking a destructive or
+// data-exposing decision must check ok — "unknown" is not "not mounted".
+func HostMountsOK() (map[string]string, bool) {
 	mountsMu.Lock()
 	fresh := mountsCache != nil && time.Since(mountsReadAt) < mountsCacheTTL
-	if fresh || mountsInFlight {
+	if fresh {
 		cached := mountsCache
 		mountsMu.Unlock()
-		return cached
+		return cached, true
+	}
+	if mountsInFlight {
+		cached, ok := cachedMountsLocked()
+		mountsMu.Unlock()
+		return cached, ok
 	}
 	mountsInFlight = true
+	mountsBlockedAt = time.Now()
 	mountsMu.Unlock()
 
 	done := make(chan map[string]string, 1)
@@ -67,15 +85,30 @@ func HostMounts() map[string]string {
 
 	select {
 	case m := <-done:
-		return m
+		return m, m != nil
 	case <-time.After(mountsReadBudget):
 		mountsMu.Lock()
-		cached := mountsCache
+		cached, ok := cachedMountsLocked()
 		mountsMu.Unlock()
 		klog.Warningf("Reading the host mount table blocked for %s (a wedged umount holds the kernel mount "+
-			"lock); serving the last known table with %d entries", mountsReadBudget, len(cached))
-		return cached
+			"lock); serving the last known table with %d entries (trustworthy=%v)", mountsReadBudget, len(cached), ok)
+		return cached, ok
 	}
+}
+
+// cachedMountsLocked returns the cached table if young enough to act on.
+func cachedMountsLocked() (map[string]string, bool) {
+	if mountsCache == nil {
+		return nil, false
+	}
+	age := time.Since(mountsReadAt)
+	if age < mountsMaxStale {
+		return mountsCache, true
+	}
+	klog.Errorf("Host mount table has been unreadable for %s (read blocked since %s): treating mount state as "+
+		"UNKNOWN. Every mount check now fails closed — pods will not be published onto unverifiable mounts.",
+		age.Round(time.Second), mountsBlockedAt.Format(time.RFC3339))
+	return nil, false
 }
 
 // readHostMounts reads and parses the host mount table, falling back to our own
@@ -131,7 +164,26 @@ func IsHostMountPoint(path string) bool {
 
 // IsHostFUSEMount reports whether path is served by a FUSE filesystem in the
 // host namespace — i.e. one of our rclone mounts is actually live there.
+// Fails closed: an unreadable mount table reports "not a FUSE mount".
 func IsHostFUSEMount(path string) bool {
-	fsType, ok := HostMounts()[path]
-	return ok && strings.Contains(fsType, "fuse")
+	isFUSE, _ := HostFUSEMountState(path)
+	return isFUSE
+}
+
+// HostFUSEMountState reports whether path is FUSE in the host namespace, and
+// whether that answer is trustworthy. Do not reconcile on known=false: absent
+// and unknown look identical, and acting tears down healthy volumes.
+func HostFUSEMountState(path string) (isFUSE, known bool) {
+	mounts, known := HostMountsOK()
+	if !known {
+		return false, false
+	}
+	fsType, ok := mounts[path]
+	return ok && strings.Contains(fsType, "fuse"), true
+}
+
+// HostMountsKnown reports whether the host mount table can currently be read.
+func HostMountsKnown() bool {
+	_, known := HostMountsOK()
+	return known
 }

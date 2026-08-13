@@ -38,6 +38,7 @@ FROM alpine:3.24
 # Install required packages for LUKS operations and rclone mount (via librclone)
 RUN apk add --no-cache \
     cryptsetup \
+    device-mapper \
     util-linux \
     e2fsprogs \
     e2fsprogs-extra \

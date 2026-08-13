@@ -50,7 +50,7 @@ parameters:
   {{- end }}
   {{- if .fsMode }}
   # Recursive permission mode applied with fsGroup (default 0750).
-  # Use 0750 for PostgreSQL data dirs; 0770 if a non-owner needs group-write.
+  # 0750 by default; 0770 only if a non-owner container must group-write.
   fs-mode: {{ .fsMode | quote }}
   {{- end }}
 

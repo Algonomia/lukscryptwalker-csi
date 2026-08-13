@@ -2,7 +2,6 @@ package driver
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,10 +11,10 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/lukscryptwalker-csi/pkg/asynclog"
 	"github.com/lukscryptwalker-csi/pkg/luks"
 	"github.com/lukscryptwalker-csi/pkg/rclone"
 	"github.com/lukscryptwalker-csi/pkg/secrets"
@@ -65,6 +64,12 @@ type NodeServer struct {
 	// consumerRestartTimes (volumeID → time.Time) rate-limits destructive
 	// consumer recovery so a reconcile loop can never kill pods repeatedly.
 	consumerRestartTimes sync.Map
+	// logStalled tracks whether we have already reported that log output is
+	// blocked, so the stall is announced once rather than every minute.
+	logStalled atomic.Bool
+	// cacheUnencrypted tracks whether we have already reported that the VFS
+	// cache lost its encrypted mount, so it is announced once, not every minute.
+	cacheUnencrypted atomic.Bool
 }
 
 // NewNodeServer creates a new NodeServer instance
@@ -131,39 +136,53 @@ func (ns *NodeServer) runStaleS3MountChecker() {
 			// StatefulSet ordinal forever; reconcile never revisits it once
 			// the mount looks healthy again.
 			ns.sweepStuckTerminatingConsumers()
+			// Leaked loop devices and backing files accumulate between restarts.
+			ns.runWatched("orphaned-volume GC", ns.cleanupOrphanedVolumes)
 		}
 		tick++
-		ns.runCheckerTickWatched()
+		ns.runWatched("stale-mount checker", ns.cleanupStaleS3Mounts)
 	}
 }
 
-// checkerTickStuckAfter is how long a stale-mount tick may run before we treat
-// it as hung and dump stacks.
-const checkerTickStuckAfter = 3 * time.Minute
+// How long background work may run before we dump stacks, then give up on the
+// process. Every call it makes is bounded, so exceeding the fatal budget means
+// something below us is held forever and only a restart clears it.
+const (
+	checkerTickStuckAfter = 3 * time.Minute
+	checkerTickFatalAfter = 15 * time.Minute
+)
 
-// runCheckerTickWatched runs one stale-mount tick and, if it has not returned
-// in time, dumps every goroutine's stack. Every driver death so far has ended
-// mid-tick with no further output, and without stacks there is no way to see
-// which call is stuck.
-func (ns *NodeServer) runCheckerTickWatched() {
+// runWatched runs background maintenance, dumping goroutine stacks if it hangs
+// and ending the process if it hangs past the fatal budget. A silent freeze is
+// the worst outcome: every accessor then parks in uninterruptible sleep.
+func (ns *NodeServer) runWatched(name string, work func()) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		ns.cleanupStaleS3Mounts()
+		work()
 	}()
 
 	select {
 	case <-done:
+		return
 	case <-time.After(checkerTickStuckAfter):
 		buf := make([]byte, 1<<20)
 		n := runtime.Stack(buf, true)
-		// Straight to stderr, not through klog/asynclog: a stuck tick often
-		// comes with a stalled log pipe, and a queued dump is dropped exactly
-		// when it is the only thing that could explain the freeze.
-		fmt.Fprintf(os.Stderr, "STUCK-TICK: stale-mount checker running for %s; goroutine dump follows\n%s\n",
-			checkerTickStuckAfter, buf[:n])
-		<-done // one dump per stuck tick; the next tick waits for this one
-		klog.Warning("Stale-mount checker tick finally completed after being reported stuck")
+		// Straight to stderr and bounded: a stuck tick usually comes with a
+		// stalled log pipe, which drops queued dumps and would block this watcher.
+		asynclog.WriteBounded(os.Stderr, fmt.Sprintf("STUCK-TICK: %s running for %s; goroutine dump follows\n%s\n",
+			name, checkerTickStuckAfter, buf[:n]), 10*time.Second)
+	}
+
+	select {
+	case <-done:
+		klog.Warningf("%s finally completed after being reported stuck", name)
+	case <-time.After(checkerTickFatalAfter - checkerTickStuckAfter):
+		asynclog.WriteBounded(os.Stderr, fmt.Sprintf("FATAL-STUCK-TICK: %s has been stuck for %s; every call it "+
+			"makes is individually bounded, so the process is wedged below us. Exiting so kubelet restarts the "+
+			"plugin.\n", name, checkerTickFatalAfter), 10*time.Second)
+		klog.Errorf("FATAL: %s stuck for %s — exiting so kubelet restarts the plugin", name, checkerTickFatalAfter)
+		os.Exit(1)
 	}
 }
 
@@ -233,26 +252,50 @@ func (ns *NodeServer) cleanupOrphanedVolumes() {
 
 		// PV not found and backing file exists - this is an orphaned volume from our driver
 		klog.Infof("Found orphaned volume directory (PV deleted): %s", volumeDir)
-
-		if _, err := ns.cleanupS3Sync(volumeID); err != nil {
-			klog.Warningf("Failed to cleanup S3 sync for orphaned volume %s: %v", volumeID, err)
-		}
-
-		// Clean up LUKS device (pass empty staging path for orphan cleanup)
-		if err := ns.cleanupVolumeStaging(volumeID, ""); err != nil {
-			klog.Warningf("Failed to cleanup LUKS for orphaned volume %s: %v, skipping removal", volumeID, err)
-			continue
-		}
-
-		// Remove the orphaned directory
-		if err := os.RemoveAll(volumeDir); err != nil {
-			klog.Warningf("Failed to remove orphaned volume directory %s: %v", volumeDir, err)
-		} else {
-			klog.Infof("Successfully removed orphaned volume directory: %s", volumeDir)
-		}
+		ns.reclaimOrphanedVolume(volumeID, volumeDir)
 	}
 
 	klog.Infof("Orphaned volume cleanup completed")
+}
+
+// reclaimOrphanedVolume tears down every layer a deleted PV left behind.
+func (ns *NodeServer) reclaimOrphanedVolume(volumeID, volumeDir string) {
+	defer ns.s3SyncMgr.lockVolume(volumeID)()
+
+	if _, err := ns.cleanupS3Sync(volumeID); err != nil {
+		klog.Warningf("Failed to cleanup S3 sync for orphaned volume %s: %v", volumeID, err)
+	}
+
+	// A force-killed pod leaves bind, staging mount, mapper, loop device and
+	// backing file behind; the mapper cannot close while anything is mounted on
+	// it, and the backing file stays allocated until reboot.
+	ns.releaseVolumeMounts(volumeID)
+
+	// Clean up LUKS device (pass empty staging path for orphan cleanup)
+	if err := ns.cleanupVolumeStaging(volumeID, ""); err != nil {
+		klog.Warningf("Failed to cleanup LUKS for orphaned volume %s: %v, skipping removal", volumeID, err)
+		return
+	}
+
+	// Remove the orphaned directory
+	if err := os.RemoveAll(volumeDir); err != nil {
+		klog.Warningf("Failed to remove orphaned volume directory %s: %v", volumeDir, err)
+		return
+	}
+	klog.Infof("Successfully removed orphaned volume directory: %s", volumeDir)
+}
+
+// releaseVolumeMounts lazily unmounts everything served by a volume's mapper,
+// deepest bind first, so the mapper can close and free its loop device. Lazy
+// because a consumer that died mid-write still holds references.
+func (ns *NodeServer) releaseVolumeMounts(volumeID string) {
+	device := ns.luksManager.GetMappedDevicePath(ns.luksManager.GenerateMapperName(volumeID))
+	for _, target := range mountsBackedBy(device) {
+		klog.Infof("Volume %s: releasing leaked mount %s (backed by %s)", volumeID, target, device)
+		if err := runCmdBounded(30*time.Second, "nsenter", "-t", "1", "-m", "umount", "-l", target); err != nil {
+			klog.Warningf("Volume %s: umount -l %s failed: %v", volumeID, target, err)
+		}
+	}
 }
 
 // initializeKubernetesClient sets up the Kubernetes client with proper error handling
@@ -309,7 +352,7 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	// Choose storage backend
 	if ns.isS3Backend(req.GetVolumeContext()) {
 		// S3 backend - no LUKS, files encrypted individually
-		// Guard the entire staging flow from stale mount detection
+		defer ns.s3SyncMgr.lockVolume(volumeID)()
 		ns.s3SyncMgr.markVolumeSetupInProgress(req.GetVolumeId())
 		defer ns.s3SyncMgr.markVolumeSetupComplete(req.GetVolumeId())
 
@@ -347,6 +390,9 @@ func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 
 	volumeID := req.GetVolumeId()
 	stagingTargetPath := req.GetStagingTargetPath()
+
+	// Serialize against staging and reconcile.
+	defer ns.s3SyncMgr.lockVolume(volumeID)()
 
 	draining, err := ns.cleanupS3Sync(volumeID)
 	if err != nil {
@@ -388,6 +434,8 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	// from interfering between mount completion and bind mount.
 	isS3 := ns.isS3Backend(req.GetVolumeContext())
 	if isS3 {
+		// Two pods publishing the same volume race into the restore path below.
+		defer ns.s3SyncMgr.lockVolume(volumeID)()
 		ns.s3SyncMgr.markVolumeSetupInProgress(volumeID)
 		defer ns.s3SyncMgr.markVolumeSetupComplete(volumeID)
 	}
@@ -395,6 +443,16 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	// Ensure volume is staged, restore if needed after reboot
 	if err := ns.ensureVolumeStaged(ctx, req); err != nil {
 		return nil, status.Errorf(codes.Internal, "Failed to ensure volume staged: %v", err)
+	}
+
+	// Binding a staging path with no live FUSE mount captures the empty directory
+	// underneath, and the pod then writes plaintext to the node's disk. A Pending
+	// pod is recoverable; that bind is not.
+	if isS3 {
+		if err := ns.verifyS3StagingLive(stagingTargetPath); err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"Refusing to publish volume %s: %v", volumeID, err)
+		}
 	}
 
 	// Apply fsGroup permissions if available from pod lookup but not applied during staging.
@@ -609,11 +667,17 @@ func (ns *NodeServer) ensureVolumeStaged(ctx context.Context, req *csi.NodePubli
 
 	// Check if volume is already staged
 	if ns.isS3Backend(volumeContext) {
-		// S3 volumes: check if mount point exists
-		if ns.isMountPoint(stagingTargetPath) {
+		// A dead FUSE is still a mount point; require a live, serving one.
+		err := ns.verifyS3StagingLive(stagingTargetPath)
+		if err == nil {
 			return nil
 		}
-		klog.Infof("S3 volume %s not staged at %s, attempting to restore", volumeID, stagingTargetPath)
+		if !rclone.HostMountsKnown() {
+			// Absent and unverifiable look identical; re-mounting blind risks a
+			// double mount.
+			return fmt.Errorf("cannot verify the staging mount at %s: %v", stagingTargetPath, err)
+		}
+		klog.Infof("S3 volume %s not usable at %s (%v), attempting to restore", volumeID, stagingTargetPath, err)
 		return ns.restoreS3VolumeStaging(volumeID, stagingTargetPath, volumeContext, req.GetSecrets(), req.GetVolumeCapability())
 	}
 
@@ -650,42 +714,33 @@ func (ns *NodeServer) isMountedFrom(path, device string) bool {
 	return mountedFrom == device
 }
 
-// unmountPath unmounts a filesystem path (idempotent - succeeds if already unmounted)
+// unmountPath unmounts a path, idempotently. It never stats it: on a wedged
+// FUSE bind stat() parks the caller in uninterruptible sleep, and this runs
+// inside NodeUnpublishVolume — kubelet's teardown would wedge with us.
 func (ns *NodeServer) unmountPath(targetPath string) error {
-	// Check if target path exists
-	_, statErr := os.Stat(targetPath)
-	if os.IsNotExist(statErr) {
-		klog.Infof("Target path %s does not exist, nothing to unmount", targetPath)
-		return nil
-	}
-
-	// Stale FUSE mount: dead daemon (ENOTCONN/ESTALE) or aborted/zombie
-	// connection (EIO) — only a lazy unmount can detach it.
-	isStale := statErr != nil && (errors.Is(statErr, syscall.ENOTCONN) ||
-		errors.Is(statErr, syscall.ESTALE) || errors.Is(statErr, syscall.EIO))
-
-	if isStale {
-		klog.Warningf("Detected stale mount at %s, using lazy unmount", targetPath)
-		cmd := exec.Command("umount", "-l", targetPath)
-		if err := cmd.Run(); err != nil {
-			klog.Warningf("Lazy unmount of stale mount %s failed: %v", targetPath, err)
+	mounts, known := rclone.HostMountsOK()
+	if known {
+		if _, mounted := mounts[targetPath]; !mounted {
+			klog.Infof("Target path %s is not a mount point, nothing to unmount", targetPath)
+			return nil
 		}
-		return nil
+	} else {
+		// Unknown: attempt the unmount anyway. A no-op umount is harmless;
+		// skipping a needed one leaves the mount pinned forever.
+		klog.Warningf("Host mount table unreadable; attempting unmount of %s regardless", targetPath)
 	}
 
-	// Check if it's actually a mount point
-	if !ns.isMountPoint(targetPath) {
-		klog.Infof("Target path %s is not a mount point, nothing to unmount", targetPath)
-		return nil
-	}
-
-	// Try normal unmount
-	cmd := exec.Command("umount", targetPath)
-	if err := cmd.Run(); err != nil {
+	if err := runCmdBounded(30*time.Second, "umount", targetPath); err != nil {
 		klog.Warningf("Normal unmount of %s failed: %v, trying lazy unmount", targetPath, err)
-		// Fallback to lazy unmount
-		lazyCmd := exec.Command("umount", "-l", targetPath)
-		if lazyErr := lazyCmd.Run(); lazyErr != nil {
+		if lazyErr := runCmdBounded(30*time.Second, "umount", "-l", targetPath); lazyErr != nil {
+			if !known {
+				// Indistinguishable from "already gone". Failing here would wedge
+				// NodeUnpublishVolume forever; if it really is mounted, kubelet's
+				// own rmdir fails and it retries us.
+				klog.Warningf("Could not unmount %s and the mount table is unreadable; reporting success so pod "+
+					"teardown is not wedged (kubelet retries if the mount is in fact still there)", targetPath)
+				return nil
+			}
 			return fmt.Errorf("failed to unmount %s (lazy also failed: %v): %v", targetPath, lazyErr, err)
 		}
 		klog.Infof("Lazy unmount of %s succeeded", targetPath)
@@ -695,11 +750,12 @@ func (ns *NodeServer) unmountPath(targetPath string) error {
 
 // bindMount creates a simple bind mount from source to target
 func (ns *NodeServer) bindMount(sourcePath, targetPath string, readonly bool, fsGroup *int64) error {
-	// Create target directory in host namespace using nsenter
+	// Create target directory in host namespace using nsenter. Bounded: mkdir
+	// and mount both take the kernel mount lock, which a wedged umount
+	// elsewhere on the node can hold indefinitely.
 	mkdirArgs := []string{"-t", "1", "-m", "-u", "mkdir", "-p", targetPath}
 	klog.Infof("Creating target directory with nsenter: nsenter %v", mkdirArgs)
-	mkdirCmd := exec.Command("nsenter", mkdirArgs...)
-	if err := mkdirCmd.Run(); err != nil {
+	if err := runCmdBounded(60*time.Second, "nsenter", mkdirArgs...); err != nil {
 		return fmt.Errorf("failed to create target directory in host namespace: %v", err)
 	}
 
@@ -707,15 +763,13 @@ func (ns *NodeServer) bindMount(sourcePath, targetPath string, readonly bool, fs
 	args := []string{"-t", "1", "-m", "-u", "mount", "--bind", sourcePath, targetPath}
 
 	klog.Infof("Executing nsenter bind mount: nsenter %v", args)
-	cmd := exec.Command("nsenter", args...)
-	if err := cmd.Run(); err != nil {
+	if err := runCmdBounded(60*time.Second, "nsenter", args...); err != nil {
 		return fmt.Errorf("failed to nsenter bind mount %s to %s: %v", sourcePath, targetPath, err)
 	}
 
 	// Set readonly if requested
 	if readonly {
-		cmd = exec.Command("mount", "-o", "remount,ro", targetPath)
-		if err := cmd.Run(); err != nil {
+		if err := runCmdBounded(60*time.Second, "mount", "-o", "remount,ro", targetPath); err != nil {
 			return fmt.Errorf("failed to remount as readonly: %v", err)
 		}
 	}
@@ -802,10 +856,8 @@ func (ns *NodeServer) extractFsGroupFromPod(volumeContext map[string]string) *in
 // driver applies when an fsGroup is set. Defaults to defaultFsMode.
 const FsModeParam = "fs-mode"
 
-// defaultFsMode is 0750 (owner rwx, group rx, no other). Since the driver also
-// chowns owner to the fsGroup, a process running as that fsGroup gets full
-// access — and 0750 is one of the two modes PostgreSQL accepts on its data
-// directory (0775 is rejected). Workloads needing group-write can set fs-mode.
+// defaultFsMode is 0750: the driver chowns owner to the fsGroup, so that
+// process gets full access. Workloads needing group-write can set fs-mode.
 const defaultFsMode = "0750"
 
 // extractFsMode returns the recursive permission mode from the StorageClass
@@ -864,4 +916,3 @@ func (ns *NodeServer) applyFsGroupPermissions(targetPath string, fsGroup int64, 
 	klog.Infof("Successfully applied fsGroup %d permissions recursively to %s", fsGroup, targetPath)
 	return nil
 }
-
