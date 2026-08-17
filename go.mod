@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/container-storage-interface/spec v1.12.0
 	github.com/rclone/rclone v1.74.3
-	github.com/stretchr/testify v1.11.1
+	github.com/stretchr/testify v1.12.0
 	google.golang.org/grpc v1.80.0
 	k8s.io/api v0.35.0
 	k8s.io/apimachinery v0.35.0
@@ -94,7 +94,6 @@ require (
 	github.com/oklog/ulid v1.3.1 // indirect
 	github.com/peterh/liner v1.2.2 // indirect
 	github.com/pkg/xattr v0.4.12 // indirect
-	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
 	github.com/prometheus/client_golang v1.23.2 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
