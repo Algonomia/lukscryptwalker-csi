@@ -78,7 +78,7 @@ func TestOpenFilesUnder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer fd.Close()
+	defer func() { _ = fd.Close() }()
 
 	open, realRoot, ok := openFilesUnder(root)
 	if !ok {
