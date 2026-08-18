@@ -70,6 +70,13 @@ node:
   # VFS cache configuration
   vfsCacheSize: "20G"  # Size of the encrypted LUKS volume for VFS cache
 
+  # Take file mtimes from the S3 listing instead of each object's metadata.
+  # Metadata is not returned by a listing, so reading it costs one HEAD per
+  # file: a cold `ls` of a large directory becomes thousands of round-trips.
+  # Cost of leaving this on: mtime is the S3 upload time rather than the exact
+  # write time (rclone still stores the true mtime, so this is reversible).
+  useServerModTime: true
+
   # Upgrade one node at a time: the driver serves FUSE mounts in-process, so
   # restarting it disrupts every volume on the node.
   updateStrategy:

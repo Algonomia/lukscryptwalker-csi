@@ -143,6 +143,12 @@ spec:
         # kubelet recreates it. Never touches runtime, control plane, or node.
         - name: HOST_WATCHDOG
           value: {{ .Values.node.hostWatchdog | default true | quote }}
+        # S3 keeps rclone's mtime in object metadata, which listings don't
+        # return — so reading it costs one HEAD per file and a cold `ls` of a
+        # large directory becomes thousands of round-trips. Serve mtimes from
+        # the listing instead. Set "false" to get exact mtimes back at that cost.
+        - name: RCLONE_USE_SERVER_MODTIME
+          value: {{ .Values.node.useServerModTime | default true | quote }}
         volumeMounts:
         - name: plugin-dir
           mountPath: /csi

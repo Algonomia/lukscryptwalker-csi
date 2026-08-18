@@ -42,10 +42,29 @@ func Initialize() error {
 	initOnce.Do(func() {
 		librclone.Initialize()
 		klog.Info("librclone initialized successfully")
+		setServerModTime()
 	})
 
 	initDone = true
 	return nil
+}
+
+// setServerModTime makes the VFS read mtimes from the S3 listing instead of
+// each object's metadata. S3 keeps rclone's mtime in object metadata, which a
+// listing does not return, so serving one cold readdir costs a HEAD per file —
+// the whole reason `ls` stalls for seconds once the dir cache expires. Uploads
+// still record the true mtime, so this only changes what we read back.
+func setServerModTime() {
+	if os.Getenv("RCLONE_USE_SERVER_MODTIME") == "false" {
+		klog.Info("UseServerModTime disabled by env: cold directory listings will HEAD every object")
+		return
+	}
+	params := map[string]interface{}{"main": map[string]interface{}{"UseServerModTime": true}}
+	if _, err := RPCWithTimeout("options/set", params, RPCDefaultTimeout); err != nil {
+		klog.Warningf("Could not enable UseServerModTime (%v); cold directory listings will HEAD every object", err)
+		return
+	}
+	klog.Info("Enabled UseServerModTime: file mtimes come from the S3 listing, not a HEAD per object")
 }
 
 // Finalize cleans up librclone resources

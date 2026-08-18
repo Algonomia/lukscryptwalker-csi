@@ -411,6 +411,7 @@ func (mm *MountManager) Mount() error {
 
 	mm.stopCacheMon = make(chan struct{})
 	go mm.cacheMonitor()
+	go mm.dirCacheWarmer()
 
 	// Stale cache from unclean shutdown: async refresh reconciles rclone's
 	// in-memory state with S3 while dirty files remain available for re-upload.
@@ -813,21 +814,83 @@ func (mm *MountManager) refreshVFS() {
 	mm.refreshMu.Lock()
 	defer mm.refreshMu.Unlock()
 
-	fs := mm.cryptConfigName + ":"
-
 	// Forget in-memory directory cache so rclone drops any stale Items
-	if _, err := RPCWithTimeout("vfs/forget", map[string]interface{}{"fs": fs}, rpcRefreshTimeout); err != nil {
+	if _, err := RPCWithTimeout("vfs/forget", map[string]interface{}{"fs": mm.cryptConfigName + ":"}, rpcRefreshTimeout); err != nil {
 		klog.Warningf("vfs/forget failed for volume %s: %v", mm.volumeID, err)
 	}
 
-	// Refresh directory listings from S3 to rebuild clean state
+	mm.refreshTree()
+}
+
+// refreshTree re-lists the remote into the directory cache. A recursive refresh
+// resolves to one ListR sweep and restamps every subdirectory it walks, so the
+// whole tree is renewed by a single paginated listing. Caller holds refreshMu.
+func (mm *MountManager) refreshTree() {
 	refreshParams := map[string]interface{}{
-		"fs":        fs,
+		"fs":        mm.cryptConfigName + ":",
 		"dir":       "",
 		"recursive": "true",
 	}
+	start := time.Now()
 	if _, err := RPCWithTimeout("vfs/refresh", refreshParams, rpcRefreshTimeout); err != nil {
 		klog.Warningf("vfs/refresh failed for volume %s: %v", mm.volumeID, err)
+		return
+	}
+	klog.V(4).Infof("Volume %s: directory cache refreshed in %s", mm.volumeID, time.Since(start))
+}
+
+// Background dir-cache renewal. Without it the cache simply expires and the
+// next consumer request pays the full listing — the reason `ls` stalls after an
+// idle period. Renewing early keeps that cost off the request path entirely.
+const (
+	// Refresh at this fraction of DirCacheTime, leaving margin for a slow listing.
+	dirCacheWarmRatio = 0.8
+	// Floor so a small DirCacheTime cannot turn the warmer into a listing loop.
+	minDirCacheWarmInterval = time.Minute
+)
+
+// dirCacheWarmInterval returns how often to renew the listing, or 0 when
+// directory caching is off and there is nothing to keep warm.
+func (mm *MountManager) dirCacheWarmInterval() time.Duration {
+	dirCacheTime := time.Hour // matches DefaultVFSCacheConfig
+	if mm.vfsConfig.DirCacheTime != "" {
+		ns, err := parseDurationToNs(mm.vfsConfig.DirCacheTime)
+		if err != nil || ns <= 0 {
+			return 0
+		}
+		dirCacheTime = time.Duration(ns)
+	}
+	return max(time.Duration(float64(dirCacheTime)*dirCacheWarmRatio), minDirCacheWarmInterval)
+}
+
+// dirCacheWarmer renews the directory listing just before it expires, so a
+// consumer never meets a cold cache. Refresh without a preceding forget: the
+// existing entries keep serving until the fresh listing replaces them.
+func (mm *MountManager) dirCacheWarmer() {
+	interval := mm.dirCacheWarmInterval()
+	if interval <= 0 {
+		return
+	}
+	klog.Infof("Volume %s: renewing the directory cache every %s to keep listings off the request path",
+		mm.volumeID, interval)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-mm.stopCacheMon:
+			return
+		case <-ticker.C:
+			// A dead or replaced mount must not have its listing renewed: that
+			// is the checker's business, and the RPC would only be ambiguous.
+			if !mm.IsMounted() {
+				continue
+			}
+			mm.refreshMu.Lock()
+			mm.refreshTree()
+			mm.refreshMu.Unlock()
+		}
 	}
 }
 
@@ -1056,11 +1119,22 @@ func (mm *MountManager) evictCacheIfNeeded(cacheDir string, maxBytes int64) {
 	klog.Infof("VFS cache for volume %s is %d bytes (limit %d), evicting oldest files",
 		mm.volumeID, totalSize, maxBytes)
 
+	// One /proc sweep for the whole pass. Probing per candidate re-read every fd
+	// on the node for every file considered, which on a busy node burns real CPU
+	// inside the process that also serves FUSE.
+	open, realRoot, ok := openFilesUnder(cacheDir)
+	if !ok {
+		klog.Warningf("VFS cache for volume %s: cannot enumerate open file descriptors, skipping eviction this pass",
+			mm.volumeID)
+		return
+	}
+
 	// Sort oldest first
 	sort.Slice(files, func(i, j int) bool {
 		return files[i].modTime.Before(files[j].modTime)
 	})
 
+	var evicted []string
 	for _, f := range files {
 		if totalSize <= maxBytes {
 			break
@@ -1068,7 +1142,7 @@ func (mm *MountManager) evictCacheIfNeeded(cacheDir string, maxBytes int64) {
 		// Skip files that have open file descriptors — removing them while
 		// rclone holds a handle leaves the VFS item with didClose=false,
 		// causing "internal error: didn't Close file" on the next access.
-		if isCacheFileOpen(f.path) {
+		if _, isOpen := open[resolveUnder(cacheDir, realRoot, f.path)]; isOpen {
 			klog.V(4).Infof("Skipping eviction of open cache file %s", f.path)
 			continue
 		}
@@ -1077,46 +1151,108 @@ func (mm *MountManager) evictCacheIfNeeded(cacheDir string, maxBytes int64) {
 			continue
 		}
 		totalSize -= f.size
+		evicted = append(evicted, f.path)
 	}
 
 	klog.Infof("VFS cache for volume %s reduced to %d bytes", mm.volumeID, totalSize)
 
-	// After removing cache data files, clear rclone's in-memory directory
-	// cache so it doesn't serve stale entries pointing to removed files.
-	// On the next read rclone will re-download from S3 as needed.
-	mm.refreshVFS()
+	// Drop the evicted files from rclone's directory cache so it stops
+	// advertising cache data we just deleted — but only those. Forgetting the
+	// whole fs (the previous behaviour) meant a single evicted file made the
+	// next ls re-list the entire volume from S3.
+	mm.forgetCachePaths(cacheDir, evicted)
 }
 
-// isCacheFileOpen reports whether any process has an open file descriptor
-// pointing at path. It scans /proc/*/fd symlinks, the same technique used by
-// lsof. Returns true on any error so callers err on the side of safety.
-func isCacheFileOpen(path string) bool {
-	// Resolve to canonical path so symlinks don't fool the comparison.
-	real, err := filepath.EvalSymlinks(path)
+// forgetCachePaths drops the given cache files from rclone's directory cache.
+// Paths under the VFS cache dir mirror the crypt remote's decrypted layout, so
+// a path relative to cacheDir is the remote path vfs/forget expects.
+func (mm *MountManager) forgetCachePaths(cacheDir string, paths []string) {
+	if len(paths) == 0 {
+		return
+	}
+
+	mm.refreshMu.Lock()
+	defer mm.refreshMu.Unlock()
+
+	// vfs/forget takes file, file2, file3… Chunked so one large eviction does
+	// not build a single enormous RPC payload.
+	const perCall = 500
+	params := map[string]interface{}{"fs": mm.cryptConfigName + ":"}
+	n := 0
+	flush := func() {
+		if n == 0 {
+			return
+		}
+		if _, err := RPCWithTimeout("vfs/forget", params, rpcRefreshTimeout); err != nil {
+			klog.Warningf("Volume %s: forgetting %d evicted cache paths failed: %v", mm.volumeID, n, err)
+		}
+		params = map[string]interface{}{"fs": mm.cryptConfigName + ":"}
+		n = 0
+	}
+
+	for _, p := range paths {
+		rel, err := filepath.Rel(cacheDir, p)
+		if err != nil || strings.HasPrefix(rel, "..") {
+			continue
+		}
+		key := "file"
+		if n > 0 {
+			key = fmt.Sprintf("file%d", n+1)
+		}
+		params[key] = rel
+		if n++; n >= perCall {
+			flush()
+		}
+	}
+	flush()
+}
+
+// openFilesUnder returns the canonical paths under root that some process holds
+// an fd on, plus the resolved root the caller must map its paths through. The
+// scan is the technique lsof uses. ok=false means the scan could not be trusted
+// and nothing should be removed.
+func openFilesUnder(root string) (open map[string]struct{}, realRoot string, ok bool) {
+	// Kernel fd links are already fully resolved, so compare in that namespace.
+	realRoot, err := filepath.EvalSymlinks(root)
 	if err != nil {
-		real = path
+		realRoot = root
 	}
 
 	fdDirs, err := filepath.Glob("/proc/*/fd")
 	if err != nil {
-		return true
+		return nil, realRoot, false
 	}
+
+	open = make(map[string]struct{})
 	for _, fdDir := range fdDirs {
 		entries, err := os.ReadDir(fdDir)
 		if err != nil {
-			continue
+			continue // process exited mid-scan; its fds went with it
 		}
 		for _, e := range entries {
 			target, err := os.Readlink(filepath.Join(fdDir, e.Name()))
 			if err != nil {
 				continue
 			}
-			if target == real || target == path {
-				return true
+			if strings.HasPrefix(target, realRoot) {
+				open[target] = struct{}{}
 			}
 		}
 	}
-	return false
+	return open, realRoot, true
+}
+
+// resolveUnder rewrites a path found by walking root into the resolved
+// namespace that openFilesUnder reports.
+func resolveUnder(root, realRoot, path string) string {
+	if root == realRoot {
+		return path
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return path
+	}
+	return filepath.Join(realRoot, rel)
 }
 
 // hasActiveTransfers returns true if rclone is currently uploading files
