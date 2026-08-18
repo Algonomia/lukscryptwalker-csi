@@ -59,9 +59,12 @@ func setServerModTime() {
 		klog.Info("UseServerModTime disabled by env: cold directory listings will HEAD every object")
 		return
 	}
-	params := map[string]interface{}{"main": map[string]interface{}{"UseServerModTime": true}}
-	if _, err := RPCWithTimeout("options/set", params, RPCDefaultTimeout); err != nil {
-		klog.Warningf("Could not enable UseServerModTime (%v); cold directory listings will HEAD every object", err)
+	// Straight to callLibrclone: RPCWithTimeout re-enters Initialize, whose
+	// lock this runs under, and sync.Mutex is not reentrant.
+	_, status, err := callLibrclone("options/set", `{"main":{"UseServerModTime":true}}`, RPCDefaultTimeout)
+	if err != nil || status >= 400 {
+		klog.Warningf("Could not enable UseServerModTime (status %d, %v); cold directory listings will HEAD every object",
+			status, err)
 		return
 	}
 	klog.Info("Enabled UseServerModTime: file mtimes come from the S3 listing, not a HEAD per object")
