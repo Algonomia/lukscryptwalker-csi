@@ -57,7 +57,11 @@ type NodeServer struct {
 	regUnhealthy atomic.Bool
 	// vfsProbesInFlight caps the zombie-mount readdir probe at one goroutine
 	// per mount path, so a wedged FUSE can't leak one on every checker tick.
+	// Values are the probe's start time; see vfsProbeStuckAfter.
 	vfsProbesInFlight sync.Map
+	// zombieVFSStrikes (volumeID → int) counts consecutive ticks on which a
+	// live FUSE mount had no VFS registered in rclone.
+	zombieVFSStrikes sync.Map
 	// statfsProbesInFlight likewise caps the checker's statfs probe: a wedged
 	// FUSE blocks statfs in D-state, and an unbounded call freezes the checker.
 	statfsProbesInFlight sync.Map

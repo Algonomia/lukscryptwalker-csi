@@ -256,27 +256,58 @@ func (mm *MountManager) bumpGeneration() {
 	mm.vfsName, mm.s3ConfigName, mm.cryptConfigName = vfsNamesFor(mm.volumeID, mm.generation)
 }
 
-// countRegisteredVFS returns how many VFSes rclone has under this fs name, and
-// whether the answer could be obtained at all.
-func (mm *MountManager) countRegisteredVFS() (int, bool) {
+// RegisteredVFSNames returns how many VFSes rclone serves under each fs name,
+// and whether the registry could be read at all. A live kernel mount whose name
+// is absent is a zombie: its serve loop still answers, but every request behind
+// it reaches a shut-down fs and comes back EIO.
+func RegisteredVFSNames() (map[string]int, bool) {
 	result, err := RPCWithTimeout("vfs/list", map[string]interface{}{}, rpcListTimeout)
 	if err != nil || result == nil || result.Output == nil {
-		klog.Warningf("Volume %s: could not list active VFSes (%v); cannot verify name exclusivity", mm.volumeID, err)
-		return 0, false
+		klog.Warningf("Could not list active VFSes: %v", err)
+		return nil, false
 	}
 	names, ok := result.Output["vfses"].([]interface{})
 	if !ok {
-		return 0, false
+		return nil, false
 	}
 	// Duplicates are listed as "name:[i]", singletons as "name:".
-	prefix := mm.cryptConfigName + ":"
-	count := 0
+	counts := make(map[string]int, len(names))
 	for _, n := range names {
-		if s, ok := n.(string); ok && (s == prefix || strings.HasPrefix(s, prefix+"[")) {
-			count++
+		s, ok := n.(string)
+		if !ok {
+			continue
 		}
+		name, _, found := strings.Cut(s, ":")
+		if !found {
+			continue
+		}
+		counts[name]++
 	}
-	return count, true
+	return counts, true
+}
+
+// FSName is the rclone remote this mount's VFS registers under, as it appears
+// in RegisteredVFSNames (no trailing colon).
+func (mm *MountManager) FSName() string {
+	return mm.cryptConfigName
+}
+
+// FSNameForVolume recovers the fs name a volume's mount registers under from
+// the persisted vfsName map, for callers with no live MountManager.
+func FSNameForVolume(volumeID string) string {
+	_, _, cryptConfigName := vfsNamesFor(volumeID, generationOfVFSName(volumeID, LoadVFSNameMap()[volumeID]))
+	return cryptConfigName
+}
+
+// countRegisteredVFS returns how many VFSes rclone has under this fs name, and
+// whether the answer could be obtained at all.
+func (mm *MountManager) countRegisteredVFS() (int, bool) {
+	counts, ok := RegisteredVFSNames()
+	if !ok {
+		klog.Warningf("Volume %s: could not list active VFSes; cannot verify name exclusivity", mm.volumeID)
+		return 0, false
+	}
+	return counts[mm.cryptConfigName], true
 }
 
 // Mount mounts the encrypted S3 remote at the mount point using librclone

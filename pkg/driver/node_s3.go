@@ -271,8 +271,13 @@ func (ns *NodeServer) setupS3Sync(volumeID, stagingPath string, volumeContext ma
 		return fmt.Errorf("failed to mount S3 volume: %w", err)
 	}
 
-	// Store mount manager
+	// Store mount manager, stopping the monitors of any manager it replaces:
+	// those keep polling a VFS name this mount no longer uses and keep evicting
+	// a cache dir the fresh mount now owns.
 	ns.s3SyncMgr.mutex.Lock()
+	if old := ns.s3SyncMgr.mountManagers[volumeID]; old != nil && old != mountMgr {
+		old.StopCacheMonitor()
+	}
 	ns.s3SyncMgr.mountManagers[volumeID] = mountMgr
 	ns.s3SyncMgr.mutex.Unlock()
 
@@ -464,6 +469,10 @@ func (ns *NodeServer) cleanupStaleS3Mounts() {
 		return
 	}
 
+	// One registry snapshot per tick: the authority on which mounts still have
+	// a live fs behind them (see vfsRegistryMissing).
+	vfsNames, vfsNamesKnown := rclone.RegisteredVFSNames()
+
 	kubeletRoot := resolveKubeletRoot()
 	csiPluginPath := kubeletRoot + "/plugins/kubernetes.io/csi/" + DriverName
 	klog.Infof("Checking for stale/missing S3 mounts in %s", csiPluginPath)
@@ -517,6 +526,17 @@ func (ns *NodeServer) cleanupStaleS3Mounts() {
 		// Check if mount is missing (directory exists but no FUSE mount)
 		// This happens when the stale mount was already cleaned up but pods still need it
 		isMissingMount := statErr == nil && !ns.isFUSEMountPoint(globalmountPath)
+
+		// rclone's registry is the authority on a zombie: statfs is answered by
+		// the FUSE layer and listings by the dir cache, so both keep passing
+		// after the fs behind them is gone. Ask it before the read probe, which
+		// only proves the mount dead if it stumbles onto an uncached file.
+		if !isStaleFUSE && statErr == nil && !isMissingMount &&
+			ns.vfsRegistryMissing(volumeDir, vfsNames, vfsNamesKnown) {
+			klog.Warningf("S3 mount %s has no VFS registered in rclone (zombie: the FUSE mount answers, the fs behind "+
+				"it is shut down); reconciling", globalmountPath)
+			isStaleFUSE = true
+		}
 
 		// statfs is FUSE-local, so a healthy-looking mount can be a cancelled-VFS
 		// zombie (real ops return EIO); probe it and reconcile if unresponsive.
@@ -1187,11 +1207,68 @@ func (ns *NodeServer) forceDeletePod(ctx context.Context, pod *corev1.Pod) {
 	}
 }
 
+// A mount must be missing from the VFS registry on this many consecutive ticks
+// before it counts as a zombie: one tick can race a mount being registered.
+const zombieVFSConfirmations = 2
+
+// vfsRegistryMissing reports whether a live FUSE mount has no VFS behind it in
+// rclone, confirmed across consecutive ticks. Every request such a mount serves
+// returns EIO, which is invisible to statfs and to cached listings.
+func (ns *NodeServer) vfsRegistryMissing(volumeDir string, vfsNames map[string]int, known bool) bool {
+	if !known {
+		return false
+	}
+	volumeID := ns.getVolumeIDFromVolData(volumeDir)
+	// A mount still being set up has no VFS yet, and a drain owns the volume's
+	// cache — neither is a zombie.
+	if volumeID == "" || ns.s3SyncMgr.isVolumeSetupInProgress(volumeID) ||
+		ns.s3SyncMgr.isBackgroundDraining(volumeID) {
+		return false
+	}
+	if vfsNames[ns.expectedFSName(volumeID)] > 0 {
+		ns.zombieVFSStrikes.Delete(volumeID)
+		return false
+	}
+	strikes := 1
+	if prev, ok := ns.zombieVFSStrikes.Load(volumeID); ok {
+		strikes = prev.(int) + 1
+	}
+	if strikes < zombieVFSConfirmations {
+		ns.zombieVFSStrikes.Store(volumeID, strikes)
+		klog.Warningf("Volume %s: its FUSE mount is live but rclone has no VFS for it (%d/%d confirmations)",
+			volumeID, strikes, zombieVFSConfirmations)
+		return false
+	}
+	ns.zombieVFSStrikes.Delete(volumeID)
+	return true
+}
+
+// expectedFSName is the rclone remote this volume's mount should be registered
+// under: the live manager's name, or the persisted one after a driver restart.
+func (ns *NodeServer) expectedFSName(volumeID string) string {
+	ns.s3SyncMgr.mutex.RLock()
+	mm := ns.s3SyncMgr.mountManagers[volumeID]
+	ns.s3SyncMgr.mutex.RUnlock()
+	if mm != nil {
+		return mm.FSName()
+	}
+	return rclone.FSNameForVolume(volumeID)
+}
+
+// A read probe parked this long is itself the symptom: the mount is wedged, and
+// reporting it healthy while the probe never returns hides that forever.
+const vfsProbeStuckAfter = 2 * time.Minute
+
 // mountVFSResponsive reports whether a FUSE mount can serve real reads,
 // catching a cancelled-VFS zombie that passes statfs but fails real ops. Times
 // out as healthy (slow backend), and runs one probe per path at a time.
 func (ns *NodeServer) mountVFSResponsive(globalmountPath string) bool {
-	if _, inFlight := ns.vfsProbesInFlight.LoadOrStore(globalmountPath, struct{}{}); inFlight {
+	if prev, inFlight := ns.vfsProbesInFlight.LoadOrStore(globalmountPath, time.Now()); inFlight {
+		if since := time.Since(prev.(time.Time)); since > vfsProbeStuckAfter {
+			klog.Warningf("S3 mount %s: read probe has been blocked for %s (wedged FUSE); treating as unresponsive",
+				globalmountPath, since.Round(time.Second))
+			return false
+		}
 		return true
 	}
 

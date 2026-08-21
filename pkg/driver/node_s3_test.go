@@ -146,3 +146,74 @@ func TestCgroupBelongsToPod(t *testing.T) {
 		})
 	}
 }
+
+func TestVFSRegistryMissing(t *testing.T) {
+	const volumeID = "pvc-264e09a8-7045-45ba-9e7e-e325d2f780f2"
+
+	volumeDir := func(t *testing.T) string {
+		t.Helper()
+		dir := t.TempDir()
+		body := []byte(`{"volumeHandle":"` + volumeID + `"}`)
+		if err := os.WriteFile(filepath.Join(dir, "vol_data.json"), body, 0644); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	newNS := func() *NodeServer { return &NodeServer{s3SyncMgr: NewS3SyncManager()} }
+
+	t.Run("registered VFS is not a zombie", func(t *testing.T) {
+		ns := newNS()
+		names := map[string]int{volumeID: 1}
+		if ns.vfsRegistryMissing(volumeDir(t), names, true) {
+			t.Error("a mount whose VFS is registered must not be reported missing")
+		}
+	})
+
+	t.Run("unreadable registry decides nothing", func(t *testing.T) {
+		ns := newNS()
+		if ns.vfsRegistryMissing(volumeDir(t), nil, false) {
+			t.Error("an unreadable registry must not be read as a missing VFS")
+		}
+	})
+
+	t.Run("missing VFS needs consecutive confirmations", func(t *testing.T) {
+		ns := newNS()
+		dir := volumeDir(t)
+		for i := 1; i < zombieVFSConfirmations; i++ {
+			if ns.vfsRegistryMissing(dir, map[string]int{}, true) {
+				t.Fatalf("confirmation %d must not be enough to declare a zombie", i)
+			}
+		}
+		if !ns.vfsRegistryMissing(dir, map[string]int{}, true) {
+			t.Errorf("a mount missing from the registry on %d ticks must be reported", zombieVFSConfirmations)
+		}
+	})
+
+	t.Run("a reappearing VFS clears the strikes", func(t *testing.T) {
+		ns := newNS()
+		dir := volumeDir(t)
+		ns.vfsRegistryMissing(dir, map[string]int{}, true)
+		ns.vfsRegistryMissing(dir, map[string]int{volumeID: 1}, true)
+		if ns.vfsRegistryMissing(dir, map[string]int{}, true) {
+			t.Error("strikes must restart after the VFS is seen again")
+		}
+	})
+
+	t.Run("a mount still being set up has no VFS yet", func(t *testing.T) {
+		ns := newNS()
+		ns.s3SyncMgr.markVolumeSetupInProgress(volumeID)
+		dir := volumeDir(t)
+		for i := 0; i <= zombieVFSConfirmations; i++ {
+			if ns.vfsRegistryMissing(dir, map[string]int{}, true) {
+				t.Fatal("a volume in setup must never be reported as a zombie")
+			}
+		}
+	})
+
+	t.Run("no vol_data.json", func(t *testing.T) {
+		ns := newNS()
+		if ns.vfsRegistryMissing(t.TempDir(), map[string]int{}, true) {
+			t.Error("an unidentifiable volume must not be reported as a zombie")
+		}
+	})
+}
