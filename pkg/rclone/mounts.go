@@ -35,9 +35,20 @@ const (
 	mountsMaxStale = 90 * time.Second
 )
 
+// HostMount is one entry of the mount table: the device backing it and its
+// filesystem type. Dev identifies the superblock, so it distinguishes two
+// mounts of the same fs type at one path — which is the whole point.
+type HostMount struct {
+	Dev    string // maj:min
+	FSType string
+}
+
 var (
-	mountsMu        sync.Mutex
-	mountsCache     map[string]string
+	mountsMu     sync.Mutex
+	mountsStacks map[string][]HostMount // mountpoint → mounts, mountinfo order (last is topmost)
+	// Topmost mount per path; replaced together with mountsStacks so the two
+	// views never disagree.
+	mountsFlat      map[string]string
 	mountsReadAt    time.Time
 	mountsInFlight  bool
 	mountsBlockedAt time.Time // when the currently in-flight read started
@@ -53,11 +64,52 @@ func HostMounts() map[string]string {
 // HostMountsOK returns the host mount table and whether it is trustworthy,
 // never blocking past mountsReadBudget. Callers taking a destructive or
 // data-exposing decision must check ok — "unknown" is not "not mounted".
+// One entry per path (the topmost); to ask whether a path is FULLY unmounted
+// use HostMountDepth — a buried mount is absent here and from stat().
 func HostMountsOK() (map[string]string, bool) {
+	if _, ok := hostMountStacksOK(); !ok {
+		return nil, false
+	}
 	mountsMu.Lock()
-	fresh := mountsCache != nil && time.Since(mountsReadAt) < mountsCacheTTL
+	defer mountsMu.Unlock()
+	return mountsFlat, true
+}
+
+// HostMountStacksOK returns every mount at each path in the host namespace, in
+// mountinfo order (last is topmost), and whether the table is trustworthy.
+func HostMountStacksOK() (map[string][]HostMount, bool) {
+	return hostMountStacksOK()
+}
+
+// HostMountDepth reports how many mounts are stacked at path in the host mount
+// namespace, and whether the table could be read. Depth >1 means a buried
+// mount still serves every process that opened it before the newer one.
+func HostMountDepth(path string) (int, bool) {
+	stacks, ok := hostMountStacksOK()
+	if !ok {
+		return 0, false
+	}
+	return len(stacks[path]), true
+}
+
+// InvalidateHostMounts drops the cached table so the next query re-reads
+// /proc/1/mountinfo, for callers that just changed the mount tree.
+func InvalidateHostMounts() {
+	mountsMu.Lock()
+	if !mountsReadAt.IsZero() {
+		// Just past the TTL, not zero: a re-read that blocks must still serve
+		// the previous table rather than report UNKNOWN.
+		mountsReadAt = time.Now().Add(-mountsCacheTTL)
+	}
+	mountsMu.Unlock()
+}
+
+// hostMountStacksOK is the single reader behind every mount query.
+func hostMountStacksOK() (map[string][]HostMount, bool) {
+	mountsMu.Lock()
+	fresh := mountsStacks != nil && time.Since(mountsReadAt) < mountsCacheTTL
 	if fresh {
-		cached := mountsCache
+		cached := mountsStacks
 		mountsMu.Unlock()
 		return cached, true
 	}
@@ -70,12 +122,13 @@ func HostMountsOK() (map[string]string, bool) {
 	mountsBlockedAt = time.Now()
 	mountsMu.Unlock()
 
-	done := make(chan map[string]string, 1)
+	done := make(chan map[string][]HostMount, 1)
 	go func() {
 		m := readHostMounts()
 		mountsMu.Lock()
 		if m != nil {
-			mountsCache = m
+			mountsStacks = m
+			mountsFlat = flattenMountStacks(m)
 			mountsReadAt = time.Now()
 		}
 		mountsInFlight = false
@@ -97,13 +150,13 @@ func HostMountsOK() (map[string]string, bool) {
 }
 
 // cachedMountsLocked returns the cached table if young enough to act on.
-func cachedMountsLocked() (map[string]string, bool) {
-	if mountsCache == nil {
+func cachedMountsLocked() (map[string][]HostMount, bool) {
+	if mountsStacks == nil {
 		return nil, false
 	}
 	age := time.Since(mountsReadAt)
 	if age < mountsMaxStale {
-		return mountsCache, true
+		return mountsStacks, true
 	}
 	klog.Errorf("Host mount table has been unreadable for %s (read blocked since %s): treating mount state as "+
 		"UNKNOWN. Every mount check now fails closed — pods will not be published onto unverifiable mounts.",
@@ -113,7 +166,7 @@ func cachedMountsLocked() (map[string]string, bool) {
 
 // readHostMounts reads and parses the host mount table, falling back to our own
 // namespace if the host view is unreadable.
-func readHostMounts() map[string]string {
+func readHostMounts() map[string][]HostMount {
 	data, err := os.ReadFile(hostMountInfo)
 	if err != nil {
 		if data, err = os.ReadFile(selfMountInfo); err != nil {
@@ -122,13 +175,21 @@ func readHostMounts() map[string]string {
 		}
 		klog.V(4).Infof("Host mount table unreadable, using our own namespace")
 	}
-	return parseMountInfo(string(data))
+	return parseMountStacks(string(data))
 }
 
-// parseMountInfo maps mountpoint → fstype from /proc/*/mountinfo content.
+// ParseMountStacks parses /proc/<pid>/mountinfo content, for callers reading a
+// namespace other than the host's — a container's own view of its mounts.
+func ParseMountStacks(data string) map[string][]HostMount {
+	return parseMountStacks(data)
+}
+
+// parseMountStacks maps mountpoint → every mount there, in mountinfo order.
+// Keyed by path alone, stacked mounts collapse and a stale bind buried under a
+// fresh one becomes unobservable.
 // Format: ID PARENT MAJ:MIN ROOT MOUNTPOINT OPTIONS [OPTIONAL...] - FSTYPE SOURCE SUPEROPTS
-func parseMountInfo(data string) map[string]string {
-	out := make(map[string]string)
+func parseMountStacks(data string) map[string][]HostMount {
+	out := make(map[string][]HostMount)
 	for _, line := range strings.Split(data, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 5 {
@@ -138,10 +199,25 @@ func parseMountInfo(data string) map[string]string {
 		// Filesystem type is the first field after the " - " separator.
 		for i := 5; i < len(fields)-1; i++ {
 			if fields[i] == "-" {
-				out[mountPoint] = fields[i+1]
+				out[mountPoint] = append(out[mountPoint], HostMount{Dev: fields[2], FSType: fields[i+1]})
 				break
 			}
 		}
+	}
+	return out
+}
+
+// parseMountInfo maps mountpoint → the fstype of the TOPMOST mount there.
+func parseMountInfo(data string) map[string]string {
+	return flattenMountStacks(parseMountStacks(data))
+}
+
+// flattenMountStacks keeps the topmost mount at each path — the one the kernel
+// resolves for stat, open and umount.
+func flattenMountStacks(stacks map[string][]HostMount) map[string]string {
+	out := make(map[string]string, len(stacks))
+	for path, mounts := range stacks {
+		out[path] = mounts[len(mounts)-1].FSType
 	}
 	return out
 }

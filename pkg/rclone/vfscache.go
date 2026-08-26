@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -584,6 +585,72 @@ func sweepUnmappedVFSCacheDirsAt(base string, m map[string]string, isActive func
 		}
 		removeVFSCacheDirsAt(base, vfsName)
 	}
+}
+
+// HasUnuploadedData reports whether any on-disk VFS cache for this volume still
+// holds writes that never reached S3 — across every generation, since a mount
+// that hit a leaked VFS name strands its data under a .gN suffix. This is the
+// only evidence available once the in-memory mount manager is gone (driver
+// restart), so callers must consult it before declaring a volume unstaged.
+func HasUnuploadedData(volumeID string) bool {
+	return hasUnuploadedDataAt(VFSCacheBasePath, volumeID)
+}
+
+// VolumesWithUnuploadedData lists the volumes whose on-disk VFS cache still
+// holds writes that never reached S3. Used to find volumes the CO has stopped
+// asking about: no CSI call will ever be made for them again, so without this
+// sweep their cached writes have no remaining path to S3.
+func VolumesWithUnuploadedData() []string {
+	return volumesWithUnuploadedDataAt(VFSCacheBasePath)
+}
+
+func volumesWithUnuploadedDataAt(base string) []string {
+	entries, err := os.ReadDir(filepath.Join(base, "vfsMeta"))
+	if err != nil {
+		if !os.IsNotExist(err) {
+			klog.Warningf("Could not scan VFS cache metadata for unuploaded data: %v", err)
+		}
+		return nil
+	}
+	seen := make(map[string]bool)
+	var out []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		volumeID := volumeIDOfVFSName(e.Name())
+		if seen[volumeID] || !hasDirtyCacheItemsAt(base, e.Name()) {
+			continue
+		}
+		seen[volumeID] = true
+		out = append(out, volumeID)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func hasUnuploadedDataAt(base, volumeID string) bool {
+	if volumeID == "" {
+		return false
+	}
+	entries, err := os.ReadDir(filepath.Join(base, "vfsMeta"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false
+		}
+		klog.Warningf("Could not scan VFS cache metadata for volume %s (%v); treating it as holding unuploaded data",
+			volumeID, err)
+		return true
+	}
+	for _, e := range entries {
+		if !e.IsDir() || volumeIDOfVFSName(e.Name()) != volumeID {
+			continue
+		}
+		if hasDirtyCacheItemsAt(base, e.Name()) {
+			return true
+		}
+	}
+	return false
 }
 
 // hasDirtyCacheItemsAt reports unuploaded writes, erring towards "dirty": an

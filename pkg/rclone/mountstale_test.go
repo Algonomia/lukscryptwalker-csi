@@ -9,9 +9,15 @@ import (
 // with the last successful read at the given age.
 func pinMountsCache(t *testing.T, table map[string]string, age time.Duration) {
 	t.Helper()
+	stacks := make(map[string][]HostMount, len(table))
+	for path, fsType := range table {
+		stacks[path] = []HostMount{{Dev: "0:1", FSType: fsType}}
+	}
+
 	mountsMu.Lock()
-	origCache, origAt, origFlight, origBlocked := mountsCache, mountsReadAt, mountsInFlight, mountsBlockedAt
-	mountsCache = table
+	origStacks, origFlat := mountsStacks, mountsFlat
+	origAt, origFlight, origBlocked := mountsReadAt, mountsInFlight, mountsBlockedAt
+	mountsStacks, mountsFlat = stacks, table
 	mountsReadAt = time.Now().Add(-age)
 	mountsInFlight = true // a read is stuck on the kernel mount lock
 	mountsBlockedAt = time.Now().Add(-age)
@@ -19,7 +25,24 @@ func pinMountsCache(t *testing.T, table map[string]string, age time.Duration) {
 
 	t.Cleanup(func() {
 		mountsMu.Lock()
-		mountsCache, mountsReadAt, mountsInFlight, mountsBlockedAt = origCache, origAt, origFlight, origBlocked
+		mountsStacks, mountsFlat = origStacks, origFlat
+		mountsReadAt, mountsInFlight, mountsBlockedAt = origAt, origFlight, origBlocked
+		mountsMu.Unlock()
+	})
+}
+
+// pinMountsStacks installs a fresh host mount table, stacks and all.
+func pinMountsStacks(t *testing.T, stacks map[string][]HostMount) {
+	t.Helper()
+	mountsMu.Lock()
+	origStacks, origFlat, origAt := mountsStacks, mountsFlat, mountsReadAt
+	mountsStacks, mountsFlat = stacks, flattenMountStacks(stacks)
+	mountsReadAt = time.Now()
+	mountsMu.Unlock()
+
+	t.Cleanup(func() {
+		mountsMu.Lock()
+		mountsStacks, mountsFlat, mountsReadAt = origStacks, origFlat, origAt
 		mountsMu.Unlock()
 	})
 }

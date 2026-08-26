@@ -155,6 +155,28 @@ The cache lives in a LUKS-encrypted volume on the node; a background process enf
 
 `rclone-dir-cache-time` / `rclone-attr-timeout` control directory **metadata** caching. With filename encryption on, each uncached `stat`/`readdir` costs an S3 `ListObjects` + decrypt, so metadata-heavy workloads on large directories (e.g. pgbackrest WAL archives) can stall. The `1h` default avoids that; these are RWO/single-writer volumes, so a writer always sees its own changes immediately regardless. Lower it per StorageClass if a volume is modified from outside the cluster and needs fresher metadata. The default applies to existing volumes too — they pick it up on the next mount (pod restart), with no re-provisioning.
 
+### Moving a volume between nodes
+
+Writes land in the node's local VFS cache first and are uploaded asynchronously. Until
+that upload completes, the node holds the only copy — so the driver refuses to unstage
+the volume, and `kubectl describe pvc` shows an `UnuploadedData` warning naming the node.
+The consumer stays `Terminating` until the upload finishes, because letting it start
+elsewhere would give it an S3 prefix missing everything still queued.
+
+A volume kubelet has already stopped staging on a node is re-mounted privately by the
+driver, uploaded, and unmounted — no manual step is needed for data stranded by an
+earlier crash or driver restart.
+
+If S3 is unreachable for good and the consumer has to move regardless:
+
+```bash
+kubectl annotate pvc <name> lukscryptwalker.io/force-unstage=true
+```
+
+This **abandons** the unuploaded writes. They stay in the node's cache
+(`/root/.cache/rclone/vfs/<volumeID>` inside the CSI node pod, plaintext) for manual
+recovery; remove the annotation once the volume has moved.
+
 ### Layout in S3
 
 ```

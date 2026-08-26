@@ -84,14 +84,20 @@ func corruptReason(metaPath, dataPath string) string {
 	return ""
 }
 
+// isCacheItemDirty reports whether an item still holds unuploaded writes,
+// erring towards "dirty": metadata we cannot read is not proof of an upload.
 func isCacheItemDirty(metaPath string) bool {
 	raw, err := os.ReadFile(metaPath)
 	if err != nil {
-		return false
+		// Unreadable metadata is no evidence the data reached S3; a truncated
+		// meta file used to make an unuploaded item look clean and reclaimable.
+		klog.Warningf("VFS cache metadata %s is unreadable (%v); treating the item as unuploaded", metaPath, err)
+		return true
 	}
 	var info cacheItemInfo
 	if err := json.Unmarshal(raw, &info); err != nil {
-		return false
+		klog.Warningf("VFS cache metadata %s is unparseable (%v); treating the item as unuploaded", metaPath, err)
+		return true
 	}
 	return info.Dirty
 }

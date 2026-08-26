@@ -94,11 +94,18 @@ func (sm *S3SyncManager) loadPendingDrains() {
 	}
 }
 
-func (sm *S3SyncManager) startBackgroundDrain(volumeID string) {
+// startBackgroundDrain claims the volume's single drain slot. It returns false
+// when a drain is already running: a second one would mount a second VFS under
+// the same name, which makes the upload queue permanently unobservable.
+func (sm *S3SyncManager) startBackgroundDrain(volumeID string) bool {
 	sm.drainMu.Lock()
 	defer sm.drainMu.Unlock()
+	if _, running := sm.backgroundDrains[volumeID]; running {
+		return false
+	}
 	sm.backgroundDrains[volumeID] = make(chan struct{})
 	rclone.SaveDrainPending(volumeID)
+	return true
 }
 
 func (sm *S3SyncManager) isBackgroundDraining(volumeID string) bool {
@@ -114,12 +121,22 @@ func (sm *S3SyncManager) hasPendingDrain(volumeID string) bool {
 	return sm.pendingDrains[volumeID]
 }
 
-func (sm *S3SyncManager) finishBackgroundDrain(volumeID string) {
+// finishBackgroundDrain releases the drain slot. The persistent marker is
+// cleared only when the drain actually completed: clearing it on failure
+// destroyed the one record that this node still held the volume's only copy,
+// so nothing afterwards — not the checker, not the next driver start — could
+// tell that its cache was more than a stale read cache.
+func (sm *S3SyncManager) finishBackgroundDrain(volumeID string, drained bool) {
 	sm.drainMu.Lock()
 	defer sm.drainMu.Unlock()
 	if done, ok := sm.backgroundDrains[volumeID]; ok {
 		close(done)
 		delete(sm.backgroundDrains, volumeID)
+	}
+	if !drained {
+		sm.pendingDrains[volumeID] = true
+		rclone.SaveDrainPending(volumeID)
+		return
 	}
 	delete(sm.pendingDrains, volumeID)
 	rclone.ClearDrainPending(volumeID)
@@ -196,6 +213,36 @@ func (ns *NodeServer) setupS3Volume(params *StagingParameters, volumeContext, se
 // The caller is responsible for calling markVolumeSetupInProgress/markVolumeSetupComplete
 // to guard the full publish flow (including bind mount) from stale mount detection.
 func (ns *NodeServer) setupS3Sync(volumeID, stagingPath string, volumeContext map[string]string, _ map[string]string, fsGroup *int64) error {
+	// If a background drain is still running (previous pod terminated with
+	// uploads in progress), wait briefly for it to finish before remounting.
+	// Never block past kubelet's CSI deadline (~2min): return a retryable
+	// error and let the drain finish in the background.
+	if ns.s3SyncMgr.isBackgroundDraining(volumeID) {
+		klog.Infof("Volume %s: waiting for background drain before remounting", volumeID)
+		if !ns.s3SyncMgr.waitForBackgroundDrain(volumeID, 45*time.Second) {
+			return fmt.Errorf("volume %s: background drain still in progress, retry later", volumeID)
+		}
+	}
+
+	// Post-restart: a drain was in progress when the driver was killed. The
+	// VFS cache has unuploaded data; Mount() will detect it via hasStaleVFSCache
+	// and schedule a background refreshVFS. Clear the in-memory and disk markers
+	// now since the stale-cache path takes ownership from here.
+	if ns.s3SyncMgr.hasPendingDrain(volumeID) {
+		klog.Infof("Volume %s: post-restart pending drain detected, Mount() will upload stale VFS cache data", volumeID)
+		ns.s3SyncMgr.drainMu.Lock()
+		delete(ns.s3SyncMgr.pendingDrains, volumeID)
+		ns.s3SyncMgr.drainMu.Unlock()
+		rclone.ClearDrainPending(volumeID)
+	}
+
+	return ns.mountS3Volume(volumeID, stagingPath, volumeContext, fsGroup)
+}
+
+// mountS3Volume builds the rclone mount for a volume and registers its manager.
+// Split out of setupS3Sync so the stranded-drain path can re-mount without
+// tripping the drain gates it holds itself.
+func (ns *NodeServer) mountS3Volume(volumeID, stagingPath string, volumeContext map[string]string, fsGroup *int64) error {
 	klog.Infof("Setting up S3 mount for volume %s", volumeID)
 
 	ctx := context.Background()
@@ -235,29 +282,6 @@ func (ns *NodeServer) setupS3Sync(volumeID, stagingPath string, volumeContext ma
 
 	// S3 path prefix is now a StorageClass parameter
 	s3PathPrefix := volumeContext[S3PathPrefixParam]
-
-	// If a background drain is still running (previous pod terminated with
-	// uploads in progress), wait briefly for it to finish before remounting.
-	// Never block past kubelet's CSI deadline (~2min): return a retryable
-	// error and let the drain finish in the background.
-	if ns.s3SyncMgr.isBackgroundDraining(volumeID) {
-		klog.Infof("Volume %s: waiting for background drain before remounting", volumeID)
-		if !ns.s3SyncMgr.waitForBackgroundDrain(volumeID, 45*time.Second) {
-			return fmt.Errorf("volume %s: background drain still in progress, retry later", volumeID)
-		}
-	}
-
-	// Post-restart: a drain was in progress when the driver was killed. The
-	// VFS cache has unuploaded data; Mount() will detect it via hasStaleVFSCache
-	// and schedule a background refreshVFS. Clear the in-memory and disk markers
-	// now since the stale-cache path takes ownership from here.
-	if ns.s3SyncMgr.hasPendingDrain(volumeID) {
-		klog.Infof("Volume %s: post-restart pending drain detected, Mount() will upload stale VFS cache data", volumeID)
-		ns.s3SyncMgr.drainMu.Lock()
-		delete(ns.s3SyncMgr.pendingDrains, volumeID)
-		ns.s3SyncMgr.drainMu.Unlock()
-		rclone.ClearDrainPending(volumeID)
-	}
 
 	// Create rclone mount manager
 	mountMgr, err := rclone.NewMountManager(s3Config, volumeID, stagingPath, vfsConfig, s3PathPrefix, passphrase, fsGroup)
@@ -346,59 +370,255 @@ func (ns *NodeServer) getS3ConfigFromSecrets(volSecrets *secrets.VolumeSecrets) 
 	return config
 }
 
-// cleanupS3Sync unmounts an S3 volume. Returns (true, nil) when a background
-// drain was started — the caller must skip staging cleanup so the FUSE mount
-// stays live for the drain goroutine to finish uploading.
-func (ns *NodeServer) cleanupS3Sync(volumeID string) (bool, error) {
+// ErrUnuploadedData means the node still holds writes that never reached S3.
+// NodeUnstageVolume must fail on it: reporting the volume unstaged is what lets
+// the CO start the consumer on another node, where the same S3 prefix is missing
+// everything still queued here.
+var ErrUnuploadedData = errors.New("volume still holds writes that have not reached S3")
+
+// cleanupS3Sync unmounts an S3 volume. It returns ErrUnuploadedData while the
+// only copy of any data is still local, in which case the caller must NOT report
+// the volume as unstaged. stagingTargetPath may be empty for orphan reclaim of a
+// deleted PV, which skips the unuploaded-data guard — that data is meant to go.
+func (ns *NodeServer) cleanupS3Sync(volumeID, stagingTargetPath string) error {
 	klog.Infof("Cleaning up S3 mount for volume %s", volumeID)
+
+	// Refusing to unstage blocks pod teardown for as long as S3 stays
+	// unreachable, so an operator who has decided to abandon the unuploaded
+	// writes needs a way to say so that is deliberate and auditable. Gated on a
+	// local check first: the common case is a clean volume, and that must not
+	// cost two API calls on every teardown.
+	if (ns.s3SyncMgr.isBackgroundDraining(volumeID) || rclone.HasUnuploadedData(volumeID)) &&
+		ns.forceUnstageRequested(volumeID) {
+		return ns.forceCleanupS3Sync(volumeID)
+	}
 
 	// Kubelet retried NodeUnstageVolume while a previous drain is still running.
 	if ns.s3SyncMgr.isBackgroundDraining(volumeID) {
 		klog.Infof("Volume %s: background drain still in progress", volumeID)
-		return true, nil
+		return fmt.Errorf("%w: upload still draining on node %s", ErrUnuploadedData, ns.driver.nodeID)
 	}
 
 	ns.s3SyncMgr.mutex.Lock()
 	mountMgr, exists := ns.s3SyncMgr.mountManagers[volumeID]
 	ns.s3SyncMgr.mutex.Unlock()
 	if !exists {
-		return false, nil
+		// No manager: either never mounted here, or the driver restarted and lost
+		// it while the mount stayed up. In the second case the cache dir is the
+		// only remaining evidence, and tearing the staging mount down from here
+		// would abandon it — resume the upload instead.
+		if stagingTargetPath == "" || !rclone.HasUnuploadedData(volumeID) {
+			return nil
+		}
+		ns.resumeStrandedDrain(volumeID, stagingTargetPath,
+			"no mount manager for this volume (driver restarted while it was mounted)")
+		return fmt.Errorf("%w: resuming upload from the VFS cache on node %s", ErrUnuploadedData, ns.driver.nodeID)
 	}
 
 	// Fast path, bounded and NOT under the manager-map lock: holding it through
 	// a long drain would stall every other S3 volume on the node.
 	if mountMgr.IsUploadQueueEmpty() {
-		if err := mountMgr.UnmountWithin(rclone.ShortDrainWait); err != nil {
-			return false, err
+		drained, err := mountMgr.UnmountWithin(rclone.ShortDrainWait)
+		if err != nil {
+			return err
 		}
 		ns.s3SyncMgr.mutex.Lock()
 		delete(ns.s3SyncMgr.mountManagers, volumeID)
 		ns.s3SyncMgr.mutex.Unlock()
-		return false, nil
+		if !drained && stagingTargetPath != "" {
+			// The queue looked empty but the cache disagreed. The mount is gone
+			// now, so nothing is uploading: only a fresh mount re-queues those
+			// items, and retrying the unmount would spin forever without one.
+			ns.resumeStrandedDrain(volumeID, stagingTargetPath, "unmount completed without confirming the upload")
+			return fmt.Errorf("%w: unconfirmed upload on node %s", ErrUnuploadedData, ns.driver.nodeID)
+		}
+		return nil
 	}
 
-	// Uploads in progress: drain in the background so NodeUnstageVolume returns
-	// immediately, letting kubelet delete the pod and the StatefulSet schedule
-	// a replacement without waiting for S3 transfers to complete.
+	// Uploads in progress. Drain in the background so this handler returns
+	// promptly, but return an error: kubelet retries NodeUnstageVolume and the
+	// consumer cannot be rescheduled elsewhere until a retry finds the queue
+	// empty. Waiting for S3 is the price of not serving an empty volume.
 	ns.s3SyncMgr.startBackgroundDrain(volumeID)
 	go func() {
-		defer ns.s3SyncMgr.finishBackgroundDrain(volumeID)
+		drained := false
+		defer func() { ns.s3SyncMgr.finishBackgroundDrain(volumeID, drained) }()
 		klog.Infof("Volume %s: background drain started", volumeID)
 		ns.s3SyncMgr.mutex.Lock()
 		mm := ns.s3SyncMgr.mountManagers[volumeID]
 		ns.s3SyncMgr.mutex.Unlock()
-		if mm != nil {
-			if err := mm.Unmount(); err != nil {
-				klog.Errorf("Volume %s: background drain unmount failed: %v", volumeID, err)
-			}
-			ns.s3SyncMgr.mutex.Lock()
-			delete(ns.s3SyncMgr.mountManagers, volumeID)
-			ns.s3SyncMgr.mutex.Unlock()
+		if mm == nil {
+			return
+		}
+		var err error
+		if drained, err = mm.Unmount(); err != nil {
+			klog.Errorf("Volume %s: background drain unmount failed: %v", volumeID, err)
+		}
+		ns.s3SyncMgr.mutex.Lock()
+		delete(ns.s3SyncMgr.mountManagers, volumeID)
+		ns.s3SyncMgr.mutex.Unlock()
+		if !drained {
+			ns.reportUnuploadedData(volumeID, "background drain finished without uploading everything")
+			return
 		}
 		klog.Infof("Volume %s: background drain complete", volumeID)
 	}()
 
-	return true, nil
+	return fmt.Errorf("%w: draining %s", ErrUnuploadedData, volumeID)
+}
+
+// ForceUnstageAnnotation, set on the PVC or the PV, tells the driver to unstage
+// a volume even though this node still holds writes that never reached S3. It
+// abandons that data. It exists because the alternative — refusing forever while
+// S3 is unreachable — leaves the consumer stuck in Terminating with no recourse.
+const ForceUnstageAnnotation = "lukscryptwalker.io/force-unstage"
+
+// forceUnstageRequested reports whether an operator has explicitly accepted the
+// loss of this volume's unuploaded writes.
+func (ns *NodeServer) forceUnstageRequested(volumeID string) bool {
+	if ns.clientset == nil {
+		return false
+	}
+	ctx := context.Background()
+	pv, err := getPVByVolumeID(ctx, ns.clientset, volumeID)
+	if err != nil {
+		return false
+	}
+	if pv.Annotations[ForceUnstageAnnotation] == "true" {
+		return true
+	}
+	if pv.Spec.ClaimRef == nil {
+		return false
+	}
+	pvc, err := ns.clientset.CoreV1().PersistentVolumeClaims(pv.Spec.ClaimRef.Namespace).
+		Get(ctx, pv.Spec.ClaimRef.Name, metav1.GetOptions{})
+	if err != nil {
+		return false
+	}
+	return pvc.Annotations[ForceUnstageAnnotation] == "true"
+}
+
+// forceCleanupS3Sync tears the mount down without waiting for the upload, and
+// leaves the cache on disk: the annotation authorises giving up on the handover,
+// not deleting the only copy of the data.
+func (ns *NodeServer) forceCleanupS3Sync(volumeID string) error {
+	klog.Errorf("Volume %s: %s=true — unstaging without confirming the upload. Any writes still in %s on node %s "+
+		"will NOT appear when this volume is mounted elsewhere; the cache is kept for manual recovery",
+		volumeID, ForceUnstageAnnotation, rclone.VFSCacheBasePath, ns.driver.nodeID)
+	if ns.recorder != nil {
+		ref := ns.pvcRef(volumeID)
+		if ref == nil {
+			ref = ns.nodeRef()
+		}
+		ns.recorder.Eventf(ref, corev1.EventTypeWarning, "ForcedUnstageWithUnuploadedData",
+			"Volume %s: unstaged from node %s by operator request while writes were still unuploaded. Those writes "+
+				"remain only in that node's local cache.", volumeID, ns.driver.nodeID)
+	}
+
+	ns.s3SyncMgr.mutex.Lock()
+	mountMgr := ns.s3SyncMgr.mountManagers[volumeID]
+	delete(ns.s3SyncMgr.mountManagers, volumeID)
+	ns.s3SyncMgr.mutex.Unlock()
+	if mountMgr == nil {
+		return nil
+	}
+	if _, err := mountMgr.UnmountWithin(rclone.ShortDrainWait); err != nil {
+		return err
+	}
+	return nil
+}
+
+// resumeStrandedDrain re-mounts a volume whose VFS cache still holds unuploaded
+// writes but whose mount manager is gone, so rclone's cache reload finishes the
+// upload. Without this the only recovery was kubelet happening to stage the same
+// volume on this node again, which never happens once the consumer moves away.
+func (ns *NodeServer) resumeStrandedDrain(volumeID, stagingTargetPath, reason string) {
+	if stagingTargetPath == "" {
+		return
+	}
+	volumeContext := ns.getS3VolumeContext(context.Background(), volumeID)
+	if volumeContext == nil {
+		klog.Errorf("Volume %s: holds unuploaded writes but its PV is unreadable, so the upload cannot be resumed; "+
+			"the data stays in %s on node %s", volumeID, rclone.VFSCacheBasePath, ns.driver.nodeID)
+		return
+	}
+
+	// Claims the drain slot, so kubelet's NodeUnstageVolume retries and the
+	// checker tick do not each start their own mount of the same volume.
+	if !ns.s3SyncMgr.startBackgroundDrain(volumeID) {
+		return
+	}
+	ns.reportUnuploadedData(volumeID, reason)
+
+	go func() {
+		drained := false
+		defer func() { ns.s3SyncMgr.finishBackgroundDrain(volumeID, drained) }()
+
+		klog.Infof("Volume %s: re-mounting at %s to upload writes stranded in the VFS cache",
+			volumeID, stagingTargetPath)
+		// mountS3Volume, not setupS3Sync: the drain gates there would deadlock
+		// against the slot this goroutine already holds.
+		if err := ns.mountS3Volume(volumeID, stagingTargetPath, volumeContext, nil); err != nil {
+			klog.Errorf("Volume %s: could not re-mount to resume the upload: %v", volumeID, err)
+			return
+		}
+
+		ns.s3SyncMgr.mutex.Lock()
+		mm := ns.s3SyncMgr.mountManagers[volumeID]
+		ns.s3SyncMgr.mutex.Unlock()
+		if mm == nil {
+			return
+		}
+		var err error
+		if drained, err = mm.Unmount(); err != nil {
+			klog.Errorf("Volume %s: resumed drain unmount failed: %v", volumeID, err)
+		}
+		ns.s3SyncMgr.mutex.Lock()
+		delete(ns.s3SyncMgr.mountManagers, volumeID)
+		ns.s3SyncMgr.mutex.Unlock()
+		if drained {
+			klog.Infof("Volume %s: stranded writes uploaded, the volume is now safe to mount elsewhere", volumeID)
+		} else {
+			ns.reportUnuploadedData(volumeID, "resumed drain did not complete")
+		}
+		// Only our own scratch mountpoint; a kubelet staging path is kubelet's.
+		if strings.HasPrefix(stagingTargetPath, drainMountBase+"/") {
+			removeAllBounded(stagingTargetPath, 30*time.Second)
+		}
+	}()
+}
+
+// reportUnuploadedData makes stranded data visible outside this node's logs.
+// The cache is node-local and the PV carries no record of it, so an event on the
+// PVC is the only place an operator looking at the workload can see which node
+// still holds the data.
+func (ns *NodeServer) reportUnuploadedData(volumeID, reason string) {
+	klog.Errorf("Volume %s: %s — node %s holds writes that never reached S3. The volume must not be mounted "+
+		"on another node until they upload; the cache is at %s", volumeID, reason, ns.driver.nodeID, rclone.VFSCacheBasePath)
+	if ns.recorder == nil {
+		return
+	}
+	ref := ns.pvcRef(volumeID)
+	if ref == nil {
+		ref = ns.nodeRef()
+	}
+	ns.recorder.Eventf(ref, corev1.EventTypeWarning, "UnuploadedData",
+		"Volume %s: %s. Node %s still holds writes that have not reached S3; mounting this volume elsewhere "+
+			"would serve an incomplete view, so unstaging is being refused until the upload completes.",
+		volumeID, reason, ns.driver.nodeID)
+}
+
+// pvcRef returns an event target on the volume's claim, or nil when it cannot
+// be resolved.
+func (ns *NodeServer) pvcRef(volumeID string) *corev1.ObjectReference {
+	if ns.clientset == nil {
+		return nil
+	}
+	pv, err := getPVByVolumeID(context.Background(), ns.clientset, volumeID)
+	if err != nil || pv.Spec.ClaimRef == nil {
+		return nil
+	}
+	return pv.Spec.ClaimRef
 }
 
 // restoreS3VolumeStaging restores an S3 volume's staging mount after node reboot
@@ -564,10 +784,12 @@ func (ns *NodeServer) cleanupStaleS3Mounts() {
 			klog.V(4).Infof("Volume %s is currently being set up, skipping stale detection", volumeID)
 			continue
 		}
-		// Skip volumes whose drain goroutine is still live or whose drain persisted
-		// across a driver restart — the VFS cache contains unuploaded data.
-		if ns.s3SyncMgr.isBackgroundDraining(volumeID) || ns.s3SyncMgr.hasPendingDrain(volumeID) {
-			klog.V(4).Infof("Volume %s has an active or post-restart pending drain, skipping stale detection", volumeID)
+		// Skip volumes whose drain goroutine is still live — it owns the cache.
+		// A merely *pending* drain is not skipped: nothing is uploading it, and
+		// re-mounting is how the cache gets uploaded, so skipping it here is what
+		// left unuploaded data sitting on the node with no path back to S3.
+		if ns.s3SyncMgr.isBackgroundDraining(volumeID) {
+			klog.V(4).Infof("Volume %s has an active drain, skipping stale detection", volumeID)
 			continue
 		}
 
@@ -607,6 +829,91 @@ func (ns *NodeServer) cleanupStaleS3Mounts() {
 	}
 
 	klog.Infof("Stale/missing S3 mount cleanup completed")
+}
+
+// drainMountBase is a driver-private, host-propagated directory used to mount a
+// volume just long enough to upload writes stranded in its VFS cache. Not a
+// kubelet path: kubelet has finished with these volumes, and the only thing left
+// to do with them on this node is finish their upload.
+const drainMountBase = "/var/lib/lukscrypt-cache/drain"
+
+// strandedRetryInterval floors how often one volume's stranded-upload recovery
+// is re-attempted, for attempts that fail before they can hold the drain slot.
+const strandedRetryInterval = 5 * time.Minute
+
+// recoverStrandedVolumes uploads writes left in the VFS cache of volumes kubelet
+// no longer stages here. Nothing else can reach them: CSI calls only arrive for
+// volumes kubelet still tracks, so once the consumer moves to another node the
+// cached writes have no path back to S3 and the volume reads empty everywhere.
+func (ns *NodeServer) recoverStrandedVolumes() {
+	stranded := rclone.VolumesWithUnuploadedData()
+	if len(stranded) == 0 {
+		return
+	}
+
+	staged, known := ns.stagedVolumeIDs()
+	if !known {
+		klog.Warningf("Cannot tell which volumes kubelet still stages here; deferring recovery of %d volume(s) "+
+			"holding unuploaded writes", len(stranded))
+		return
+	}
+
+	for _, volumeID := range stranded {
+		// Kubelet still stages it here: a live mount owns the cache, and the
+		// stale-mount checker owns its repair. Mounting a second VFS under the
+		// same name is the one thing that makes the queue permanently unobservable.
+		if staged[volumeID] || ns.s3SyncMgr.isVolumeSetupInProgress(volumeID) ||
+			ns.s3SyncMgr.isBackgroundDraining(volumeID) {
+			continue
+		}
+		ns.s3SyncMgr.mutex.RLock()
+		_, mounted := ns.s3SyncMgr.mountManagers[volumeID]
+		ns.s3SyncMgr.mutex.RUnlock()
+		if mounted {
+			continue
+		}
+		// An attempt that fails before it can mount frees the drain slot at once;
+		// without a floor this would retry on every 30s tick forever.
+		if last, ok := ns.strandedRetry.Load(volumeID); ok && time.Since(last.(time.Time)) < strandedRetryInterval {
+			continue
+		}
+		// The operator has already accepted losing this data; do not keep
+		// re-mounting the volume to chase an upload they gave up on.
+		if ns.forceUnstageRequested(volumeID) {
+			continue
+		}
+		ns.strandedRetry.Store(volumeID, time.Now())
+
+		ns.resumeStrandedDrain(volumeID, filepath.Join(drainMountBase, volumeID),
+			"kubelet no longer stages this volume here, but its cache is not empty")
+	}
+}
+
+// stagedVolumeIDs returns the volumes kubelet still has a staging directory for
+// on this node. known is false when the answer could not be obtained: "unknown"
+// must never be read as "none", or a private drain VFS gets mounted alongside a
+// live one and every vfs/* RPC for that volume turns ambiguous.
+func (ns *NodeServer) stagedVolumeIDs() (staged map[string]bool, known bool) {
+	csiPluginPath := resolveKubeletRoot() + "/plugins/kubernetes.io/csi/" + DriverName
+	entries, err := os.ReadDir(csiPluginPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// kubelet stages nothing here at all; that is a real answer.
+			return map[string]bool{}, true
+		}
+		klog.Warningf("Could not list staged volumes in %s: %v", csiPluginPath, err)
+		return nil, false
+	}
+	staged = make(map[string]bool, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if id := ns.getVolumeIDFromVolData(filepath.Join(csiPluginPath, e.Name())); id != "" {
+			staged[id] = true
+		}
+	}
+	return staged, true
 }
 
 // reconcileS3Mount heals a stale/missing S3 mount in place: re-mount the volume
@@ -770,13 +1077,325 @@ func (ns *NodeServer) rebindConsumerMount(globalmountPath, podUID, pvName string
 		return true // not published on this node; nothing stale to re-point
 	}
 
-	_ = runCmdBounded(30*time.Second, "umount", "-l", targetPath)
+	// The path must be fully clear first. Binding over a mount we failed to
+	// remove stacks the fresh one on the stale one, and a container started
+	// before the rebind keeps talking to the stale one underneath.
+	if err := unmountHostStack(targetPath); err != nil {
+		klog.Warningf("Pod %s: not re-binding %s, its stale mount is still there: %v", podUID, targetPath, err)
+		return false
+	}
 	if err := ns.bindMount(globalmountPath, targetPath, false, fsGroup); err != nil {
 		klog.Warningf("Pod %s: failed to re-bind CSI mount %s to %s: %v",
 			podUID, globalmountPath, targetPath, err)
 		return false
 	}
 	return true
+}
+
+// consumerBind is one pod's bind of one of our volumes, as the host sees it.
+type consumerBind struct {
+	path   string
+	podUID string
+	pvName string
+	depth  int    // mounts stacked here; >1 means a re-bind left the old one
+	dev    string // device of the topmost mount, the one the host resolves
+}
+
+// consumerBinds returns every consumer bind of one of our volumes and the set
+// of devices the host still resolves, from the mount table alone — no API
+// calls, so a healthy node costs nothing.
+func consumerBinds() ([]consumerBind, map[string]bool, bool) {
+	stacks, known := rclone.HostMountStacksOK()
+	if !known {
+		return nil, nil, false
+	}
+	return parseConsumerBinds(stacks, resolveKubeletRoot()), liveMountDevices(stacks), true
+}
+
+// parseConsumerBinds picks our FUSE consumer binds out of a mount table. Only
+// <root>/pods/<uid>/volumes/kubernetes.io~csi/<pv>/mount qualifies: a subPath
+// mount below it, or another driver's non-FUSE volume, is not ours to repair.
+func parseConsumerBinds(stacks map[string][]rclone.HostMount, kubeletRoot string) []consumerBind {
+	podsPrefix := kubeletRoot + "/pods/"
+	const csiSegment = "/volumes/kubernetes.io~csi/"
+
+	var out []consumerBind
+	for path, mounts := range stacks {
+		top := mounts[len(mounts)-1]
+		if !strings.HasPrefix(top.FSType, "fuse") {
+			continue
+		}
+		rest, found := strings.CutPrefix(path, podsPrefix)
+		if !found {
+			continue
+		}
+		podUID, rest, found := strings.Cut(rest, csiSegment)
+		if !found || podUID == "" || strings.Contains(podUID, "/") {
+			continue
+		}
+		pvName, leaf, found := strings.Cut(rest, "/")
+		if !found || leaf != "mount" || pvName == "" {
+			continue
+		}
+		out = append(out, consumerBind{
+			path: path, podUID: podUID, pvName: pvName, depth: len(mounts), dev: top.Dev,
+		})
+	}
+	return out
+}
+
+// liveMountDevices is the set of devices the host actually resolves: the
+// topmost mount at each path. A device outside it is either buried under a
+// newer mount or gone from the table altogether — either way nothing reaching
+// the host through a path can still get to it.
+func liveMountDevices(stacks map[string][]rclone.HostMount) map[string]bool {
+	live := make(map[string]bool, len(stacks))
+	for _, mounts := range stacks {
+		live[mounts[len(mounts)-1].Dev] = true
+	}
+	return live
+}
+
+// containerStrandedDevices returns the FUSE devices a pod's containers hold
+// that the host no longer resolves. A container's mounts are its own entries
+// in its own namespace, so re-binding on the host never moves it: it keeps
+// reading the old superblock, whose VFS is shut down, and everything that
+// reaches the backend comes back EIO while stat() reports the path healthy.
+func containerStrandedDevices(podUID string, live map[string]bool) []string {
+	var stranded []string
+	seen := make(map[string]bool)
+	for _, pid := range podContainerPIDs(podUID) {
+		data, err := readFileBounded(fmt.Sprintf("/proc/%d/mountinfo", pid), 5*time.Second)
+		if err != nil {
+			continue
+		}
+		for _, mounts := range rclone.ParseMountStacks(data) {
+			for _, m := range mounts {
+				if strings.HasPrefix(m.FSType, "fuse") && !live[m.Dev] && !seen[m.Dev] {
+					seen[m.Dev] = true
+					stranded = append(stranded, m.Dev)
+				}
+			}
+		}
+	}
+	return stranded
+}
+
+// maxStrandedRestartsPerSweep staggers recovery: re-binding is harmless, but a
+// node whose every consumer is stranded must not be restarted all at once.
+const maxStrandedRestartsPerSweep = 1
+
+// repairStrandedConsumers recovers consumers reading a mount the host no longer
+// resolves — a bind left stacked under a newer one, or a container holding a
+// superblock a re-bind moved on from. Both read EIO from a shut-down VFS while
+// stat() on the bind path reports healthy, so nothing else on the node notices.
+func (ns *NodeServer) repairStrandedConsumers() {
+	binds, live, known := consumerBinds()
+	if !known || len(binds) == 0 {
+		return
+	}
+
+	type broken struct {
+		bind     consumerBind
+		stranded []string
+	}
+	var todo []broken
+	for _, b := range binds {
+		stranded := containerStrandedDevices(b.podUID, live)
+		if b.depth > 1 || len(stranded) > 0 {
+			todo = append(todo, broken{b, stranded})
+		}
+	}
+	if len(todo) == 0 {
+		return
+	}
+	klog.Warningf("Found %d consumer bind(s) whose mount the host no longer resolves", len(todo))
+
+	staged := ns.stagedVolumesByPV()
+	restarts := 0
+	for _, t := range todo {
+		sv, found := staged[t.bind.pvName]
+		if !found {
+			klog.Warningf("Consumer bind %s is stale but its volume is not staged here; leaving it alone", t.bind.path)
+			continue
+		}
+		// A volume mid-setup or mid-drain owns its own mounts.
+		if ns.s3SyncMgr.isVolumeSetupInProgress(sv.volumeID) || ns.s3SyncMgr.isBackgroundDraining(sv.volumeID) {
+			continue
+		}
+
+		consumers := ns.podsUsingPVC(sv.pvcNamespace, sv.pvcName)
+		pod := podByUID(consumers, t.bind.podUID)
+
+		// A departed pod's bind is kubelet's to unwind, and re-binding for one
+		// on its way out only fights its teardown.
+		if pod == nil {
+			klog.Warningf("Consumer bind %s is stale but no pod with that UID runs here; leaving it to kubelet",
+				t.bind.path)
+			continue
+		}
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+
+		klog.Warningf("Volume %s: re-pointing %s (%d mount(s) stacked there; container holds stale device(s) %v)",
+			sv.volumeID, t.bind.path, t.bind.depth, t.stranded)
+		if !ns.rebindConsumerMount(sv.globalmountPath, t.bind.podUID, t.bind.pvName, fsGroupFromPods(consumers)) {
+			continue
+		}
+		if len(t.stranded) == 0 {
+			continue
+		}
+
+		// Propagation carries the re-bind into the container. Rather than infer
+		// that from the pod spec, re-read what the container actually holds.
+		rclone.InvalidateHostMounts()
+		if _, live2, ok := consumerBinds(); ok && len(containerStrandedDevices(t.bind.podUID, live2)) == 0 {
+			klog.Infof("Pod %s/%s picked the re-bind up via mount propagation for volume %s; left running",
+				pod.Namespace, pod.Name, sv.volumeID)
+			continue
+		}
+		if restarts >= maxStrandedRestartsPerSweep {
+			klog.Warningf("Pod %s/%s still holds a stale mount for volume %s; deferring its restart to a later "+
+				"sweep so the whole node is not recovered at once", pod.Namespace, pod.Name, sv.volumeID)
+			continue
+		}
+		if !ns.consumerRestartAllowed(sv.volumeID) {
+			continue
+		}
+		klog.Warningf("Pod %s/%s cannot self-heal for volume %s and is reading a shut-down mount; restarting",
+			pod.Namespace, pod.Name, sv.volumeID)
+		ns.recoverConsumerPod(pod)
+		restarts++
+	}
+}
+
+// stagedVolume is one of this node's staged volumes, as a consumer bind path
+// names it: by PV, not by volume handle.
+type stagedVolume struct {
+	volumeID        string
+	globalmountPath string
+	pvcNamespace    string
+	pvcName         string
+}
+
+// stagedVolumesByPV indexes this node's staged volumes by PV name. One PV list
+// for the whole sweep: resolving each bind on its own re-listed every PV in the
+// cluster per bind.
+func (ns *NodeServer) stagedVolumesByPV() map[string]stagedVolume {
+	csiPluginPath := resolveKubeletRoot() + "/plugins/kubernetes.io/csi/" + DriverName
+	entries, err := os.ReadDir(csiPluginPath)
+	if err != nil || ns.clientset == nil {
+		return nil
+	}
+	stagingPaths := make(map[string]string, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		volumeDir := filepath.Join(csiPluginPath, e.Name())
+		if id := ns.getVolumeIDFromVolData(volumeDir); id != "" {
+			stagingPaths[id] = filepath.Join(volumeDir, "globalmount")
+		}
+	}
+
+	pvs, err := ns.clientset.CoreV1().PersistentVolumes().List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		klog.Warningf("Could not list PVs to resolve stacked consumer binds: %v", err)
+		return nil
+	}
+	out := make(map[string]stagedVolume, len(stagingPaths))
+	for i := range pvs.Items {
+		pv := &pvs.Items[i]
+		if pv.Spec.CSI == nil || pv.Spec.CSI.Driver != DriverName {
+			continue
+		}
+		path, staged := stagingPaths[pv.Spec.CSI.VolumeHandle]
+		if !staged {
+			continue
+		}
+		sv := stagedVolume{volumeID: pv.Spec.CSI.VolumeHandle, globalmountPath: path}
+		if pv.Spec.ClaimRef != nil {
+			sv.pvcNamespace, sv.pvcName = pv.Spec.ClaimRef.Namespace, pv.Spec.ClaimRef.Name
+		}
+		out[pv.Name] = sv
+	}
+	return out
+}
+
+// podByUID picks a pod out of a consumer list.
+func podByUID(pods []corev1.Pod, podUID string) *corev1.Pod {
+	for i := range pods {
+		if string(pods[i].UID) == podUID {
+			return &pods[i]
+		}
+	}
+	return nil
+}
+
+// readFileBounded reads a file without parking the caller forever: procfs
+// mount tables take the kernel mount lock, which a wedged umount can hold.
+func readFileBounded(path string, timeout time.Duration) (string, error) {
+	type result struct {
+		data []byte
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		data, err := os.ReadFile(path)
+		done <- result{data, err}
+	}()
+	select {
+	case r := <-done:
+		return string(r.data), r.err
+	case <-time.After(timeout):
+		return "", fmt.Errorf("reading %s blocked for %s", path, timeout)
+	}
+}
+
+// maxMountStackUnwind bounds how many stacked mounts unmountHostStack removes;
+// past it something is re-mounting behind us and looping only hides it.
+const maxMountStackUnwind = 10
+
+// unmountHostStack detaches every mount stacked at path in the HOST namespace,
+// where bindMount makes them. Unmounting from our own namespace can leave the
+// host entry in place, and stat() never sees what the next bind buries.
+func unmountHostStack(path string) error {
+	for i := range maxMountStackUnwind {
+		depth, known := rclone.HostMountDepth(path)
+		if !known {
+			return fmt.Errorf("host mount table unreadable; cannot confirm %s is unmounted", path)
+		}
+		if depth == 0 {
+			return nil
+		}
+		// Only the topmost mount can still be live, and callers close the
+		// device under it as soon as this returns; anything buried is a stale
+		// bind that just needs detaching.
+		if err := unmountHostOnce(path, i == 0); err != nil {
+			return err
+		}
+		rclone.InvalidateHostMounts()
+	}
+	depth, _ := rclone.HostMountDepth(path)
+	return fmt.Errorf("%s still carries %d stacked mount(s) after %d unmounts", path, depth, maxMountStackUnwind)
+}
+
+// unmountHostOnce removes the topmost mount at path in the host namespace.
+// With tryNormal it attempts a non-lazy unmount first: only that proves the
+// filesystem is detached rather than merely scheduled for it.
+func unmountHostOnce(path string, tryNormal bool) error {
+	if tryNormal {
+		err := runCmdBounded(30*time.Second, "nsenter", "-t", "1", "-m", "umount", path)
+		if err == nil {
+			return nil
+		}
+		klog.Warningf("Normal unmount of %s failed: %v, trying lazy unmount", path, err)
+	}
+	if err := runCmdBounded(30*time.Second, "nsenter", "-t", "1", "-m", "umount", "-l", path); err != nil {
+		return fmt.Errorf("umount -l %s in the host namespace: %w", path, err)
+	}
+	return nil
 }
 
 // unbindTerminatingConsumer lazily unmounts a terminating pod's CSI bind so a
@@ -790,7 +1409,9 @@ func (ns *NodeServer) unbindTerminatingConsumer(podUID, pvName string) {
 	if _, err := os.Stat(filepath.Dir(targetPath)); err != nil {
 		return // not published on this node
 	}
-	_ = runCmdBounded(30*time.Second, "umount", "-l", targetPath)
+	if err := unmountHostStack(targetPath); err != nil {
+		klog.Warningf("Pod %s: could not unbind %s: %v", podUID, targetPath, err)
+	}
 }
 
 // recoverConsumerPod restarts the pod's containers in place so they re-bind the
@@ -875,6 +1496,15 @@ func (ns *NodeServer) consumerMountHealthy(podUID, pvName, globalmountPath strin
 	}
 	mountPath := filepath.Join(resolveKubeletRoot(), "pods", podUID,
 		"volumes", "kubernetes.io~csi", pvName, "mount")
+
+	// stat() resolves only the topmost mount, so a stale bind buried under a
+	// fresh one reads as healthy while the container still holds the buried
+	// one — whose VFS is shut down, so every backend read there is EIO.
+	if depth, known := rclone.HostMountDepth(mountPath); known && depth > 1 {
+		klog.Warningf("Pod %s: %d mounts stacked at %s; the container may still hold a buried one",
+			podUID, depth, mountPath)
+		return false
+	}
 
 	want, err := statBounded(globalmountPath, 5*time.Second)
 	if err != nil {
@@ -1041,8 +1671,8 @@ func (ns *NodeServer) restartPodsWithStaleS3Mount(volumeID string) {
 			klog.Infof("Found pod %s using S3 volume %s, cleaning up mount and triggering restart", podUID, volumeID)
 
 			// Unmount the pod's bind mount (may be stale or pointing to old staging)
-			if err := runCmdBounded(30*time.Second, "umount", "-l", mountPath); err != nil {
-				klog.V(4).Infof("umount -l for pod mount %s: %v (may already be unmounted)", mountPath, err)
+			if err := unmountHostStack(mountPath); err != nil {
+				klog.Warningf("Pod %s: could not unbind %s: %v", podUID, mountPath, err)
 			}
 
 			// Delete the pod to trigger restart (if managed by a controller like Deployment)

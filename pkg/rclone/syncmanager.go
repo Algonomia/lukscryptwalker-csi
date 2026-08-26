@@ -326,7 +326,9 @@ func (mm *MountManager) Mount() error {
 	hadPredecessor := mm.isMountPoint()
 	if hadPredecessor {
 		klog.Warningf("Found stale mount at %s, attempting to unmount first", mm.mountPoint)
-		if err := mm.unmount(ShortDrainWait); err != nil {
+		// The cache is preserved when this does not drain, and the mount we are
+		// about to make reloads it — so a false here is recovered, not lost.
+		if _, err := mm.unmount(ShortDrainWait); err != nil {
 			klog.Warningf("Unmount failed: %v, will try mounting anyway with AllowNonEmpty", err)
 		}
 	}
@@ -538,23 +540,31 @@ const (
 )
 
 // Unmount unmounts the S3 volume using librclone, waiting for pending uploads
-// to drain first.
-func (mm *MountManager) Unmount() error {
+// to drain first. drained is false when unuploaded writes remain in the local
+// VFS cache — the caller must not report the volume as safely detached.
+func (mm *MountManager) Unmount() (drained bool, err error) {
 	return mm.unmount(maxDrainWait)
 }
 
 // UnmountWithin unmounts, waiting at most budget for the write-back queue.
-func (mm *MountManager) UnmountWithin(budget time.Duration) error {
+func (mm *MountManager) UnmountWithin(budget time.Duration) (drained bool, err error) {
 	return mm.unmount(budget)
 }
 
 // unmount unmounts the volume, spending at most drainBudget waiting for the
 // write-back queue to empty.
-func (mm *MountManager) unmount(drainBudget time.Duration) error {
+func (mm *MountManager) unmount(drainBudget time.Duration) (bool, error) {
 
 	if !mm.mounted && !mm.isMountPoint() {
+		// Nothing to unmount, but the on-disk cache outlives the mount: a
+		// previous session can have left writes here that no VFS is carrying.
+		if mm.hasDirtyCacheOnDisk() {
+			klog.Errorf("Volume %s is not mounted but its VFS cache still holds writes that never reached S3",
+				mm.volumeID)
+			return false, nil
+		}
 		klog.Infof("Volume %s not mounted, skipping unmount", mm.volumeID)
-		return nil
+		return true, nil
 	}
 
 	klog.Infof("Unmounting encrypted S3 volume %s from %s", mm.volumeID, mm.mountPoint)
@@ -585,16 +595,38 @@ func (mm *MountManager) unmount(drainBudget time.Duration) error {
 
 	DeleteNamedConfigs(mm.cryptConfigName, mm.s3ConfigName)
 
+	// VFS.Shutdown has run and the metadata is settled, so the cache dir is now
+	// the final word. An empty write-back queue is not the same as an uploaded
+	// cache, and the next step deletes that cache — require both.
+	if drained && mm.hasDirtyCacheOnDisk() {
+		klog.Errorf("Volume %s: write-back queue reported empty but the VFS cache still holds unuploaded items; "+
+			"keeping the cache", mm.volumeID)
+		drained = false
+	}
+
 	if drained {
 		mm.cleanupVFSCacheDir()
 	} else {
-		klog.Infof("Volume %s: preserving VFS cache for retry on next mount", mm.volumeID)
+		klog.Errorf("Volume %s: unmounted with writes still only in the local VFS cache at %s/vfs/%s — "+
+			"preserving it for retry. Until it drains, this node holds the only copy: mounting the volume "+
+			"elsewhere serves a stale or empty view", mm.volumeID, VFSCacheBasePath, mm.vfsName)
 	}
 
 	mm.mounted = false
 
 	klog.Infof("Successfully unmounted encrypted S3 volume %s", mm.volumeID)
-	return nil
+	return drained, nil
+}
+
+// hasDirtyCacheOnDisk reports unuploaded writes in this mount's cache directory.
+// Unlike vfs/stats it needs no live VFS, so it stays truthful across the exact
+// failures that make the RPC answer useless: a dead FUSE, a leaked duplicate
+// VFS, or a driver restart that lost the VFS entirely.
+func (mm *MountManager) hasDirtyCacheOnDisk() bool {
+	if mm.vfsName == "" {
+		return false
+	}
+	return hasDirtyCacheItemsAt(VFSCacheBasePath, mm.vfsName)
 }
 
 // cacheFSFreeFraction returns the free-space fraction of the shared VFS cache
@@ -754,9 +786,14 @@ func (mm *MountManager) waitForPendingUploads(maxWait time.Duration) bool {
 // IsUploadQueueEmpty does a single non-blocking poll of vfs/stats.
 // Returns true if there are no uploads in progress or queued.
 // Use waitForPendingUploads to block until the queue drains.
+//
+// Every path where the queue is unobservable falls back to the on-disk cache
+// rather than assuming "empty": a dead FUSE, a missing VFS and a duplicate VFS
+// all used to answer "nothing pending" for a volume whose writes had never left
+// the node, which is what let the next mount elsewhere serve an empty view.
 func (mm *MountManager) IsUploadQueueEmpty() bool {
 	if !mm.isMountPoint() {
-		return true
+		return !mm.hasDirtyCacheOnDisk()
 	}
 	// Deliberately the short budget: this runs inside NodeUnstageVolume to
 	// decide whether the fast path is available. If stats cannot answer
@@ -764,12 +801,11 @@ func (mm *MountManager) IsUploadQueueEmpty() bool {
 	// right call anyway — waiting longer would only delay kubelet.
 	result, err := RPCWithTimeout("vfs/stats", map[string]interface{}{"fs": mm.cryptConfigName + ":"}, rpcStatsProbeTimeout)
 	if err != nil {
-		// Orphaned mount (no VFS in this instance): nothing to drain here, take
-		// the fast unmount path rather than starting an endless background drain.
-		// Same for a duplicate-VFS name clash: the queue is unobservable, and the
-		// fast path's Unmount preserves the cache for reload to re-upload.
+		// Orphaned mount (no VFS in this instance) or a duplicate-VFS name clash:
+		// the queue cannot be observed through the RPC, so read the cache dir. It
+		// is the same evidence rclone itself reloads from on the next mount.
 		if isNoVFSError(err) || isAmbiguousVFSError(err) {
-			return true
+			return !mm.hasDirtyCacheOnDisk()
 		}
 		return false // assume work pending on other RPC errors
 	}

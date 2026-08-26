@@ -49,6 +49,44 @@ func TestFUSEDetectionRejectsShadowedMount(t *testing.T) {
 	}
 }
 
+// A rebind that fails to remove the old mount stacks a fresh bind on a stale
+// one. stat() and the flattened table both show only the top, so the buried
+// mount — still serving containers that opened it earlier — must be visible
+// through the stack view or nothing can ever detect it.
+func TestStackedMountsAreNotCollapsed(t *testing.T) {
+	const path = "/var/lib/kubelet/pods/uid/volumes/kubernetes.io~csi/pvc-1/mount"
+	data := `600 30 0:274 / ` + path + ` rw,relatime shared:1 - fuse.rclone pvc-1: rw
+900 30 0:1320 / ` + path + ` rw,relatime shared:2 - fuse.rclone pvc-1: rw`
+
+	stacks := parseMountStacks(data)
+	if got := len(stacks[path]); got != 2 {
+		t.Fatalf("parseMountStacks found %d mounts at the path, want 2", got)
+	}
+	// Both are fuse.rclone binds of the same volume; only the device tells the
+	// live mount from the shut-down one the container may still be holding.
+	if got, want := stacks[path][0].Dev, "0:274"; got != want {
+		t.Errorf("buried mount device = %q, want %q", got, want)
+	}
+	if got, want := stacks[path][1].Dev, "0:1320"; got != want {
+		t.Errorf("topmost mount device = %q, want %q", got, want)
+	}
+	if got := len(parseMountInfo(data)); got != 1 {
+		t.Errorf("flattened table has %d entries, want 1 (topmost only)", got)
+	}
+
+	pinMountsStacks(t, stacks)
+	depth, known := HostMountDepth(path)
+	if !known {
+		t.Fatal("depth reported as unknown from a readable table")
+	}
+	if depth != 2 {
+		t.Errorf("HostMountDepth = %d, want 2", depth)
+	}
+	if depth, _ := HostMountDepth("/not/mounted"); depth != 0 {
+		t.Errorf("HostMountDepth of an unmounted path = %d, want 0", depth)
+	}
+}
+
 // A node rename must not orphan the cache: the passphrase embeds the node id,
 // so the id recorded at format time wins over the current one.
 func TestVFSCachePassphrase(t *testing.T) {

@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -55,6 +56,9 @@ type NodeServer struct {
 	// regUnhealthy tracks the last registration-health state for
 	// transition-only event emission.
 	regUnhealthy atomic.Bool
+	// strandedRetry (volumeID → time.Time) floors how often the stranded-upload
+	// recovery re-attempts one volume.
+	strandedRetry sync.Map
 	// vfsProbesInFlight caps the zombie-mount readdir probe at one goroutine
 	// per mount path, so a wedged FUSE can't leak one on every checker tick.
 	// Values are the probe's start time; see vfsProbeStuckAfter.
@@ -140,11 +144,17 @@ func (ns *NodeServer) runStaleS3MountChecker() {
 			// StatefulSet ordinal forever; reconcile never revisits it once
 			// the mount looks healthy again.
 			ns.sweepStuckTerminatingConsumers()
+			// A bind stacked over a stale one passes every path-based check,
+			// so nothing else on this tick can notice it.
+			ns.runWatched("stranded-consumer repair", ns.repairStrandedConsumers)
 			// Leaked loop devices and backing files accumulate between restarts.
 			ns.runWatched("orphaned-volume GC", ns.cleanupOrphanedVolumes)
 		}
 		tick++
 		ns.runWatched("stale-mount checker", ns.cleanupStaleS3Mounts)
+		// After the mount checker, so a volume kubelet still stages is repaired
+		// in place rather than picked up as stranded.
+		ns.runWatched("stranded-upload recovery", ns.recoverStrandedVolumes)
 	}
 }
 
@@ -266,7 +276,9 @@ func (ns *NodeServer) cleanupOrphanedVolumes() {
 func (ns *NodeServer) reclaimOrphanedVolume(volumeID, volumeDir string) {
 	defer ns.s3SyncMgr.lockVolume(volumeID)()
 
-	if _, err := ns.cleanupS3Sync(volumeID); err != nil {
+	// Empty staging path: the PV is gone, so unuploaded writes have nowhere left
+	// to go and must not block the reclaim.
+	if err := ns.cleanupS3Sync(volumeID, ""); err != nil {
 		klog.Warningf("Failed to cleanup S3 sync for orphaned volume %s: %v", volumeID, err)
 	}
 
@@ -398,17 +410,17 @@ func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 	// Serialize against staging and reconcile.
 	defer ns.s3SyncMgr.lockVolume(volumeID)()
 
-	draining, err := ns.cleanupS3Sync(volumeID)
-	if err != nil {
+	if err := ns.cleanupS3Sync(volumeID, stagingTargetPath); err != nil {
+		if errors.Is(err, ErrUnuploadedData) {
+			// Success here is the CO's signal that the volume is detached and may
+			// be published on another node. While this node holds the only copy of
+			// any data, that signal would be a lie the consumer sees as an empty
+			// volume — so fail, and let kubelet retry until the upload finishes.
+			klog.Errorf("Volume %s: refusing to unstage, %v", volumeID, err)
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"Refusing to unstage volume %s: %v", volumeID, err)
+		}
 		klog.Errorf("Failed to cleanup S3 sync for volume %s: %v", volumeID, err)
-	}
-	if draining {
-		// A background drain is running; the FUSE mount must stay live.
-		// Return success now — kubelet will delete the pod, the StatefulSet
-		// can schedule a replacement, and the drain goroutine will unmount
-		// once uploads complete.
-		klog.Infof("Volume %s: background drain active, skipping staging cleanup", volumeID)
-		return &csi.NodeUnstageVolumeResponse{}, nil
 	}
 
 	if err := ns.cleanupVolumeStaging(volumeID, stagingTargetPath); err != nil {
@@ -722,32 +734,29 @@ func (ns *NodeServer) isMountedFrom(path, device string) bool {
 // FUSE bind stat() parks the caller in uninterruptible sleep, and this runs
 // inside NodeUnpublishVolume — kubelet's teardown would wedge with us.
 func (ns *NodeServer) unmountPath(targetPath string) error {
-	mounts, known := rclone.HostMountsOK()
-	if known {
-		if _, mounted := mounts[targetPath]; !mounted {
-			klog.Infof("Target path %s is not a mount point, nothing to unmount", targetPath)
-			return nil
-		}
-	} else {
+	depth, known := rclone.HostMountDepth(targetPath)
+	if !known {
 		// Unknown: attempt the unmount anyway. A no-op umount is harmless;
 		// skipping a needed one leaves the mount pinned forever.
 		klog.Warningf("Host mount table unreadable; attempting unmount of %s regardless", targetPath)
+		if err := unmountHostOnce(targetPath, true); err != nil {
+			// Indistinguishable from "already gone". Failing here would wedge
+			// NodeUnpublishVolume forever; if it really is mounted, kubelet's
+			// own rmdir fails and it retries us.
+			klog.Warningf("Could not unmount %s and the mount table is unreadable; reporting success so pod "+
+				"teardown is not wedged (kubelet retries if the mount is in fact still there): %v", targetPath, err)
+		}
+		return nil
+	}
+	if depth == 0 {
+		klog.Infof("Target path %s is not a mount point, nothing to unmount", targetPath)
+		return nil
 	}
 
-	if err := runCmdBounded(30*time.Second, "umount", targetPath); err != nil {
-		klog.Warningf("Normal unmount of %s failed: %v, trying lazy unmount", targetPath, err)
-		if lazyErr := runCmdBounded(30*time.Second, "umount", "-l", targetPath); lazyErr != nil {
-			if !known {
-				// Indistinguishable from "already gone". Failing here would wedge
-				// NodeUnpublishVolume forever; if it really is mounted, kubelet's
-				// own rmdir fails and it retries us.
-				klog.Warningf("Could not unmount %s and the mount table is unreadable; reporting success so pod "+
-					"teardown is not wedged (kubelet retries if the mount is in fact still there)", targetPath)
-				return nil
-			}
-			return fmt.Errorf("failed to unmount %s (lazy also failed: %v): %v", targetPath, lazyErr, err)
-		}
-		klog.Infof("Lazy unmount of %s succeeded", targetPath)
+	// Every layer, in the host namespace where the bind was made: one left
+	// buried keeps the volume pinned where nothing later can see it.
+	if err := unmountHostStack(targetPath); err != nil {
+		return fmt.Errorf("failed to unmount %s: %w", targetPath, err)
 	}
 	return nil
 }
