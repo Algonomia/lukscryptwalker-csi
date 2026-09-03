@@ -161,3 +161,24 @@ func TestIsNodeMode(t *testing.T) {
 		})
 	}
 }
+
+func TestConsumerRestartAllowedGatedOnRegistration(t *testing.T) {
+	ns := &NodeServer{}
+	if !ns.consumerRestartAllowed("vol-1") {
+		t.Fatal("first call on a registered driver must be allowed")
+	}
+	if ns.consumerRestartAllowed("vol-1") {
+		t.Error("second call within the cooldown must be refused")
+	}
+
+	ns.regUnhealthy.Store(true)
+	if ns.consumerRestartAllowed("vol-2") {
+		t.Error("an unregistered driver must not destructively recover consumers")
+	}
+	// The refusal must not have stamped the cooldown, or recovery would stay
+	// blocked for another 5 minutes after registration comes back.
+	ns.regUnhealthy.Store(false)
+	if !ns.consumerRestartAllowed("vol-2") {
+		t.Error("recovery must be allowed again as soon as registration returns")
+	}
+}

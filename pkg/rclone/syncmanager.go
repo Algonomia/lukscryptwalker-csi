@@ -970,7 +970,8 @@ const (
 	// Each session does this at most once, so observing it and remounting
 	// converges. An accelerator, not a guarantee — the checker catches the rest.
 	mountSettleWindow = 14 * time.Second
-	// Must exceed the host mount-table cache TTL or every poll rereads one snapshot.
+	// A real sampling interval: each poll drops the cached mount table first,
+	// so it is not a reread of one snapshot.
 	mountSettlePoll = 2 * time.Second
 )
 
@@ -983,6 +984,10 @@ var ErrMountRippedOut = errors.New("fresh mount was unmounted by a previous sess
 // with settle, that it stays so. Invisible means consumers bind the empty
 // directory underneath; visible-but-dead means they bind a dead endpoint.
 func (mm *MountManager) waitForMountReady(settle bool) error {
+	// We just changed the mount tree: the cached table predates our mount, and
+	// serving it burns seconds of the budget reporting the mount as missing.
+	InvalidateHostMounts()
+
 	deadline := time.Now().Add(mountReadyTimeout)
 	var lastErr error
 
@@ -1010,6 +1015,9 @@ func (mm *MountManager) waitForMountToSettle() error {
 	deadline := time.Now().Add(mountSettleWindow)
 	for time.Now().Before(deadline) {
 		time.Sleep(mountSettlePoll)
+		// Every poll must see a new table: a cached one can predate the
+		// rip-out this window exists to catch.
+		InvalidateHostMounts()
 		isFUSE, known := HostFUSEMountState(mm.mountPoint)
 		if known && !isFUSE {
 			return fmt.Errorf("%w (at %s)", ErrMountRippedOut, mm.mountPoint)

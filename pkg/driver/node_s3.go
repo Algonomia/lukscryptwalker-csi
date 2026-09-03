@@ -236,7 +236,23 @@ func (ns *NodeServer) setupS3Sync(volumeID, stagingPath string, volumeContext ma
 		rclone.ClearDrainPending(volumeID)
 	}
 
-	return ns.mountS3Volume(volumeID, stagingPath, volumeContext, fsGroup)
+	if err := ns.mountS3Volume(volumeID, stagingPath, volumeContext, fsGroup); err != nil {
+		return err
+	}
+	ns.mountedAt.Store(volumeID, time.Now())
+	return nil
+}
+
+// reportMountLifetime logs how long the mount that just vanished had been up.
+// A short and repeatable lifetime points at a teardown racing our own mount; a
+// scattered one points at an external unmounter.
+func (ns *NodeServer) reportMountLifetime(volumeID string) {
+	v, ok := ns.mountedAt.LoadAndDelete(volumeID)
+	if !ok {
+		return
+	}
+	klog.Warningf("Volume %s: the mount that just went away had been up for %s",
+		volumeID, time.Since(v.(time.Time)).Round(time.Second))
 }
 
 // mountS3Volume builds the rclone mount for a volume and registers its manager.
@@ -822,6 +838,7 @@ func (ns *NodeServer) cleanupStaleS3Mounts() {
 			}
 			klog.Infof("Detected missing FUSE mount for S3 volume %s at %s", volumeID, globalmountPath)
 		}
+		ns.reportMountLifetime(volumeID)
 
 		// Heal in place: re-mount the volume in-process and re-attach consumers
 		// without bouncing pods that can self-heal via mount propagation.
@@ -1051,6 +1068,15 @@ const consumerRestartCooldown = 5 * time.Minute
 // consumerRestartAllowed reports whether destructive consumer recovery is
 // allowed for the volume, stamping the cooldown when it is.
 func (ns *NodeServer) consumerRestartAllowed(volumeID string) bool {
+	// Killing a consumer while kubelet has no driver to call is a one-way
+	// door: nothing can re-stage the volume, so the pod never comes back and a
+	// degraded-but-running workload becomes a hard outage.
+	if !ns.registrationHealthy() {
+		klog.Warningf("Volume %s: leaving consumers alone — this driver is not registered with kubelet, so a "+
+			"restarted pod could not re-stage the volume until the node-driver-registrar re-registers it",
+			volumeID)
+		return false
+	}
 	if t, ok := ns.consumerRestartTimes.Load(volumeID); ok {
 		if since := time.Since(t.(time.Time)); since < consumerRestartCooldown {
 			klog.Warningf("Volume %s: consumers were destructively recovered %s ago (cooldown %s)",

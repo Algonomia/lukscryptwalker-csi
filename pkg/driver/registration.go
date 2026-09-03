@@ -129,6 +129,13 @@ func portHolderDescription(addr string) string {
 	return "it is held by pid " + pid + " (" + name + ")"
 }
 
+// registrationHealthy reports whether kubelet currently knows about this
+// driver. Defaults to healthy: the refresher flips it only on a confirmed
+// absence, and fails open during startup and on API errors.
+func (ns *NodeServer) registrationHealthy() bool {
+	return !ns.regUnhealthy.Load()
+}
+
 // recordRegistrationTransition emits a Node event when registration health
 // changes state, so a lost registration is visible without reading driver logs.
 func (ns *NodeServer) recordRegistrationTransition(healthy bool) {

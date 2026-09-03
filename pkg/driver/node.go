@@ -69,6 +69,9 @@ type NodeServer struct {
 	// statfsProbesInFlight likewise caps the checker's statfs probe: a wedged
 	// FUSE blocks statfs in D-state, and an unbounded call freezes the checker.
 	statfsProbesInFlight sync.Map
+	// mountedAt (volumeID → time.Time) stamps each successful mount, so the
+	// checker can report how long a mount that vanished had been up.
+	mountedAt sync.Map
 	// consumerRestartTimes (volumeID → time.Time) rate-limits destructive
 	// consumer recovery so a reconcile loop can never kill pods repeatedly.
 	consumerRestartTimes sync.Map
@@ -149,6 +152,10 @@ func (ns *NodeServer) runStaleS3MountChecker() {
 			ns.runWatched("stranded-consumer repair", ns.repairStrandedConsumers)
 			// Leaked loop devices and backing files accumulate between restarts.
 			ns.runWatched("orphaned-volume GC", ns.cleanupOrphanedVolumes)
+			// Every leaked VFS name strands its cache generation on the cache
+			// volume; at startup only, a churning volume fills it before the
+			// next restart ever gets to sweep.
+			ns.runWatched("orphaned VFS-cache GC", ns.cleanupOrphanedVFSCacheDirs)
 		}
 		tick++
 		ns.runWatched("stale-mount checker", ns.cleanupStaleS3Mounts)
