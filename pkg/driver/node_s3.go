@@ -1942,42 +1942,51 @@ func (ns *NodeServer) mountVFSResponsive(globalmountPath string) bool {
 	}
 }
 
-// abortFUSEConnection aborts the kernel FUSE connection backing mountPoint via
+// abortFUSEConnection aborts the kernel FUSE connections backing mountPoint via
 // /sys/fs/fuse/connections/<dev-minor>/abort. Pending and future requests fail
 // with ECONNABORTED, releasing D-state waiters a wedged serve loop stranded.
-// The device id comes from /proc/self/mountinfo, which never stats the mount.
+// The device ids come from mountinfo, which never stats the mount.
+//
+// The host namespace is the authority, as it is for every other mount check:
+// our own /proc/self/mountinfo does not carry mounts rclone made and propagated
+// out of a replaced sandbox, so reading it aborted nothing and every wedged
+// mount stayed wedged. Aborts every FUSE layer stacked at the path — a buried
+// one still serves whoever opened it before the mount above it appeared.
 func abortFUSEConnection(mountPoint string) {
-	data, err := os.ReadFile("/proc/self/mountinfo")
-	if err != nil {
-		klog.Warningf("abortFUSEConnection %s: cannot read mountinfo: %v", mountPoint, err)
-		return
+	// A cached table can name a device minor the kernel has since recycled for
+	// another FUSE mount, and aborting that one would break an innocent volume.
+	rclone.InvalidateHostMounts()
+	stacks, ok := rclone.HostMountStacksOK()
+	if !ok {
+		// Unreadable is usually a wedged umount holding the kernel mount lock —
+		// exactly when we need the abort — so fall back to our own view rather
+		// than skip. Worse than the host's, better than nothing.
+		data, err := os.ReadFile("/proc/self/mountinfo")
+		if err != nil {
+			klog.Warningf("abortFUSEConnection %s: cannot read any mount table: %v", mountPoint, err)
+			return
+		}
+		stacks = rclone.ParseMountStacks(string(data))
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		// fields: id parentid major:minor root mountpoint ... - fstype source opts
-		if len(fields) < 5 || fields[4] != mountPoint {
+
+	aborted := 0
+	for _, m := range stacks[mountPoint] {
+		if !strings.HasPrefix(m.FSType, "fuse") {
 			continue
 		}
-		sep := 0
-		for i, f := range fields {
-			if f == "-" {
-				sep = i
-				break
-			}
-		}
-		if sep == 0 || sep+1 >= len(fields) || !strings.HasPrefix(fields[sep+1], "fuse") {
-			continue
-		}
-		_, minor, ok := strings.Cut(fields[2], ":")
-		if !ok {
+		_, minor, found := strings.Cut(m.Dev, ":")
+		if !found {
 			continue
 		}
 		if err := writeFUSEAbort(minor); err != nil {
 			klog.Warningf("abortFUSEConnection %s: aborting connection %s failed: %v", mountPoint, minor, err)
-		} else {
-			klog.Infof("abortFUSEConnection %s: aborted FUSE connection %s", mountPoint, minor)
+			continue
 		}
-		return
+		aborted++
+		klog.Infof("abortFUSEConnection %s: aborted FUSE connection %s", mountPoint, minor)
+	}
+	if aborted == 0 {
+		klog.V(4).Infof("abortFUSEConnection %s: no FUSE mount there to abort", mountPoint)
 	}
 }
 
