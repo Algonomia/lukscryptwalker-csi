@@ -360,8 +360,15 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	volumeID := req.GetVolumeId()
 	stagingTargetPath := req.GetStagingTargetPath()
 
-	// Check if volume is already staged (idempotency)
-	if ns.isVolumeStaged(volumeID, stagingTargetPath) {
+	// Idempotency. Must branch on the backend: isVolumeStaged answers for LUKS
+	// only, and its first test is IsLUKSOpened — which an S3 volume never
+	// satisfies, so an S3 re-stage would always fall through and tear down a
+	// healthy mount to rebuild it.
+	staged, err := ns.isAlreadyStaged(volumeID, stagingTargetPath, req.GetVolumeContext())
+	if err != nil {
+		return nil, status.Errorf(codes.Aborted, "Volume %s: %v", volumeID, err)
+	}
+	if staged {
 		klog.Infof("Volume %s is already staged at %s, returning success", volumeID, stagingTargetPath)
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
@@ -680,6 +687,33 @@ func (ns *NodeServer) prepareVolumeStaging(req *csi.NodeStageVolumeRequest) (*St
 	params.mappedDevice = mappedDevice
 
 	return params, nil
+}
+
+// isAlreadyStaged reports whether a re-stage can return success untouched.
+// A kubelet restart re-issues NodeStageVolume for every volume it holds, so a
+// wrong "no" here is not cosmetic: it unmounts a live FUSE mount, strands the
+// old VFS instance with no live mount to shut it down through (leaking it and
+// its cache generation for the life of the process), and arms rclone's
+// unmount-by-path finalizer to rip out the successor mount.
+// A non-nil error means staged-ness could not be established; the caller must
+// fail the RPC rather than stage, and let kubelet retry.
+func (ns *NodeServer) isAlreadyStaged(volumeID, stagingTargetPath string, volumeContext map[string]string) (bool, error) {
+	if !ns.isS3Backend(volumeContext) {
+		return ns.isVolumeStaged(volumeID, stagingTargetPath), nil
+	}
+	// Mounted is not enough: a dead FUSE is still a mount point. Require the
+	// same live, serving mount the publish path demands.
+	err := ns.verifyS3StagingLive(stagingTargetPath)
+	if err == nil {
+		return true, nil
+	}
+	if !rclone.HostMountsKnown() {
+		// Live and unverifiable look identical here, and only one of them is
+		// safe to act on: staging over a mount we cannot see would tear it out.
+		return false, fmt.Errorf("cannot verify the staging mount at %s: %v", stagingTargetPath, err)
+	}
+	klog.Infof("S3 volume %s is not live at %s (%v), staging it", volumeID, stagingTargetPath, err)
+	return false, nil
 }
 
 // ensureVolumeStaged ensures the volume is staged, restoring if needed after reboot
