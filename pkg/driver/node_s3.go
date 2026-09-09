@@ -782,7 +782,10 @@ func (ns *NodeServer) cleanupStaleS3Mounts() {
 		}
 
 		if !isStaleFUSE && !isMissingMount {
-			// Mount is healthy, skip
+			// Healthy: clear any backoff so a real fault later is repaired at once.
+			if id := ns.getVolumeIDFromVolData(volumeDir); id != "" {
+				ns.reconcileSucceeded(id)
+			}
 			continue
 		}
 
@@ -839,6 +842,10 @@ func (ns *NodeServer) cleanupStaleS3Mounts() {
 			klog.Infof("Detected missing FUSE mount for S3 volume %s at %s", volumeID, globalmountPath)
 		}
 		ns.reportMountLifetime(volumeID)
+
+		if !ns.reconcileAllowed(volumeID) {
+			continue
+		}
 
 		// Heal in place: re-mount the volume in-process and re-attach consumers
 		// without bouncing pods that can self-heal via mount propagation.
@@ -1059,6 +1066,50 @@ func (ns *NodeServer) reconcileS3Mount(volumeID, globalmountPath string, volumeC
 			pod.Namespace, pod.Name, volumeID)
 		ns.recoverConsumerPod(pod)
 	}
+}
+
+// Repair that does not hold must decay to occasional retries: every unheld
+// remount permanently leaks a VFS (nothing can shut down one whose mount record
+// is gone) plus its cache generation, so a treadmill is a memory and disk leak,
+// not just noise.
+const (
+	reconcileFreeAttempts = 2
+	reconcileBackoffBase  = 2 * time.Minute
+	reconcileBackoffMax   = 15 * time.Minute
+)
+
+// reconcileAttempt is one volume's consecutive-failed-repair state.
+type reconcileAttempt struct {
+	count int
+	last  time.Time
+}
+
+// reconcileAllowed reports whether this volume may be reconciled now, counting
+// the attempt when it is. reconcileSucceeded clears the count once a tick sees
+// the mount healthy, so a one-off repair is never delayed.
+func (ns *NodeServer) reconcileAllowed(volumeID string) bool {
+	var a reconcileAttempt
+	if v, ok := ns.reconcileAttempts.Load(volumeID); ok {
+		a = v.(reconcileAttempt)
+	}
+	if a.count >= reconcileFreeAttempts {
+		wait := min(reconcileBackoffBase<<min(a.count-reconcileFreeAttempts, 3), reconcileBackoffMax)
+		if since := time.Since(a.last); since < wait {
+			klog.Warningf("Volume %s: repair has not held %d times running; next attempt in %s. Each unheld "+
+				"remount leaks a VFS and a cache generation, so retrying faster only fills the node",
+				volumeID, a.count, (wait - since).Round(time.Second))
+			return false
+		}
+	}
+	a.count++
+	a.last = time.Now()
+	ns.reconcileAttempts.Store(volumeID, a)
+	return true
+}
+
+// reconcileSucceeded clears a volume's backoff once its mount is seen healthy.
+func (ns *NodeServer) reconcileSucceeded(volumeID string) {
+	ns.reconcileAttempts.Delete(volumeID)
 }
 
 // consumerRestartCooldown bounds how often reconcile may destructively recover

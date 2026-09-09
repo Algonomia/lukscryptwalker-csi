@@ -182,3 +182,33 @@ func TestConsumerRestartAllowedGatedOnRegistration(t *testing.T) {
 		t.Error("recovery must be allowed again as soon as registration returns")
 	}
 }
+
+func TestReconcileBackoff(t *testing.T) {
+	ns := &NodeServer{}
+
+	// A one-off repair is never delayed: the free attempts, then a reset the
+	// moment a tick sees the mount healthy.
+	for i := 0; i < reconcileFreeAttempts; i++ {
+		if !ns.reconcileAllowed("vol-1") {
+			t.Fatalf("attempt %d must be allowed before backoff starts", i+1)
+		}
+	}
+	if ns.reconcileAllowed("vol-1") {
+		t.Error("attempt past the free budget must back off")
+	}
+	ns.reconcileSucceeded("vol-1")
+	if !ns.reconcileAllowed("vol-1") {
+		t.Error("a healthy observation must clear the backoff")
+	}
+
+	// The wait grows and is capped.
+	ns.reconcileAttempts.Store("vol-2", reconcileAttempt{count: 99, last: time.Now()})
+	if ns.reconcileAllowed("vol-2") {
+		t.Error("a long-failing volume must still be backed off")
+	}
+	ns.reconcileAttempts.Store("vol-2", reconcileAttempt{
+		count: 99, last: time.Now().Add(-reconcileBackoffMax - time.Second)})
+	if !ns.reconcileAllowed("vol-2") {
+		t.Error("backoff must never exceed reconcileBackoffMax")
+	}
+}

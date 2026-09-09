@@ -72,6 +72,9 @@ type NodeServer struct {
 	// mountedAt (volumeID → time.Time) stamps each successful mount, so the
 	// checker can report how long a mount that vanished had been up.
 	mountedAt sync.Map
+	// reconcileAttempts (volumeID → reconcileAttempt) backs off repair that
+	// does not hold, so a permanent fault cannot become a remount treadmill.
+	reconcileAttempts sync.Map
 	// consumerRestartTimes (volumeID → time.Time) rate-limits destructive
 	// consumer recovery so a reconcile loop can never kill pods repeatedly.
 	consumerRestartTimes sync.Map
