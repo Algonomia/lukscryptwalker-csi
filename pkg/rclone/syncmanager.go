@@ -341,6 +341,14 @@ func (mm *MountManager) Mount() error {
 		hadPredecessor = true
 	}
 
+	// The dangerous predecessor is the one already gone from the mount tree:
+	// the checker fires precisely because the mount vanished, so isMountPoint
+	// is false and a reusable VFS name leaks nothing — yet the dead session's
+	// finalizer is still pending and takes the fresh mount with it.
+	if takePendingFinalizer(mm.mountPoint) {
+		hadPredecessor = true
+	}
+
 	// Quarantine unloadable cache items before rclone can serve them: one
 	// corrupt item blocks its readers forever and can stall the whole node.
 	ValidateVFSCache(mm.vfsName)
@@ -671,15 +679,58 @@ func setFuseFdsCloexec() {
 func UnmountDead(mountPoint string) bool {
 	if _, err := RPCWithTimeout("mount/unmount", map[string]interface{}{"mountPoint": mountPoint}, rpcUnmountTimeout); err != nil {
 		if strings.Contains(err.Error(), "mount not found") {
+			// No mount record means the session is fully gone: whatever removed
+			// the record already ran the finalizer, so none is pending.
 			klog.V(4).Infof("UnmountDead %s: no live rclone mount entry", mountPoint)
 			return false
 		}
 		// VFS.Shutdown still ran; the caller's umount -l completes the detach.
 		klog.Warningf("UnmountDead %s: mount/unmount RPC failed: %v", mountPoint, err)
+		notePendingFinalizer(mountPoint)
 		return true
 	}
 	klog.Infof("UnmountDead %s: old librclone session shut down cleanly", mountPoint)
+	notePendingFinalizer(mountPoint)
 	return true
+}
+
+// rclone's mount teardown unmounts BY PATH with no identity check, and it runs
+// when the old serve loop finishes exiting — which can be after we have already
+// mounted the successor at that path. Nothing in the mount tree or the VFS
+// registry shows that a teardown is still in flight, so the code that tore the
+// session down records it here for the next Mount of the same path.
+var (
+	pendingFinalizersMu sync.Mutex
+	pendingFinalizers   = map[string]time.Time{}
+)
+
+// How long a torn-down session is assumed able to still unmount its path.
+const pendingFinalizerTTL = 5 * time.Minute
+
+// notePendingFinalizer records that a session at mountPoint was shut down and
+// its unmount-by-path finalizer has not necessarily run yet.
+func notePendingFinalizer(mountPoint string) {
+	pendingFinalizersMu.Lock()
+	defer pendingFinalizersMu.Unlock()
+	pendingFinalizers[mountPoint] = time.Now()
+}
+
+// takePendingFinalizer reports whether a session torn down at mountPoint could
+// still unmount it, clearing the note. A false positive costs one settle
+// window; a false negative is a mount reported healthy moments before it is
+// ripped out from under its consumers.
+func takePendingFinalizer(mountPoint string) bool {
+	pendingFinalizersMu.Lock()
+	defer pendingFinalizersMu.Unlock()
+	at, noted := pendingFinalizers[mountPoint]
+	delete(pendingFinalizers, mountPoint)
+	// Paths come and go with volumes, so expire the rest rather than grow.
+	for p, t := range pendingFinalizers {
+		if time.Since(t) > pendingFinalizerTTL {
+			delete(pendingFinalizers, p)
+		}
+	}
+	return noted && time.Since(at) <= pendingFinalizerTTL
 }
 
 // waitForPendingUploads polls vfs/stats until the write-back queue is empty or
