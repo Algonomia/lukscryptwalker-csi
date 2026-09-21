@@ -62,6 +62,23 @@ func TestLiveMountDevicesExcludesBuriedAndDeparted(t *testing.T) {
 	}
 }
 
+// A container started on a session the bind has since moved off keeps it through
+// kubelet's subPath mounts; those must not make the stale device look live.
+func TestLiveMountDevicesIgnoresSubPathMounts(t *testing.T) {
+	subPath := testKubeletRoot + "/pods/pod-uid-1/volume-subpaths/pvc-1/nextcloud-cron/0"
+	stacks := map[string][]rclone.HostMount{
+		bindPath("pvc-1"): {fuseMount("0:168")},
+		subPath:           {fuseMount("0:248")},
+	}
+	live := liveMountDevices(stacks)
+	if live["0:248"] {
+		t.Error("a device held only by a subPath mount was reported live")
+	}
+	if !live["0:168"] {
+		t.Error("the bind's device must stay live")
+	}
+}
+
 // Repair restarts pods, so anything that is not unambiguously one of our
 // consumer binds must be left alone.
 func TestParseConsumerBindsIgnoresEverythingElse(t *testing.T) {

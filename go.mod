@@ -6,6 +6,7 @@ require (
 	github.com/container-storage-interface/spec v1.12.0
 	github.com/rclone/rclone v1.74.3
 	github.com/stretchr/testify v1.11.1
+	golang.org/x/sys v0.45.0
 	google.golang.org/grpc v1.80.0
 	k8s.io/api v0.35.0
 	k8s.io/apimachinery v0.35.0
@@ -125,7 +126,6 @@ require (
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.45.0 // indirect
 	golang.org/x/term v0.43.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
