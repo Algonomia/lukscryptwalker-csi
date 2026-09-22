@@ -35,7 +35,8 @@ func newSessionDir(volumeID, vfsName string) (string, error) {
 	}
 	// Sessions serve decrypted data with no mode checks (allow_other), so the
 	// tree must be root-only, like the kubelet tree the globalmount lives in.
-	if err := os.Chmod(sessionBase, 0700); err != nil { // #nosec G302 -- a directory: root needs its search bit
+	// #nosec G302 -- a directory: root needs its search bit
+	if err := os.Chmod(sessionBase, 0700); err != nil {
 		return "", err
 	}
 	for {
