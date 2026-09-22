@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **A repaired S3 mount no longer takes down its successor.** When an rclone session's
+  serve loop exits, rclone's teardown unmounts whatever rclone mount it finds *at its path*
+  and deletes the mount record stored under that path, without checking that either is
+  still its own. Every generation used to mount at the kubelet globalmount, so when a
+  repair restarted the last consumer still holding the previous generation, that
+  generation's teardown unmounted the fresh mount. The next repair repeated it, killing
+  the consumers on every cycle (seen in production: 177 consecutive repairs that did not
+  hold, a pgBackRest repo-host killed every 15 minutes, scheduled backups missed). Each
+  session now mounts at its own private path under `/var/lib/lukscrypt-cache/sessions`,
+  and the globalmount is a bind of it, so a teardown can only ever reach its own session.
+  A globalmount that loses its bind while its session is still live is re-bound in place,
+  with no remount and no consumer restart. The 14-second settle window, the
+  pending-finalizer bookkeeping and the rip-out retry loop are removed.
+- **A consumer is never re-bound to a staging path that isn't serving.** Binding the bare
+  directory exposed the node's disk, and that bind joins the root filesystem's mount
+  propagation group: every later re-bind of the consumer then silently unmounted the
+  globalmount too, so the volume was remounted every 30 seconds (seen on a 1.4.3 node:
+  26 generations in 15 minutes). The staging path is now verified, and re-exposed from its
+  live session if needed, right before the bind.
+- The stranded-consumer sweep no longer counts kubelet subPath mounts as proof that a
+  device is still served. They pin whatever the bind held when the container started, so
+  a container reading a shut-down session through a subPath went unnoticed.
 - **Consumers left reading EIO forever after a re-bind.** Bind mounts are made in the
   host mount namespace but were unmounted from the driver's own, so the old mount could
   survive and the fresh bind stacked on top of it. A container started before the re-bind

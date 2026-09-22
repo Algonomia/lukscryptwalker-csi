@@ -123,6 +123,7 @@ func NewNodeServer(d *Driver) *NodeServer {
 		ns.reportWatchdogActions()
 		InstallHostWatchdog()
 		abortOrphanedFUSEConnections()
+		ns.sweepDeadSessions()
 		ns.cleanupStaleS3Mounts()
 		ns.cleanupOrphanedVFSCacheDirs()
 		ns.cleanupOrphanedVolumes()

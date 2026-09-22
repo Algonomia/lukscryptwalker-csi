@@ -71,7 +71,9 @@ func (sm *SecretsManager) fetchPassphrase(ctx context.Context, ref SecretReferen
 
 	passphrase, ok := secret.Data[passphraseKey]
 	if !ok {
-		return "", fmt.Errorf("passphrase key '%s' not found in secret %s/%s", passphraseKey, ref.Namespace, ref.Name)
+		// Not the key name: this error reaches logs, and CodeQL treats the key as secret.
+		return "", fmt.Errorf("secret %s/%s has no entry under the key named by the passphraseKey parameter",
+			ref.Namespace, ref.Name)
 	}
 
 	return string(passphrase), nil

@@ -236,6 +236,9 @@ func (ns *NodeServer) setupS3Sync(volumeID, stagingPath string, volumeContext ma
 		rclone.ClearDrainPending(volumeID)
 	}
 
+	if ns.reexposeLiveSession(volumeID, stagingPath) {
+		return nil
+	}
 	if err := ns.mountS3Volume(volumeID, stagingPath, volumeContext, fsGroup); err != nil {
 		return err
 	}
@@ -305,8 +308,6 @@ func (ns *NodeServer) mountS3Volume(volumeID, stagingPath string, volumeContext 
 		return fmt.Errorf("failed to create rclone mount manager: %v", err)
 	}
 
-	// Mount the encrypted S3 remote. %w, not %v: callers distinguish a mount
-	// ripped out by a stale finalizer (retry now) from a real failure.
 	if err := mountMgr.Mount(); err != nil {
 		return fmt.Errorf("failed to mount S3 volume: %w", err)
 	}
@@ -598,8 +599,11 @@ func (ns *NodeServer) resumeStrandedDrain(volumeID, stagingTargetPath, reason st
 			ns.reportUnuploadedData(volumeID, "resumed drain did not complete")
 		}
 		// Only our own scratch mountpoint; a kubelet staging path is kubelet's.
+		// rmdir, never recursive: a bind left there would be the volume itself.
 		if strings.HasPrefix(stagingTargetPath, drainMountBase+"/") {
-			removeAllBounded(stagingTargetPath, 30*time.Second)
+			if err := os.Remove(stagingTargetPath); err != nil && !os.IsNotExist(err) {
+				klog.Warningf("Volume %s: could not remove drain mountpoint %s: %v", volumeID, stagingTargetPath, err)
+			}
 		}
 	}()
 }
@@ -849,10 +853,23 @@ func (ns *NodeServer) cleanupStaleS3Mounts() {
 
 		// Heal in place: re-mount the volume in-process and re-attach consumers
 		// without bouncing pods that can self-heal via mount propagation.
-		ns.reconcileS3Mount(volumeID, globalmountPath, volumeContext)
+		ns.reconcileS3Mount(volumeID, globalmountPath, volumeContext, !isStaleFUSE)
 	}
 
 	klog.Infof("Stale/missing S3 mount cleanup completed")
+}
+
+// sweepDeadSessions detaches the session mountpoints a previous driver process
+// left: sessions die with the process that served them.
+func (ns *NodeServer) sweepDeadSessions() {
+	for _, volumeID := range rclone.SessionVolumes() {
+		if ns.s3SyncMgr.isBackgroundDraining(volumeID) {
+			continue
+		}
+		unlock := ns.s3SyncMgr.lockVolume(volumeID)
+		rclone.SweepDeadSessions(volumeID)
+		unlock()
+	}
 }
 
 // drainMountBase is a driver-private, host-propagated directory used to mount a
@@ -944,7 +961,7 @@ func (ns *NodeServer) stagedVolumeIDs() (staged map[string]bool, known bool) {
 // in-process (resuming from the LUKS VFS cache), then re-attach consumers —
 // those with HostToContainer/Bidirectional propagation are left running, the
 // rest are restarted. On re-mount failure it falls back to remove + restart all.
-func (ns *NodeServer) reconcileS3Mount(volumeID, globalmountPath string, volumeContext map[string]string) {
+func (ns *NodeServer) reconcileS3Mount(volumeID, globalmountPath string, volumeContext map[string]string, missing bool) {
 	// Serialize against CSI handlers: the setup-in-progress flag is advisory.
 	defer ns.s3SyncMgr.lockVolume(volumeID)()
 
@@ -952,23 +969,28 @@ func (ns *NodeServer) reconcileS3Mount(volumeID, globalmountPath string, volumeC
 	ns.s3SyncMgr.markVolumeSetupInProgress(volumeID)
 	defer ns.s3SyncMgr.markVolumeSetupComplete(volumeID)
 
+	if missing && ns.reexposeLiveSession(volumeID, globalmountPath) {
+		return
+	}
+
 	pvcNamespace, pvcName, pvName := ns.resolveVolumeRefs(volumeID)
 	consumers := ns.podsUsingPVC(pvcNamespace, pvcName)
 	fsGroup := fsGroupFromPods(consumers)
 
 	// Drop any stale in-memory manager, stopping its cache monitor first so it
 	// doesn't keep evicting the cache dir the fresh mount is about to own.
+	var oldSession string
 	ns.s3SyncMgr.mutex.Lock()
 	if old := ns.s3SyncMgr.mountManagers[volumeID]; old != nil {
 		old.StopCacheMonitor()
+		oldSession = old.SessionPath()
 	}
 	delete(ns.s3SyncMgr.mountManagers, volumeID)
 	ns.s3SyncMgr.mutex.Unlock()
 
-	// Shut down the old librclone session (VFS.Shutdown) before the kernel
-	// detach: a bare umount -l leaves the old VFS alive in rclone's registry,
-	// writing the shared cache dir and able to unmount the fresh mount later.
-	hadSession := rclone.UnmountDead(globalmountPath)
+	// End the old sessions (VFS.Shutdown) before the kernel detach: a bare
+	// umount -l leaves the old VFS alive in rclone's registry.
+	rclone.ShutdownSessions(volumeID, oldSession)
 	// Abort the kernel FUSE connection: a wedged serve loop leaves stat/open
 	// callers in uninterruptible sleep, and only the abort releases them.
 	abortFUSEConnection(globalmountPath)
@@ -978,50 +1000,28 @@ func (ns *NodeServer) reconcileS3Mount(volumeID, globalmountPath string, volumeC
 		klog.Warningf("Volume %s: failed to ensure globalmount dir: %v", volumeID, err)
 	}
 
-	// An old session's finalizer fires seconds after its serve loop exits and
-	// unmounts whatever rclone mount it finds at the path. Retry here rather
-	// than next tick: each session rips out at most one successor, so this
-	// converges, whereas one attempt per tick just mounts the next victim.
-	mounted := false
-	var lastErr error
-	for attempt := 0; attempt < 4; attempt++ {
-		if hadSession && attempt == 0 {
-			time.Sleep(2 * time.Second)
-		}
-		err := ns.setupS3Sync(volumeID, globalmountPath, volumeContext, nil, fsGroup)
-		if err == nil {
-			mounted = true
-			break
-		}
-		lastErr = err
+	if err := ns.setupS3Sync(volumeID, globalmountPath, volumeContext, nil, fsGroup); err != nil {
 		ns.s3SyncMgr.mutex.Lock()
 		if old := ns.s3SyncMgr.mountManagers[volumeID]; old != nil {
 			old.StopCacheMonitor()
 		}
 		delete(ns.s3SyncMgr.mountManagers, volumeID)
 		ns.s3SyncMgr.mutex.Unlock()
-		hadSession = rclone.UnmountDead(globalmountPath)
 
-		// Only a rip-out is worth retrying now; any other failure would burn the
-		// checker budget four times over. Next tick retries with backoff.
-		if !errors.Is(err, rclone.ErrMountRippedOut) {
-			klog.Errorf("Volume %s: in-place re-mount failed: %v", volumeID, err)
-			break
-		}
-		klog.Warningf("Volume %s: attempt %d was unmounted by a previous session's finalizer; that session has "+
-			"now spent its unmount, retrying immediately", volumeID, attempt+1)
-	}
-	if !mounted {
 		// Last resort, not the response to one failed mount: rate-limited like
 		// every other destructive recovery.
-		if lastErr != nil && ns.consumerRestartAllowed(volumeID) {
-			klog.Errorf("Volume %s: in-place re-mount keeps failing (%v); falling back to remove + restart all consumers",
-				volumeID, lastErr)
-			removeAllBounded(globalmountPath, 60*time.Second)
+		if ns.consumerRestartAllowed(volumeID) {
+			klog.Errorf("Volume %s: in-place re-mount failed (%v); falling back to remove + restart all consumers",
+				volumeID, err)
+			// Never recursive through a mount: whatever is attached there is the volume.
+			if !rclone.IsHostMountPoint(globalmountPath) {
+				removeAllBounded(globalmountPath, 60*time.Second)
+			}
 			ns.restartPodsWithStaleS3Mount(volumeID)
 			return
 		}
-		klog.Errorf("Volume %s: fresh mount did not survive; leaving consumers alone, next checker tick retries", volumeID)
+		klog.Errorf("Volume %s: in-place re-mount failed (%v); leaving consumers alone, next checker tick retries",
+			volumeID, err)
 		return
 	}
 	klog.Infof("Volume %s: re-mounted in-process; re-attaching consumers", volumeID)
@@ -1066,6 +1066,26 @@ func (ns *NodeServer) reconcileS3Mount(volumeID, globalmountPath string, volumeC
 			pod.Namespace, pod.Name, volumeID)
 		ns.recoverConsumerPod(pod)
 	}
+}
+
+// reexposeLiveSession re-binds stagingPath from the volume's live session,
+// reporting whether that repaired it. The session outlives its bind, and every
+// consumer already holds it, so nothing needs a remount or a restart.
+func (ns *NodeServer) reexposeLiveSession(volumeID, stagingPath string) bool {
+	ns.s3SyncMgr.mutex.RLock()
+	mm := ns.s3SyncMgr.mountManagers[volumeID]
+	ns.s3SyncMgr.mutex.RUnlock()
+	if mm == nil || mm.StagingPath() != stagingPath || !mm.SessionServing() {
+		return false
+	}
+	if err := mm.Reexpose(); err != nil {
+		klog.Warningf("Volume %s: could not re-expose its live session (%v); re-mounting", volumeID, err)
+		return false
+	}
+	klog.Infof("Volume %s: %s had lost its live rclone session; re-bound it, consumers untouched",
+		volumeID, stagingPath)
+	ns.mountedAt.Store(volumeID, time.Now())
+	return true
 }
 
 // Repair that does not hold must decay to occasional retries: every unheld
@@ -1161,12 +1181,30 @@ func (ns *NodeServer) rebindConsumerMount(globalmountPath, podUID, pvName string
 		klog.Warningf("Pod %s: not re-binding %s, its stale mount is still there: %v", podUID, targetPath, err)
 		return false
 	}
+	if err := ns.ensureStagingServing(globalmountPath); err != nil {
+		klog.Warningf("Pod %s: not re-binding %s: %v", podUID, targetPath, err)
+		return false
+	}
 	if err := ns.bindMount(globalmountPath, targetPath, false, fsGroup); err != nil {
 		klog.Warningf("Pod %s: failed to re-bind CSI mount %s to %s: %v",
 			podUID, globalmountPath, targetPath, err)
 		return false
 	}
 	return true
+}
+
+// ensureStagingServing re-exposes the staging path if needed before a consumer
+// is bound to it. A bind of the bare directory exposes the node's disk and joins
+// the root fs's peer group, so unmounts at the consumer then hit the staging path.
+func (ns *NodeServer) ensureStagingServing(stagingPath string) error {
+	rclone.InvalidateHostMounts()
+	if ns.verifyS3StagingLive(stagingPath) == nil {
+		return nil
+	}
+	if id := ns.getVolumeIDFromVolData(filepath.Dir(stagingPath)); id != "" {
+		ns.reexposeLiveSession(id, stagingPath)
+	}
+	return ns.verifyS3StagingLive(stagingPath)
 }
 
 // consumerBind is one pod's bind of one of our volumes, as the host sees it.
@@ -1224,10 +1262,14 @@ func parseConsumerBinds(stacks map[string][]rclone.HostMount, kubeletRoot string
 // liveMountDevices is the set of devices the host actually resolves: the
 // topmost mount at each path. A device outside it is either buried under a
 // newer mount or gone from the table altogether — either way nothing reaching
-// the host through a path can still get to it.
+// the host through a path can still get to it. subPath mounts don't count: they
+// pin whatever the bind held when the container started.
 func liveMountDevices(stacks map[string][]rclone.HostMount) map[string]bool {
 	live := make(map[string]bool, len(stacks))
-	for _, mounts := range stacks {
+	for path, mounts := range stacks {
+		if strings.Contains(path, "/volume-subpaths/") {
+			continue
+		}
 		live[mounts[len(mounts)-1].Dev] = true
 	}
 	return live
