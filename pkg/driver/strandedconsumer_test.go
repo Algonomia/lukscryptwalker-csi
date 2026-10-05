@@ -137,3 +137,18 @@ func TestHealthyBindIsNotRepairable(t *testing.T) {
 		t.Error("the live device of a healthy bind was not in the live set")
 	}
 }
+
+// A container's own FUSE mounts (here sshfs started by the app) never appear in
+// the host table; treating them as stranded restarted a healthy pod every sweep.
+func TestStrandedInMountInfoIgnoresForeignFUSE(t *testing.T) {
+	mountinfo := "1169 6735 0:166 / /mount_FTP ro,nosuid,nodev,relatime - fuse.sshfs user@host:/incoming/ ro,user_id=0,group_id=0\n" +
+		"1170 6735 0:167 / /proc/cpuinfo rw,relatime - fuse.lxcfs lxcfs rw,user_id=0,group_id=0\n" +
+		"1171 6735 0:170 / /data rw,relatime - fuse.rclone s3:bucket rw,user_id=0,group_id=0\n" +
+		"1172 6735 0:171 / /cache rw,relatime - fuse.rclone s3:bucket rw,user_id=0,group_id=0\n"
+	live := map[string]bool{"0:171": true}
+
+	got := strandedInMountInfo(mountinfo, live)
+	if len(got) != 1 || got[0] != "0:170" {
+		t.Errorf("stranded = %v, want only the dead rclone device [0:170]", got)
+	}
+}

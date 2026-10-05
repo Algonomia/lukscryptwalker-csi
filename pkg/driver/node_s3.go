@@ -1288,17 +1288,33 @@ func containerStrandedDevices(podUID string, live map[string]bool) []string {
 		if err != nil {
 			continue
 		}
-		for _, mounts := range rclone.ParseMountStacks(data) {
-			for _, m := range mounts {
-				if strings.HasPrefix(m.FSType, "fuse") && !live[m.Dev] && !seen[m.Dev] {
-					seen[m.Dev] = true
-					stranded = append(stranded, m.Dev)
-				}
+		for _, dev := range strandedInMountInfo(data, live) {
+			if !seen[dev] {
+				seen[dev] = true
+				stranded = append(stranded, dev)
 			}
 		}
 	}
 	return stranded
 }
+
+// strandedInMountInfo returns the rclone devices in one container's mountinfo
+// that the host no longer resolves. Other FUSE filesystems (sshfs mounted by
+// the app itself, lxcfs) never appear on the host, so they are not ours to judge.
+func strandedInMountInfo(mountinfo string, live map[string]bool) []string {
+	var stranded []string
+	for _, mounts := range rclone.ParseMountStacks(mountinfo) {
+		for _, m := range mounts {
+			if m.FSType == rcloneFSType && !live[m.Dev] {
+				stranded = append(stranded, m.Dev)
+			}
+		}
+	}
+	return stranded
+}
+
+// rcloneFSType is the filesystem type of every FUSE mount this driver makes.
+const rcloneFSType = "fuse.rclone"
 
 // maxStrandedRestartsPerSweep staggers recovery: re-binding is harmless, but a
 // node whose every consumer is stranded must not be restarted all at once.
