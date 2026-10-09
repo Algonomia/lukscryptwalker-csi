@@ -1,12 +1,12 @@
 module github.com/lukscryptwalker-csi
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/container-storage-interface/spec v1.12.0
 	github.com/rclone/rclone v1.74.3
 	github.com/stretchr/testify v1.11.1
-	golang.org/x/sys v0.45.0
+	golang.org/x/sys v0.48.0
 	google.golang.org/grpc v1.80.0
 	k8s.io/api v0.35.0
 	k8s.io/apimachinery v0.35.0
