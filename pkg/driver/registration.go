@@ -354,7 +354,7 @@ func collectListeningInodes(file string, port int, inodes map[string]bool) {
 		if i < 0 {
 			continue
 		}
-		p, err := strconv.ParseUint(fields[1][i+1:], 16, 32)
+		p, err := strconv.ParseUint(fields[1][i+1:], 16, 16)
 		if err == nil && int(p) == port {
 			inodes["socket:["+fields[9]+"]"] = true
 		}

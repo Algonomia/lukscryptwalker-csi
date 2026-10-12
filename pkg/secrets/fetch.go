@@ -62,7 +62,7 @@ func (sm *SecretsManager) fetchPassphrase(ctx context.Context, ref SecretReferen
 		passphraseKey = DefaultPassphraseKey
 	}
 
-	klog.V(4).Infof("Fetching LUKS passphrase from secret %s/%s, key: %s", ref.Namespace, ref.Name, passphraseKey)
+	klog.V(4).Infof("Fetching LUKS passphrase from secret %s/%s", ref.Namespace, ref.Name)
 
 	secret, err := sm.clientset.CoreV1().Secrets(ref.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
 	if err != nil {

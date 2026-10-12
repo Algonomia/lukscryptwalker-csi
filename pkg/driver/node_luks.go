@@ -574,9 +574,8 @@ func (ns *NodeServer) getPassphraseFromRequest(req *csi.NodeStageVolumeRequest) 
 
 	// Extract secret parameters from StorageClass parameters and volume context
 	secretParams := secrets.ExtractSecretParams(scParams, volumeContext)
-	klog.V(4).Infof("getPassphraseFromRequest: extracted secretParams - LUKS: %s/%s, passphraseKey: %s",
-		secretParams.LUKSSecret.Namespace, secretParams.LUKSSecret.Name,
-		secretParams.PassphraseKey)
+	klog.V(4).Infof("getPassphraseFromRequest: extracted secretParams - LUKS: %s/%s",
+		secretParams.LUKSSecret.Namespace, secretParams.LUKSSecret.Name)
 
 	// Fetch secrets from Kubernetes
 	volSecrets, err := ns.secretsManager.FetchVolumeSecrets(ctx, secretParams)

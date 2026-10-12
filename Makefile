@@ -57,7 +57,7 @@ test:
 test-fuse:
 	docker run --rm --privileged -v $(CURDIR):/src:ro -w /src \
 		-v $(shell go env GOMODCACHE):/go/pkg/mod:ro -v lukscrypt-gocache:/root/.cache/go-build \
-		-e GOFLAGS=-mod=readonly -e GOPROXY=off golang:1.25 \
+		-e GOFLAGS=-mod=readonly -e GOPROXY=off golang:1.26 \
 		sh -c 'apt-get update -qq && apt-get install -y -qq fuse3 >/dev/null && \
 			go test -tags fuseintegration -count=1 -v -run FUSE ./pkg/rclone/'
 

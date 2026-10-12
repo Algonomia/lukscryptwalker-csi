@@ -52,10 +52,9 @@ func ExtractSecretParams(scParams, volumeContext map[string]string) SecretParams
 		}
 	}
 
-	klog.V(4).Infof("Extracted secret params: LUKS=%s/%s, S3=%s/%s, passphraseKey=%s",
+	klog.V(4).Infof("Extracted secret params: LUKS=%s/%s, S3=%s/%s",
 		params.LUKSSecret.Namespace, params.LUKSSecret.Name,
-		params.S3Secret.Namespace, params.S3Secret.Name,
-		params.PassphraseKey)
+		params.S3Secret.Namespace, params.S3Secret.Name)
 
 	return params
 }
