@@ -149,11 +149,9 @@ jobs:
 
       - name: Build binaries
         run: |
-          # Build for multiple platforms
+          # Linux only: the driver depends on Linux mount/FUSE syscalls
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o lukscryptwalker-csi-linux-amd64 ./cmd/main.go
           GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o lukscryptwalker-csi-linux-arm64 ./cmd/main.go
-          GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -o lukscryptwalker-csi-darwin-amd64 ./cmd/main.go
-          GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o lukscryptwalker-csi-darwin-arm64 ./cmd/main.go
 
           # Create checksums
           sha256sum lukscryptwalker-csi-* > checksums.txt
