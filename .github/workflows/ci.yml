@@ -25,8 +25,17 @@ jobs:
         run: apk add --no-cache git gcc musl-dev
 
       - name: Install golangci-lint
+        # Not install.sh: its suffix match picks the .sbom.json line from the checksums file.
         run: |
-          wget -O- -nv https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b /usr/local/bin ${{ env.GOLANGCI_LINT_VERSION }}
+          V=${GOLANGCI_LINT_VERSION#v}
+          F=golangci-lint-$V-linux-amd64.tar.gz
+          cd /tmp
+          wget -nv https://github.com/golangci/golangci-lint/releases/download/v$V/$F
+          wget -nv https://github.com/golangci/golangci-lint/releases/download/v$V/golangci-lint-$V-checksums.txt
+          awk -v f="$F" '$2 == f' golangci-lint-$V-checksums.txt | sha256sum -c -
+          tar -xzf $F
+          install -m 0755 golangci-lint-$V-linux-amd64/golangci-lint /usr/local/bin/golangci-lint
+          golangci-lint version
 
       - name: Download dependencies
         run: go mod tidy
