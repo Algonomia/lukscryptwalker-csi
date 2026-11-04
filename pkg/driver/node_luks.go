@@ -525,6 +525,11 @@ func (ns *NodeServer) ensureBackingFileExists(req *csi.NodeStageVolumeRequest, b
 
 	fileInfo, err := os.Stat(backingFile)
 	if os.IsNotExist(err) {
+		// The data lives on the pinned node; an empty file here would hide that.
+		if pinned := req.GetVolumeContext()[PinnedNodeParam]; pinned != "" && pinned != ns.driver.nodeID {
+			return fmt.Errorf("backing file %s is missing and volume is pinned to node %s, not %s: "+
+				"refusing to create an empty container", backingFile, pinned, ns.driver.nodeID)
+		}
 		// File doesn't exist - create it
 		klog.Infof("Creating backing file %s with capacity %s", backingFile, capacityStr)
 		if err := CreateBackingFile(backingFile, capacityStr); err != nil {

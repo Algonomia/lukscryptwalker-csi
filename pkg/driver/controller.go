@@ -77,6 +77,22 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		VolumeContext: volumeContext,
 	}
 
+	// S3 volumes are reachable from any node; LUKS volumes live in one node's
+	// backing file, so the PV must carry nodeAffinity to that node.
+	if req.GetParameters()[StorageBackendParam] != "s3" {
+		node := pickTopologyNode(req.GetAccessibilityRequirements())
+		if node == "" {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"no %s segment in accessibility requirements: a local volume cannot be pinned to a node "+
+					"(node plugins not yet re-registered with topology, or provisioner Topology feature gate off)",
+				TopologyKeyNode)
+		}
+		volumeContext[PinnedNodeParam] = node
+		volume.AccessibleTopology = []*csi.Topology{
+			{Segments: map[string]string{TopologyKeyNode: node}},
+		}
+	}
+
 	klog.Infof("Created volume: %+v", volume)
 	return &csi.CreateVolumeResponse{Volume: volume}, nil
 }
@@ -126,6 +142,19 @@ func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 
 	klog.Infof("Controller completed deletion of volume: %s", volumeID)
 	return &csi.DeleteVolumeResponse{}, nil
+}
+
+// pickTopologyNode returns the node to place a local volume on. Preferred
+// comes first: under WaitForFirstConsumer its head is the scheduler's choice.
+func pickTopologyNode(req *csi.TopologyRequirement) string {
+	for _, topos := range [][]*csi.Topology{req.GetPreferred(), req.GetRequisite()} {
+		for _, t := range topos {
+			if node := t.GetSegments()[TopologyKeyNode]; node != "" {
+				return node
+			}
+		}
+	}
+	return ""
 }
 
 // getSecretKeys returns the keys from a secrets map (for logging, without exposing values)
@@ -270,4 +299,3 @@ func (cs *ControllerServer) validateVolumeCapabilities(caps []*csi.VolumeCapabil
 
 	return nil
 }
-

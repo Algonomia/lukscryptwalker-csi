@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **LUKS volumes are pinned to the node that holds their backing file.** The driver
+  provisioned `WaitForFirstConsumer` volumes without topology, so PVs carried no
+  `nodeAffinity`. When a pod was rescheduled, its data stayed on the old node, or a fresh
+  empty container was created on the new one. Nodes now report
+  `topology.lukscryptwalker.csi.k8s.io/node`, the plugin advertises
+  `VOLUME_ACCESSIBILITY_CONSTRAINTS`, and `CreateVolume` returns the selected node as the
+  volume's accessible topology, so new PVs get `nodeAffinity`. The provisioner now runs
+  with `--strict-topology=true`. If topology is missing, `CreateVolume` fails instead of
+  creating an unpinned volume. `NodeStageVolume` will not create a backing file on any
+  node except the one the volume is pinned to. S3 volumes stay unpinned. **PVs created
+  before this release keep no `nodeAffinity`, because that field is immutable. Each one
+  must be re-created with affinity to the node that holds its backing file.**
 - **A repaired S3 mount no longer takes down its successor.** When an rclone session's
   serve loop exits, rclone's teardown unmounts whatever rclone mount it finds *at its path*
   and deletes the mount record stored under that path, without checking that either is

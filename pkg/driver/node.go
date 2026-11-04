@@ -573,6 +573,9 @@ func (ns *NodeServer) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoReque
 	ns.lastNodeGetInfo.Store(time.Now().UnixNano())
 	return &csi.NodeGetInfoResponse{
 		NodeId: ns.driver.nodeID,
+		AccessibleTopology: &csi.Topology{
+			Segments: map[string]string{TopologyKeyNode: ns.driver.nodeID},
+		},
 	}, nil
 }
 

@@ -19,6 +19,14 @@ import (
 const (
 	DriverName = "lukscryptwalker.csi.k8s.io"
 
+	// TopologyKeyNode is the topology segment each node reports. LUKS volumes
+	// are pinned to it because their backing file exists only on that node.
+	TopologyKeyNode = "topology." + DriverName + "/node"
+
+	// PinnedNodeParam records, in a LUKS volume's context, the node that
+	// holds its backing file.
+	PinnedNodeParam = DriverName + "/node"
+
 	// controllerSocketDir identifies the controller deployment by its CSI
 	// endpoint: the node DaemonSet serves unix:///csi/csi.sock, the controller
 	// serves the pluginproxy socket.
