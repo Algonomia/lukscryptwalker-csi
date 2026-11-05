@@ -37,12 +37,15 @@ metadata:
     {{- end }}
 provisioner: {{ $.Values.csiDriver.name }}
 parameters:
-  # LUKS encryption parameters
+  # LUKS encryption parameters. Without a secret, the node plugin uses its
+  # LUKS_PASSPHRASE environment variable (see node.extraEnv).
+  {{- if .secret }}
   csi.storage.k8s.io/node-stage-secret-name: {{ .secret.name | quote }}
   csi.storage.k8s.io/node-stage-secret-namespace: {{ .secret.namespace | quote }}
 
   # Key name within the secret that contains the passphrase
   passphraseKey: {{ .secret.passphraseKey | quote }}
+  {{- end }}
 
   {{- if .fsGroup }}
   # Manual fsGroup override for this StorageClass

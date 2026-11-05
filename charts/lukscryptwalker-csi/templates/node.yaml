@@ -40,6 +40,9 @@ spec:
       priorityClassName: {{ . }}
       {{- end }}
       hostNetwork: true
+      {{- with .Values.node.dnsPolicy }}
+      dnsPolicy: {{ . }}
+      {{- end }}
       hostPID: true
       {{- with .Values.podSecurityContext.node }}
       securityContext:
@@ -119,6 +122,9 @@ spec:
         securityContext:
           {{- toYaml . | nindent 10 }}
         {{- end }}
+        # Explicit command (same as the image ENTRYPOINT) so env-injecting
+        # webhooks such as bank-vaults can wrap it without a registry lookup.
+        command: ["/usr/local/bin/lukscryptwalker-csi"]
         args:
         - "--endpoint=$(CSI_ENDPOINT)"
         - "--nodeid=$(KUBE_NODE_NAME)"
@@ -149,6 +155,9 @@ spec:
         # the listing instead. Set "false" to get exact mtimes back at that cost.
         - name: RCLONE_USE_SERVER_MODTIME
           value: {{ .Values.node.useServerModTime | default true | quote }}
+        {{- with .Values.node.extraEnv }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
         volumeMounts:
         - name: plugin-dir
           mountPath: /csi

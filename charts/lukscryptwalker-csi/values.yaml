@@ -119,6 +119,21 @@ node:
       cpu: 100m
       memory: 256Mi
 
+  # Extra environment variables for the node plugin container. Setting
+  # LUKS_PASSPHRASE here replaces the LUKS Kubernetes secret: it is used for
+  # the node VFS cache and for every StorageClass without a `secret`.
+  # Example with bank-vaults (also set the vault.security.banzaicloud.io/*
+  # podAnnotations, `secret.create: false` and drop `secret` from the
+  # StorageClasses):
+  #   - name: LUKS_PASSPHRASE
+  #     value: "vault:secret/data/lukscryptwalker#passphrase"
+  extraEnv: []
+
+  # The node pod uses hostNetwork, so it resolves names with the node's DNS.
+  # Set ClusterFirstWithHostNet if something in the pod (e.g. bank-vaults'
+  # vault-env) must reach an in-cluster Service such as vault.vault.svc.
+  dnsPolicy: ""
+
   nodeSelector: {}
   tolerations:
     - operator: Exists

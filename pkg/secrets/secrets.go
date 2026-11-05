@@ -1,6 +1,10 @@
 package secrets
 
 import (
+	"fmt"
+	"os"
+	"strings"
+
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -11,6 +15,11 @@ const (
 	SecretNameKey        = "csi.storage.k8s.io/node-stage-secret-name"
 	PassphraseKeyParam   = "passphraseKey"
 	DefaultPassphraseKey = "passphrase"
+
+	// PassphraseEnvVar lets the node plugin take the LUKS passphrase from its
+	// environment (e.g. injected by a Vault webhook) instead of a Kubernetes
+	// secret. Used whenever a volume has no node-stage secret reference.
+	PassphraseEnvVar = "LUKS_PASSPHRASE"
 
 	// S3 Secret Reference (in StorageClass parameters)
 	// All S3 configuration is stored in a single secret
@@ -25,6 +34,29 @@ const (
 	S3EndpointKey        = "s3-endpoint"
 	S3ForcePathStyleKey  = "s3-force-path-style"
 )
+
+// envPassphrase is set by LoadEnvPassphrase and used for volumes that have
+// no node-stage secret reference.
+var envPassphrase string
+
+// LoadEnvPassphrase reads PassphraseEnvVar and removes it from the environment
+// so child processes (cryptsetup, mount, ...) do not inherit it. It returns ""
+// if the variable is unset, and an error if it still holds a Vault reference
+// that no webhook resolved: using that as the key would silently encrypt
+// volumes with it.
+func LoadEnvPassphrase() (string, error) {
+	p := os.Getenv(PassphraseEnvVar)
+	if err := os.Unsetenv(PassphraseEnvVar); err != nil {
+		return "", err
+	}
+	// bank-vaults forms: vault:..., >>vault:..., ${vault:...}
+	if strings.Contains(p, "vault:") {
+		return "", fmt.Errorf("%s holds an unresolved Vault reference: is the injection webhook mutating this pod?",
+			PassphraseEnvVar)
+	}
+	envPassphrase = p
+	return p, nil
+}
 
 // VolumeSecrets holds all secrets needed for volume operations
 type VolumeSecrets struct {

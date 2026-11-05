@@ -28,10 +28,13 @@ parameters:
   s3-path-prefix: {{ .s3.pathPrefix | quote }}
   {{- end }}
 
-  # LUKS encryption parameters
+  # LUKS encryption parameters. Without a secret, the node plugin uses its
+  # LUKS_PASSPHRASE environment variable (see node.extraEnv).
+  {{- if .secret }}
   csi.storage.k8s.io/node-stage-secret-name: {{ .secret.name | quote }}
   csi.storage.k8s.io/node-stage-secret-namespace: {{ .secret.namespace | quote }}
   passphraseKey: {{ .secret.passphraseKey | quote }}
+  {{- end }}
 
   # Provisioner secrets for DeleteVolume (ReclaimPolicy: Delete)
   csi.storage.k8s.io/provisioner-secret-name: {{ .s3.secret.name | quote }}

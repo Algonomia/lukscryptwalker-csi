@@ -46,6 +46,8 @@ The following table lists the configurable parameters and their default values:
 | `storage.defaultPath` | Local storage path | `/opt/local-path-provisioner` |
 | `rbac.create` | Create RBAC resources | `true` |
 | `logging.level` | Logging verbosity level | `4` |
+| `node.dnsPolicy` | Node pod DNS policy (`ClusterFirstWithHostNet` to reach in-cluster Vault) | (unset) |
+| `node.extraEnv` | Extra env vars for the node plugin, e.g. `LUKS_PASSPHRASE` injected by bank-vaults | `[]` |
 
 ### Local StorageClass Parameters
 
@@ -56,6 +58,7 @@ The following table lists the configurable parameters and their default values:
 | `storageClasses[].reclaimPolicy` | Reclaim policy | `Delete` |
 | `storageClasses[].allowVolumeExpansion` | Allow volume expansion | `true` |
 | `storageClasses[].fsGroup` | Manual fsGroup override | (auto-detect) |
+| `storageClasses[].secret` | LUKS secret reference; omit to use the node's `LUKS_PASSPHRASE` | (see below) |
 | `storageClasses[].secret.name` | LUKS secret name | `luks-secret` |
 | `storageClasses[].secret.namespace` | LUKS secret namespace | `kube-system` |
 

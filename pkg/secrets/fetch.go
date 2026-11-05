@@ -27,7 +27,14 @@ func (sm *SecretsManager) FetchVolumeSecrets(ctx context.Context, params SecretP
 	}
 
 	// Fetch LUKS passphrase secret
-	if params.LUKSSecret.Name != "" && params.LUKSSecret.Namespace != "" {
+	switch {
+	case params.LUKSSecret.Name == "" && params.LUKSSecret.Namespace == "":
+		secrets.Passphrase = envPassphrase
+	case params.LUKSSecret.Name == "" || params.LUKSSecret.Namespace == "":
+		// Never fall back to the environment on a half-set reference: the
+		// volume would be encrypted with a key other than the intended one.
+		return nil, fmt.Errorf("LUKS secret reference needs both a name and a namespace")
+	default:
 		passphrase, err := sm.fetchPassphrase(ctx, params.LUKSSecret, params.PassphraseKey)
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch LUKS passphrase: %w", err)
