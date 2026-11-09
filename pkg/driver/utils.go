@@ -30,14 +30,99 @@ func ensureFreeSpace(dir string, needBytes int64) error {
 	return nil
 }
 
+// unreservedBytes returns how much of path's apparent size has no host blocks
+// behind it. Writes into that range need free space the host may no longer have.
+func unreservedBytes(path string) (int64, error) {
+	var st syscall.Stat_t
+	if err := syscall.Stat(path, &st); err != nil {
+		return 0, err
+	}
+	if alloc := int64(st.Blocks) * 512; alloc < st.Size {
+		return st.Size - alloc, nil
+	}
+	return 0, nil
+}
+
+// committedUnreservedBytes sums unreservedBytes over every backing file under
+// root (layout root/<volumeID>/luks-<volumeID>.img).
+func committedUnreservedBytes(root string) int64 {
+	matches, _ := filepath.Glob(filepath.Join(root, "*", "luks-*.img"))
+	var total int64
+	for _, m := range matches {
+		if n, err := unreservedBytes(m); err == nil {
+			total += n
+		}
+	}
+	return total
+}
+
+// ensureBackingSpace is ensureFreeSpace for backing files: space already promised
+// to sparse backing files (including filePath's own holes) counts as used.
+func ensureBackingSpace(filePath string, needBytes int64) error {
+	dir := filepath.Dir(filePath)
+	committed := committedUnreservedBytes(filepath.Dir(dir))
+	if err := ensureFreeSpace(dir, needBytes+committed); err != nil {
+		if committed > 0 {
+			return fmt.Errorf("%v (includes %d bytes already promised to sparse backing files)", err, committed)
+		}
+		return err
+	}
+	return nil
+}
+
+// reserveBackingFile allocates any holes in an existing backing file, leaving its
+// data untouched. It returns the bytes still unreserved afterwards.
+func reserveBackingFile(filePath string) (int64, error) {
+	holes, err := unreservedBytes(filePath)
+	if err != nil || holes == 0 {
+		return 0, err
+	}
+	fi, err := os.Stat(filePath)
+	if err != nil {
+		return holes, err
+	}
+	klog.Warningf("Backing file %s has %d of %d bytes unreserved on the host, allocating them", filePath, holes, fi.Size())
+	out, ferr := exec.Command("fallocate", "-l", strconv.FormatInt(fi.Size(), 10), filePath).CombinedOutput()
+	left, _ := unreservedBytes(filePath)
+	if ferr != nil {
+		return left, fmt.Errorf("fallocate %s: %v: %s", filePath, ferr, strings.TrimSpace(string(out)))
+	}
+	return left, nil
+}
+
+// backingSpaceHint explains a failed mount when the backing file is sparse and the
+// host lacks the space for its holes; "" when that isn't the case.
+func backingSpaceHint(filePath string) string {
+	holes, err := unreservedBytes(filePath)
+	if err != nil || holes == 0 {
+		return ""
+	}
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(filepath.Dir(filePath), &st); err != nil {
+		return ""
+	}
+	avail := int64(st.Bavail) * int64(st.Bsize)
+	if avail >= holes {
+		return ""
+	}
+	return fmt.Sprintf("backing file %s has %d bytes never allocated on the host and its filesystem has only %d free, "+
+		"so writes into that range fail with EIO (e.g. ext4 journal replay): grow the host filesystem, "+
+		"then the next stage allocates them (or run 'fallocate -l $(stat -c %%s %s) %s')", filePath, holes, avail, filePath, filePath)
+}
+
 // ExpandBackingFile expands a backing file to the specified size in bytes
 func ExpandBackingFile(filePath string, newSizeBytes int64) error {
 	klog.Infof("Expanding backing file %s to %d bytes", filePath, newSizeBytes)
 
-	// Already at size: skip. Re-fallocating a full-size file can fail ENOSPC on a
-	// near-full host (XFS speculative preallocation) even though nothing needs doing.
+	// Already at size: skip re-fallocating (it can ENOSPC on a near-full XFS host),
+	// unless the file is sparse — the filesystem grow that follows writes into it.
 	if fi, err := os.Stat(filePath); err == nil && fi.Size() >= newSizeBytes {
 		klog.Infof("Backing file %s is already %d bytes (requested: %d)", filePath, fi.Size(), newSizeBytes)
+		if left, rerr := reserveBackingFile(filePath); rerr != nil && left > 0 {
+			if serr := ensureBackingSpace(filePath, 0); serr != nil {
+				return fmt.Errorf("backing file %s is sparse and its holes cannot be backed by the host: %v; %v", filePath, rerr, serr)
+			}
+		}
 		return nil
 	}
 
@@ -53,7 +138,7 @@ func ExpandBackingFile(filePath string, newSizeBytes int64) error {
 			current = fi.Size()
 		}
 		if delta := newSizeBytes - current; delta > 0 {
-			if ferr := ensureFreeSpace(filepath.Dir(filePath), delta); ferr != nil {
+			if ferr := ensureBackingSpace(filePath, delta); ferr != nil {
 				return fmt.Errorf("refusing sparse expand of backing file: %v", ferr)
 			}
 		}
@@ -82,7 +167,7 @@ func CreateBackingFile(filePath, size string) error {
 		// Guard the sparse truncate fallback: require the space to actually exist rather than
 		// silently overcommitting the host disk (which later surfaces as write I/O errors).
 		if sizeBytes, perr := strconv.ParseInt(strings.TrimSpace(size), 10, 64); perr == nil {
-			if ferr := ensureFreeSpace(filepath.Dir(filePath), sizeBytes); ferr != nil {
+			if ferr := ensureBackingSpace(filePath, sizeBytes); ferr != nil {
 				return fmt.Errorf("refusing to create sparse backing file: %v", ferr)
 			}
 		}
