@@ -54,7 +54,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          apk add --no-cache git gcc musl-dev cryptsetup bash curl gpg
+          apk add --no-cache git gcc musl-dev cryptsetup util-linux e2fsprogs bash curl gpg
 
       - name: Download dependencies
         run: go mod tidy

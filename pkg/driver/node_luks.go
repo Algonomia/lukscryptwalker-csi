@@ -2,7 +2,9 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -11,6 +13,7 @@ import (
 	"github.com/lukscryptwalker-csi/pkg/secrets"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog"
 )
 
@@ -32,6 +35,9 @@ func (ns *NodeServer) mountAndConfigureVolume(params *StagingParameters) error {
 
 	// Mount the device
 	if err := ns.mountDevice(params.mappedDevice, params.stagingTargetPath, params.volumeCapability); err != nil {
+		if hint := backingSpaceHint(params.backingFile); hint != "" {
+			return fmt.Errorf("failed to mount device: %v; %s", err, hint)
+		}
 		return fmt.Errorf("failed to mount device: %v", err)
 	}
 
@@ -388,9 +394,11 @@ func (ns *NodeServer) formatDevice(devicePath string, capability *csi.VolumeCapa
 		fsType = "ext4"
 	}
 
-	// Check if device is already formatted
-	cmd := exec.Command("blkid", devicePath)
-	if cmd.Run() == nil {
+	formatted, err := hasFilesystemSignature(devicePath)
+	if err != nil {
+		return err
+	}
+	if formatted {
 		klog.Infof("Device %s is already formatted", devicePath)
 		return nil
 	}
@@ -415,6 +423,61 @@ func (ns *NodeServer) formatDevice(devicePath string, capability *csi.VolumeCapa
 		return fmt.Errorf("failed to format device %s: %v: %s", devicePath, err, strings.TrimSpace(string(out)))
 	}
 
+	return nil
+}
+
+// hasFilesystemSignature reports whether devicePath carries a signature. blkid -p
+// exits 2 both for "nothing found" and for read errors, so a blank verdict also
+// requires the device head to read back: an I/O error must never trigger mkfs.
+func hasFilesystemSignature(devicePath string) (bool, error) {
+	out, err := exec.Command("blkid", "-p", devicePath).CombinedOutput()
+	formatted, cerr := classifyBlkidProbe(exitCode(err))
+	if cerr != nil {
+		return false, fmt.Errorf("probing %s for a filesystem: %v: %s", devicePath, cerr, strings.TrimSpace(string(out)))
+	}
+	if formatted {
+		return true, nil
+	}
+	if err := readDeviceHead(devicePath, 1<<20); err != nil {
+		return false, fmt.Errorf("blkid found no filesystem on %s but its first MiB cannot be read, refusing to format: %v", devicePath, err)
+	}
+	return false, nil
+}
+
+// classifyBlkidProbe maps a `blkid -p` exit code to formatted / blank / error.
+func classifyBlkidProbe(code int) (bool, error) {
+	switch code {
+	case 0, 8: // 8: ambivalent, several signatures — certainly not blank
+		return true, nil
+	case 2:
+		return false, nil
+	default:
+		return false, fmt.Errorf("blkid -p exit code %d", code)
+	}
+}
+
+// exitCode returns a command's exit status, or -1 when it did not run to exit.
+func exitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode()
+	}
+	return -1
+}
+
+// readDeviceHead reads up to n bytes from the start of path; a short device is fine.
+func readDeviceHead(path string, n int64) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := io.CopyN(io.Discard, f, n); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
 	return nil
 }
 
@@ -551,9 +614,35 @@ func (ns *NodeServer) ensureBackingFileExists(req *csi.NodeStageVolumeRequest, b
 		}
 	} else {
 		klog.V(4).Infof("Backing file %s exists with size %d bytes", backingFile, fileInfo.Size())
+		ns.reserveExistingBackingFile(req.GetVolumeId(), backingFile)
 	}
 
 	return nil
+}
+
+// reserveExistingBackingFile allocates holes in a sparse backing file (truncate
+// fallback, older drivers) while the host still has room. Failure only warns:
+// the volume may well mount, and refusing would turn a risk into an outage.
+func (ns *NodeServer) reserveExistingBackingFile(volumeID, backingFile string) {
+	left, err := reserveBackingFile(backingFile)
+	if err == nil || left == 0 {
+		return
+	}
+	serr := ensureBackingSpace(backingFile, 0)
+	if serr == nil {
+		klog.Warningf("Volume %s: backing file stays sparse (%v), host free space still covers it", volumeID, err)
+		return
+	}
+	msg := fmt.Sprintf("Volume %s: backing file %s has %d bytes not allocated on node %s and the host cannot back them (%v). "+
+		"Writes into that range will fail with I/O errors; grow the host filesystem.", volumeID, backingFile, left, ns.driver.nodeID, serr)
+	klog.Error(msg)
+	if ns.recorder != nil {
+		ref := ns.pvcRef(volumeID)
+		if ref == nil {
+			ref = ns.nodeRef()
+		}
+		ns.recorder.Eventf(ref, corev1.EventTypeWarning, "BackingFileOvercommitted", "%s", msg)
+	}
 }
 
 // =============================================================================
