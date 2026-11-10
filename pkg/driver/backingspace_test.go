@@ -140,8 +140,9 @@ func TestClassifyBlkidProbe(t *testing.T) {
 }
 
 func TestHasFilesystemSignature(t *testing.T) {
-	if _, err := exec.LookPath("blkid"); err != nil {
-		t.Skip("blkid not installed")
+	// busybox blkid ignores -p and exits 0 on a blank image; the driver image ships util-linux.
+	if out, _ := exec.Command("blkid", "-V").Output(); !strings.Contains(string(out), "util-linux") {
+		t.Skip("util-linux blkid not installed")
 	}
 	blank := filepath.Join(t.TempDir(), "blank.img")
 	if err := os.WriteFile(blank, make([]byte, 4<<20), 0600); err != nil {
