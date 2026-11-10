@@ -528,7 +528,7 @@ func (ns *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 
 // NodeExpandVolume expands a volume
 func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
-	klog.Infof("NodeExpandVolume called with request: %+v", req)
+	klog.Infof("NodeExpandVolume called with request: %+v", stripSecrets(req))
 
 	// Validate request parameters
 	expandParams, err := ns.validateAndPrepareExpansionRequest(ctx, req)

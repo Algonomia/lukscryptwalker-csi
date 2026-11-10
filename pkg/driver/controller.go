@@ -32,7 +32,7 @@ func NewControllerServer(d *Driver) *ControllerServer {
 }
 
 func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
-	klog.Infof("CreateVolume called with request: %+v", req)
+	klog.Infof("CreateVolume called with request: %+v", stripSecrets(req))
 
 	name := req.GetName()
 	if len(name) == 0 {
@@ -98,7 +98,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 }
 
 func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
-	klog.Infof("DeleteVolume called with request: %+v", req)
+	klog.Infof("DeleteVolume called with request: %+v", stripSecrets(req))
 
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
@@ -241,7 +241,7 @@ func (cs *ControllerServer) ListSnapshots(ctx context.Context, req *csi.ListSnap
 }
 
 func (cs *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
-	klog.Infof("ControllerExpandVolume called with request: %+v", req)
+	klog.Infof("ControllerExpandVolume called with request: %+v", stripSecrets(req))
 
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
