@@ -11,6 +11,7 @@ env:
   GO_VERSION: '1.26'
   ALPINE_VERSION: '3.18'
   GOLANGCI_LINT_VERSION: 'v2.14.0'
+  TRIVY_VERSION: '0.76.1'
 
 jobs:
   lint:
@@ -53,7 +54,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          apk add --no-cache git gcc musl-dev cryptsetup bash curl gpg
+          apk add --no-cache git gcc musl-dev cryptsetup util-linux e2fsprogs bash curl gpg
 
       - name: Download dependencies
         run: go mod tidy
@@ -75,29 +76,39 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Installed from the GitHub release: trivy-action's installer fetches
+      # from get.trivy.dev, which can fail to resolve and break the job.
+      - name: Install Trivy
+        run: |
+          cd "$RUNNER_TEMP"
+          base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
+          tarball="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -fsSLO "${base}/${tarball}"
+          curl -fsSLO "${base}/trivy_${TRIVY_VERSION}_checksums.txt"
+          grep " ${tarball}\$" "trivy_${TRIVY_VERSION}_checksums.txt" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf "${tarball}" -C "$HOME/.local/bin" trivy
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - name: Run Trivy vulnerability scanner (repo)
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: 'fs'
-          scan-ref: '.'
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-          severity: 'CRITICAL,HIGH'
+        run: trivy fs --format sarif --output trivy-results.sarif --severity CRITICAL,HIGH .
 
       - name: Upload Trivy results to GitHub Security
         uses: github/codeql-action/upload-sarif@v4
-        if: always()
+        if: ${{ !cancelled() && hashFiles('trivy-results.sarif') != '' }}
         with:
           sarif_file: 'trivy-results.sarif'
 
+      # Independent of Trivy: a Trivy failure must not skip it.
       - name: Run Gosec Security Scanner
         uses: securego/gosec@v2.23.0
+        if: ${{ !cancelled() }}
         with:
           args: '-no-fail -fmt sarif -out gosec-results.sarif ./...'
 
       - name: Upload Gosec SARIF file
         uses: github/codeql-action/upload-sarif@v4
-        if: always()
+        if: ${{ !cancelled() && hashFiles('gosec-results.sarif') != '' }}
         with:
           sarif_file: gosec-results.sarif
 

@@ -23,6 +23,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   namespace is now an explicit error.
 
 ### Fixed
+- **A LUKS volume can no longer be reformatted after a read error.** `NodeStageVolume`
+  ran `mkfs` whenever `blkid` exited non-zero, and `blkid` also exits non-zero when it
+  cannot read the device. The driver now formats only when `blkid -p` reports no
+  signature *and* the first MiB of the device reads back. Any other result fails the
+  stage and leaves the data alone.
+- **Sparse backing files are detected, and filled in when the host has space.** A
+  backing file created by the `truncate` fallback or by an older driver could promise
+  more space than the host disk holds. Once the disk filled up, writes into the
+  unallocated range failed, and the mount reported only `can't read superblock` (seen in
+  production: a 180 GiB volume on a 150 GiB disk). Now:
+  - staging allocates the file's holes, and emits a `BackingFileOvercommitted` warning
+    event when the host cannot back them;
+  - a failed mount names the unallocated bytes, the free space, and the fix;
+  - the free-space guard on the `truncate` fallback counts space already promised to
+    other sparse backing files;
+  - expanding a file that is already at full size but sparse allocates its holes first.
+- **LUKS volumes are pinned to the node that holds their backing file.** The driver
+  provisioned `WaitForFirstConsumer` volumes without topology, so PVs carried no
+  `nodeAffinity`. When a pod was rescheduled, its data stayed on the old node, or a fresh
+  empty container was created on the new one. Nodes now report
+  `topology.lukscryptwalker.csi.k8s.io/node`, the plugin advertises
+  `VOLUME_ACCESSIBILITY_CONSTRAINTS`, and `CreateVolume` returns the selected node as the
+  volume's accessible topology, so new PVs get `nodeAffinity`. The provisioner now runs
+  with `--strict-topology=true`. If topology is missing, `CreateVolume` fails instead of
+  creating an unpinned volume. `NodeStageVolume` will not create a backing file on any
+  node except the one the volume is pinned to. S3 volumes stay unpinned. **PVs created
+  before this release keep no `nodeAffinity`, because that field is immutable. Each one
+  must be re-created with affinity to the node that holds its backing file.**
 - **A repaired S3 mount no longer takes down its successor.** When an rclone session's
   serve loop exits, rclone's teardown unmounts whatever rclone mount it finds *at its path*
   and deletes the mount record stored under that path, without checking that either is

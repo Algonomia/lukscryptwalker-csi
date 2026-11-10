@@ -37,7 +37,8 @@ spec:
         - "--csi-address=$(ADDRESS)"
         - "--v={{ .Values.logging.level }}"
         - "--feature-gates=Topology=true"
-        - "--strict-topology=false"
+        # LUKS volumes are node-local: offer only the scheduler-selected node.
+        - "--strict-topology=true"
         - "--leader-election=true"
         - "--leader-election-namespace={{ .Release.Namespace }}"
         env:
