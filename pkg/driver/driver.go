@@ -21,7 +21,9 @@ const (
 
 	// TopologyKeyNode is the topology segment each node reports. LUKS volumes
 	// are pinned to it because their backing file exists only on that node.
-	TopologyKeyNode = "topology." + DriverName + "/node"
+	// The registrar sets it as a node label, so its prefix must not end in
+	// k8s.io or kubernetes.io: NodeRestriction forbids kubelets those labels.
+	TopologyKeyNode = "topology.lukscryptwalker.csi/node"
 
 	// PinnedNodeParam records, in a LUKS volume's context, the node that
 	// holds its backing file.

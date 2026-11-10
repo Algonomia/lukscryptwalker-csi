@@ -10,6 +10,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 func nodeTopo(node string) *csi.Topology {
@@ -100,5 +101,19 @@ func TestEnsureBackingFileRefusesOffPinnedNode(t *testing.T) {
 	}
 	if _, statErr := os.Stat(backing); !os.IsNotExist(statErr) {
 		t.Fatalf("backing file was created off the pinned node")
+	}
+}
+
+// The registrar writes TopologyKeyNode as a node label through the kubelet's
+// credentials; NodeRestriction rejects k8s.io/kubernetes.io prefixes.
+func TestTopologyKeyIsKubeletSettableLabel(t *testing.T) {
+	if errs := validation.IsQualifiedName(TopologyKeyNode); len(errs) > 0 {
+		t.Fatalf("%q is not a valid label key: %v", TopologyKeyNode, errs)
+	}
+	prefix, _, _ := strings.Cut(TopologyKeyNode, "/")
+	for _, ns := range []string{"k8s.io", "kubernetes.io"} {
+		if prefix == ns || strings.HasSuffix(prefix, "."+ns) {
+			t.Fatalf("%q is in the %s namespace; NodeRestriction forbids kubelets to set it", TopologyKeyNode, ns)
+		}
 	}
 }

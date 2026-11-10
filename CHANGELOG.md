@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provisioned `WaitForFirstConsumer` volumes without topology, so PVs carried no
   `nodeAffinity`. When a pod was rescheduled, its data stayed on the old node, or a fresh
   empty container was created on the new one. Nodes now report
-  `topology.lukscryptwalker.csi.k8s.io/node`, the plugin advertises
+  `topology.lukscryptwalker.csi/node`, the plugin advertises
   `VOLUME_ACCESSIBILITY_CONSTRAINTS`, and `CreateVolume` returns the selected node as the
   volume's accessible topology, so new PVs get `nodeAffinity`. The provisioner now runs
   with `--strict-topology=true`. If topology is missing, `CreateVolume` fails instead of
