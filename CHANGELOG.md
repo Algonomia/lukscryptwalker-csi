@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **LUKS passphrase from the environment.** The node plugin reads `LUKS_PASSPHRASE` and
+  uses it for its VFS cache and for every StorageClass without a `node-stage-secret-*`
+  reference, so the passphrase can be injected by Vault (e.g. bank-vaults) instead of
+  living in a Kubernetes secret. Chart: new `node.extraEnv` and `node.dnsPolicy`,
+  `storageClasses[].secret` and `s3StorageClasses[].secret` are now optional, and the node
+  container sets an explicit `command` so env-injecting webhooks can wrap it. The node refuses to start if the
+  variable still holds an unresolved `vault:` reference.
+
+### Changed
+- The node takes a volume's LUKS secret reference from its PV (`nodeStageSecretRef`) when
+  set, not from the current StorageClass, so recreating a StorageClass can no longer change
+  the key an existing volume is opened with. A secret reference with only a name or only a
+  namespace is now an explicit error.
+
 ### Fixed
 - **A LUKS volume can no longer be reformatted after a read error.** `NodeStageVolume`
   ran `mkfs` whenever `blkid` exited non-zero, and `blkid` also exits non-zero when it

@@ -34,6 +34,43 @@ var (
 		"host:port for the driver's registration-health endpoint (the node-driver-registrar's liveness probe target)")
 )
 
+// nodePassphrase returns the passphrase for the node's VFS cache: from
+// LUKS_PASSPHRASE if set, otherwise from the --luks-secret-* Kubernetes secret.
+func nodePassphrase() (string, error) {
+	p, err := secrets.LoadEnvPassphrase()
+	if err != nil {
+		return "", err
+	}
+	if p != "" {
+		klog.Infof("Using LUKS passphrase from %s environment variable", secrets.PassphraseEnvVar)
+		return p, nil
+	}
+
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return "", fmt.Errorf("failed to get in-cluster config: %w", err)
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return "", fmt.Errorf("failed to create kubernetes client: %w", err)
+	}
+
+	volSecrets, err := secrets.NewSecretsManager(clientset).FetchVolumeSecrets(context.Background(), secrets.SecretParams{
+		LUKSSecret: secrets.SecretReference{
+			Name:      *luksSecretName,
+			Namespace: *luksSecretNamespace,
+		},
+		PassphraseKey: *luksSecretKey,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch from secret: %w", err)
+	}
+	if volSecrets.Passphrase == "" {
+		return "", fmt.Errorf("passphrase is empty in secret")
+	}
+	return volSecrets.Passphrase, nil
+}
+
 // isControllerMode detects if we're running in controller mode based on the endpoint path
 func isControllerMode(endpoint string) bool {
 	// Controller uses: unix:///var/lib/csi/sockets/pluginproxy/csi.sock
@@ -64,39 +101,13 @@ func main() {
 
 	// Set up encrypted VFS cache volume (only for nodes, skip for controller)
 	if !isControllerMode(*endpoint) {
-		// Create Kubernetes client to fetch secrets
-		config, err := rest.InClusterConfig()
+		passphrase, err := nodePassphrase()
 		if err != nil {
-			klog.Fatalf("Failed to get in-cluster config: %v", err)
-		}
-
-		clientset, err := kubernetes.NewForConfig(config)
-		if err != nil {
-			klog.Fatalf("Failed to create kubernetes client: %v", err)
-		}
-
-		// Fetch LUKS passphrase from Kubernetes secret
-		secretsManager := secrets.NewSecretsManager(clientset)
-
-		secretParams := secrets.SecretParams{
-			LUKSSecret: secrets.SecretReference{
-				Name:      *luksSecretName,
-				Namespace: *luksSecretNamespace,
-			},
-			PassphraseKey: *luksSecretKey,
-		}
-
-		volSecrets, err := secretsManager.FetchVolumeSecrets(context.Background(), secretParams)
-		if err != nil {
-			klog.Fatalf("Failed to fetch LUKS passphrase from secret: %v", err)
-		}
-
-		if volSecrets.Passphrase == "" {
-			klog.Fatal("LUKS passphrase is empty in secret")
+			klog.Fatalf("Failed to get LUKS passphrase: %v", err)
 		}
 
 		// Combine with node ID to ensure uniqueness per node
-		vfsCachePath, err := rclone.SetupVFSCache(*vfsCacheSize, volSecrets.Passphrase, *nodeID)
+		vfsCachePath, err := rclone.SetupVFSCache(*vfsCacheSize, passphrase, *nodeID)
 		if err != nil {
 			klog.Fatalf("Failed to set up encrypted VFS cache: %v", err)
 		}

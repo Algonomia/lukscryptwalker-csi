@@ -661,7 +661,7 @@ func (ns *NodeServer) getPassphraseFromRequest(req *csi.NodeStageVolumeRequest) 
 		return "", fmt.Errorf("failed to get PV for volume %s: %v", volumeID, err)
 	}
 
-	scParams, err := getStorageClassParameters(ctx, ns.clientset, pv.Spec.StorageClassName)
+	scParams, err := getVolumeParameters(ctx, ns.clientset, pv)
 	if err != nil {
 		return "", fmt.Errorf("failed to get StorageClass parameters: %v", err)
 	}
@@ -692,7 +692,7 @@ func (ns *NodeServer) getPassphraseForRestore(ctx context.Context, volumeID stri
 		return "", fmt.Errorf("failed to get PV for volume %s: %v", volumeID, err)
 	}
 
-	scParams, err := getStorageClassParameters(ctx, ns.clientset, pv.Spec.StorageClassName)
+	scParams, err := getVolumeParameters(ctx, ns.clientset, pv)
 	if err != nil {
 		return "", fmt.Errorf("failed to get StorageClass parameters: %v", err)
 	}

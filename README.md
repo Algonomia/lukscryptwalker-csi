@@ -90,7 +90,7 @@ StorageClass `parameters`:
 |---|---|---|
 | `local-path` | Host directory for backing files | `/opt/local-path-provisioner` |
 | `fsType` | `ext4`, `ext3`, or `xfs` | `ext4` |
-| `csi.storage.k8s.io/node-stage-secret-name` / `-namespace` | Passphrase secret (required) | — |
+| `csi.storage.k8s.io/node-stage-secret-name` / `-namespace` | Passphrase secret (omit to use the node's `LUKS_PASSPHRASE`, see [Security](#security)) | — |
 | `passphraseKey` | Key within the secret | `passphrase` |
 | `fsGroup` | Force a group owner (see [Permissions](#permissions)) | auto-detect |
 
@@ -240,9 +240,41 @@ For production:
 
 - Set `create: false` and manage secrets with Vault, External Secrets Operator, Sealed Secrets, a cloud secret manager, etc.
 - Restrict the passphrase/credential secrets with RBAC.
+- Or keep the passphrase out of Kubernetes secrets entirely (see below).
 - Use TLS endpoints and proper IAM/bucket policies for S3.
 
 The node driver requires privileged access for LUKS. All data is encrypted at rest (LUKS for local; rclone crypt for S3, including filenames), and the S3 VFS cache is itself LUKS-encrypted.
+
+### Passphrase from the environment (Vault / bank-vaults)
+
+If the node plugin has a `LUKS_PASSPHRASE` environment variable, it is used for the node's VFS cache and for every StorageClass **without** `node-stage-secret-*` parameters. A StorageClass that references a secret keeps using it. The driver unsets it at startup so the tools it runs (cryptsetup, mount, ...) do not inherit it.
+
+With the [bank-vaults](https://bank-vaults.dev) webhook:
+
+```yaml
+# values.yaml
+podAnnotations:
+  vault.security.banzaicloud.io/vault-addr: "https://vault.vault:8200"
+  vault.security.banzaicloud.io/vault-role: "lukscryptwalker-csi"
+secret:
+  create: false
+node:
+  dnsPolicy: ClusterFirstWithHostNet   # hostNetwork pod: needed to resolve vault.vault
+  extraEnv:
+    - name: LUKS_PASSPHRASE
+      value: "vault:secret/data/lukscryptwalker#passphrase"
+storageClasses:
+  - name: lukscryptwalker-local
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: WaitForFirstConsumer
+    # no `secret:` -> LUKS_PASSPHRASE is used
+s3StorageClasses: []   # or define them without `secret:` as well
+```
+
+Install the chart in its own namespace (e.g. `-n lukscryptwalker-csi`): bank-vaults does not mutate pods in `kube-system` by default. If the webhook skips the pod anyway, the driver refuses to start rather than use the unresolved `vault:` reference as the key.
+
+A PV provisioned with a secret keeps using it (`spec.csi.nodeStageSecretRef`), whatever its StorageClass says later, so existing volumes never switch keys. StorageClass parameters are immutable and the chart does not touch existing StorageClasses: on an existing install, add a StorageClass with a new name for Vault-backed volumes.
 
 ---
 

@@ -183,6 +183,16 @@ jobs:
         run: |
           helm template lukscryptwalker-csi charts/lukscryptwalker-csi --namespace kube-system > /dev/null
 
+      - name: Template Helm chart (passphrase from environment)
+        # StorageClasses without `secret` must not reference a LUKS secret,
+        # and node.extraEnv must reach the node plugin.
+        run: |
+          out=$(helm template lukscryptwalker-csi charts/lukscryptwalker-csi --namespace lukscryptwalker-csi \
+            --set secret.create=false --set storageClasses[0].secret=null --set s3StorageClasses=null \
+            --set node.extraEnv[0].name=LUKS_PASSPHRASE --set node.extraEnv[0].value=vault:secret/data/x#p)
+          ! echo "$out" | grep -q node-stage-secret
+          echo "$out" | grep -q 'name: LUKS_PASSPHRASE'
+
   integration:
     name: Integration Test (Kind)
     runs-on: ubuntu-latest

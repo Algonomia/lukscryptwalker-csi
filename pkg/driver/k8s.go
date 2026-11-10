@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/lukscryptwalker-csi/pkg/secrets"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -61,6 +62,25 @@ func getStorageClassParameters(ctx context.Context, clientset kubernetes.Interfa
 	return sc.Parameters, nil
 }
 
+// getVolumeParameters returns the StorageClass parameters of a PV, with the
+// LUKS secret reference taken from the PV when it has one: the provisioner
+// records it there once, while the StorageClass may have been recreated since.
+func getVolumeParameters(ctx context.Context, clientset kubernetes.Interface, pv *corev1.PersistentVolume) (map[string]string, error) {
+	scParams, err := getStorageClassParameters(ctx, clientset, pv.Spec.StorageClassName)
+	if err != nil || pv.Spec.CSI == nil || pv.Spec.CSI.NodeStageSecretRef == nil {
+		return scParams, err
+	}
+
+	ref := pv.Spec.CSI.NodeStageSecretRef
+	params := make(map[string]string, len(scParams)+2)
+	for k, v := range scParams {
+		params[k] = v
+	}
+	params[secrets.SecretNameKey] = ref.Name
+	params[secrets.SecretNamespaceKey] = ref.Namespace
+	return params, nil
+}
+
 // =============================================================================
 // High-Level Helper Functions
 // =============================================================================
@@ -77,7 +97,7 @@ func (ns *NodeServer) GetStorageClassParametersByVolumeID(ctx context.Context, v
 		return nil, fmt.Errorf("PV %s has no StorageClass", volumeID)
 	}
 
-	scParams, err := getStorageClassParameters(ctx, ns.clientset, pv.Spec.StorageClassName)
+	scParams, err := getVolumeParameters(ctx, ns.clientset, pv)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get StorageClass parameters for %s: %w", pv.Spec.StorageClassName, err)
 	}
